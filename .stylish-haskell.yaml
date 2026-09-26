@@ -1,0 +1,7 @@
+steps:
+  - simple_align: {}
+  - imports: {}
+  - language_pragmas: {}
+  - trailing_whitespace: {}
+language_extensions:
+  - MultilineStrings

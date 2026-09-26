@@ -1,2 +1,14 @@
 /target
+/dist-newstyle
 .direnv
+/result
+/result-*
+/tags
+/.rockstar/
+auth.json
+.env
+.env.*
+!.env.example
+/cabal.project.local
+*.hi
+*.o
