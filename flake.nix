@@ -130,7 +130,6 @@
           };
         in
         {
-          # Keep the C toolchain for the POSIX CApiFFI imports in credential storage.
           default = pkgs.mkShell {
             packages = [
               ghc

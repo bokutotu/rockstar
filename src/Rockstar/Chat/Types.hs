@@ -1,5 +1,4 @@
 module Rockstar.Chat.Types (
-    ChatAuth (..),
     Conversation (..),
     Reply (..),
     defaultModel,
@@ -9,14 +8,6 @@ module Rockstar.Chat.Types (
 
 import           Data.Aeson (Value, object, (.=))
 import           Data.Text  (Text)
-
--- A request needs neither a refresh token nor the credential file's expiration.
--- Deliberately no Show instance for authentication data.
-data ChatAuth = ChatAuth
-    { accessToken :: Text
-    , accountId   :: Text
-    }
-    deriving (Eq)
 
 data Conversation = Conversation
     { model :: Text

@@ -1,28 +1,29 @@
 module CliSpec (spec) where
 
-import           Control.Monad         (forM_)
-import qualified Data.ByteString       as BS
-import qualified Data.Text             as Text
-import           Data.Text.Encoding    (decodeUtf8, encodeUtf8)
-import           Rockstar.Auth.Storage (saveLogin)
-import           Rockstar.Auth.Types   (StoredCredentials (..), unixNow)
-import           System.Directory      (doesPathExist)
-import           System.Exit           (ExitCode (..))
-import           System.FilePath       ((</>))
-import           System.IO             (hFlush, hPutStr)
-import           System.IO.Temp        (withSystemTempDirectory)
-import           System.Posix.Signals  (keyboardSignal, signalProcess)
-import           System.Process        (getPid, withCreateProcess)
+import           Control.Monad                    (forM_)
+import           Control.Monad.Trans.State.Strict (evalStateT)
+import qualified Data.ByteString                  as BS
+import qualified Data.Text                        as Text
+import           Data.Text.Encoding               (decodeUtf8, encodeUtf8)
+import           Data.Time.Clock.POSIX            (getPOSIXTime)
+import           Rockstar.Credentials             (Credentials (..), save)
+import           System.Directory                 (doesPathExist)
+import           System.Exit                      (ExitCode (..))
+import           System.FilePath                  ((</>))
+import           System.IO                        (hFlush, hPutStr)
+import           System.Posix.Signals             (keyboardSignal,
+                                                   signalProcess)
+import           System.Process                   (getPid, withCreateProcess)
 import           Test.Hspec
 import           TestSupport
 
 spec :: Spec
 spec = describe "CLI" $ do
-    it "shows signed-out status without creating storage" $ withHome $ \home -> do
+    it "reports missing login without creating storage" $ withHome $ \home -> do
         -- Arrange
-        let arguments = ["auth", "status"]
+        let arguments = []
             input = ""
-            expected = ((ExitSuccess, "Not signed in. Run `rockstar login`.\n", ""), False)
+            expected = ((ExitFailure 1, "", "error: Not signed in. Run `rockstar login` first\n"), False)
 
         -- Act
         let action = do
@@ -33,45 +34,20 @@ spec = describe "CLI" $ do
         -- Assert
         action `shouldReturn` expected
 
-    it "reports missing login" $ withHome $ \home -> do
+    it "rejects the removed auth command without creating storage" $ withHome $ \home -> do
         -- Arrange
-        let arguments = []
-            input = ""
-            expected = (ExitFailure 1, "", "error: Not signed in. Run `rockstar login` first\n")
-
-        -- Act
-        let action = runCli home arguments input
-
-        -- Assert
-        action `shouldReturn` expected
-
-    it "shows local status without displaying tokens" $ withHome $ \home -> do
-        -- Arrange
-        putCredentials home False
         let arguments = ["auth", "status"]
-            input = ""
-            expected = (ExitSuccess, "Signed in (local token is unexpired; server access has not been checked).\n", "")
-
-        -- Act
-        let action = runCli home arguments input
-
-        -- Assert
-        action `shouldReturn` expected
-
-    it "rejects the removed logout command without creating storage" $ withHome $ \home -> do
-        -- Arrange
-        let arguments = ["auth", "logout"]
             input = ""
             expected =
                 (
                     ( ExitFailure 1
                     , ""
                     , unlines
-                        [ "Invalid argument `logout'"
+                        [ "Invalid argument `auth'"
                         , ""
-                        , "Usage: rockstar auth COMMAND"
+                        , "Usage: rockstar [--model MODEL] [COMMAND] [-V|--version]"
                         , ""
-                        , "  Inspect locally stored credentials"
+                        , "  An independent Codex chat harness"
                         ]
                     )
                 , False
@@ -86,52 +62,85 @@ spec = describe "CLI" $ do
         -- Assert
         action `shouldReturn` expected
 
-    it "reports expiration locally without refreshing" $ withHome $ \home -> do
-        putCredentials home True
-        runCli home ["auth", "status"] ""
-            `shouldReturn` ( ExitSuccess
-                           , "Signed in; token expired or expires soon. It will refresh before the next request.\n"
-                           , ""
-                           )
-        runCli home [] "/exit\n" `shouldReturn` (ExitSuccess, banner "gpt-6-astra" <> "> ", "")
+    it "does not refresh expired credentials until a request is sent" $ withHome $ \home -> do
+        -- Arrange
+        putCredentials True
+        let arguments = []
+            input = "/exit\n"
+            expected = (ExitSuccess, banner "gpt-6-astra" <> "> ", "")
+
+        -- Act
+        let action = runCli home arguments input
+
+        -- Assert
+        action `shouldReturn` expected
 
     it "slash-exit does not wait for stdin to close" $ withHome $ \home -> do
-        putCredentials home False
+        -- Arrange
+        putCredentials False
         command <- cliProcess home []
-        withCreateProcess command $ \inputPipe outputPipe errorPipe process -> do
-            Just input <- pure inputPipe
-            Just output <- pure outputPipe
-            Just errors <- pure errorPipe
-            hPutStr input "/exit\n"
-            hFlush input
-            waitOutput process output errors `shouldReturn` (ExitSuccess, banner "gpt-6-astra" <> "> ", "")
+        let expected = (ExitSuccess, banner "gpt-6-astra" <> "> ", "")
+
+        -- Act
+        let action = withCreateProcess command $ \inputPipe outputPipe errorPipe process -> do
+                Just input <- pure inputPipe
+                Just output <- pure outputPipe
+                Just errors <- pure errorPipe
+                hPutStr input "/exit\n"
+                hFlush input
+                waitOutput process output errors
+
+        -- Assert
+        action `shouldReturn` expected
 
     it "EOF and model overrides exit without sending requests" $ withHome $ \home -> do
-        putCredentials home False
-        runCli home [] "" `shouldReturn` (ExitSuccess, banner "gpt-6-astra" <> "> \n", "")
-        runCli home ["--model", "another-model"] "/exit\n"
-            `shouldReturn` (ExitSuccess, banner "another-model" <> "> ", "")
+        -- Arrange
+        putCredentials False
+        let expected =
+                [ (ExitSuccess, banner "gpt-6-astra" <> "> \n", "")
+                , (ExitSuccess, banner "another-model" <> "> ", "")
+                ]
+
+        -- Act
+        let action = sequence [runCli home [] "", runCli home ["--model", "another-model"] "/exit\n"]
+
+        -- Assert
+        action `shouldReturn` expected
 
     it "Ctrl+C interrupts input without leaving a blocked stdin thread" $ withHome $ \home -> do
-        putCredentials home False
+        -- Arrange
+        putCredentials False
         command <- cliProcess home []
-        withCreateProcess command $ \_ outputPipe errorPipe process -> do
-            Just output <- pure outputPipe
-            Just errors <- pure errorPipe
-            let expectedPrefix = banner "gpt-6-astra" <> "> "
-                prefixBytes = encodeUtf8 (Text.pack expectedPrefix)
-            prefix <- within $ BS.hGet output (BS.length prefixBytes)
-            pid <- getPid process >>= maybe (fail "child has no PID") pure
-            signalProcess keyboardSignal pid
-            (code, remaining, stderr') <- waitOutput process output errors
-            (code, Text.unpack (decodeUtf8 prefix) <> remaining, stderr')
-                `shouldBe` (ExitSuccess, expectedPrefix <> "\n", "")
+        let expectedPrefix = banner "gpt-6-astra" <> "> "
+            prefixBytes = encodeUtf8 (Text.pack expectedPrefix)
+            expected = (ExitSuccess, expectedPrefix <> "\n", "")
+
+        -- Act
+        let action = withCreateProcess command $ \_ outputPipe errorPipe process -> do
+                Just output <- pure outputPipe
+                Just errors <- pure errorPipe
+                prefix <- within $ BS.hGet output (BS.length prefixBytes)
+                pid <- getPid process >>= maybe (fail "child has no PID") pure
+                signalProcess keyboardSignal pid
+                (code, remaining, stderr') <- waitOutput process output errors
+                pure (code, Text.unpack (decodeUtf8 prefix) <> remaining, stderr')
+
+        -- Assert
+        action `shouldReturn` expected
 
     it "reports corrupt credentials without revealing their contents" $ withHome $ \home -> do
-        putCredentials home False
+        -- Arrange
+        putCredentials False
         BS.writeFile (home </> ".rockstar" </> "auth.json") "{secret-do-not-print"
-        runCli home ["auth", "status"] ""
-            `shouldReturn` (ExitFailure 1, "", "error: Invalid auth.json; run `rockstar login` to replace it\n")
+        let arguments = []
+            input = ""
+            expected = (ExitFailure 1, "", "error: Invalid auth.json\n")
+
+        -- Act
+        let action = runCli home arguments input
+
+        -- Assert
+        action `shouldReturn` expected
 
     describe "help and version" $ do
         let help =
@@ -148,33 +157,13 @@ spec = describe "CLI" $ do
                     , ""
                     , "Available commands:"
                     , "  login                    Sign in to Codex through your browser"
-                    , "  auth                     Inspect locally stored credentials"
                     , "  help                     Print command help"
                     , ""
                     , "Run without a subcommand to chat. Type /exit or send EOF to quit. Defaults:"
                     , "gpt-6-astra, reasoning=max, Fast mode on (priority)."
                     ]
-            authHelp =
-                unlines
-                    [ "Usage: rockstar auth COMMAND"
-                    , ""
-                    , "  Inspect locally stored credentials"
-                    , ""
-                    , "Available options:"
-                    , "  -h,--help                Show this help text"
-                    , ""
-                    , "Available commands:"
-                    , "  status                   Show local authentication status without network"
-                    , "                           requests"
-                    ]
-        forM_
-            [ (["--help"], help)
-            , (["help"], help)
-            , (["auth", "--help"], authHelp)
-            , (["help", "auth"], authHelp)
-            , (["--version"], "rockstar 0.1.0\n")
-            ]
-            $ \(arguments, output) -> it ("supports " <> unwords arguments <> " without creating files") $ withHome $ \home -> do
+        forM_ [(["--help"], help), (["help"], help), (["--version"], "rockstar 0.1.0\n")] $ \(arguments, output) ->
+            it ("supports " <> unwords arguments <> " without creating files") $ withHome $ \home -> do
                 -- Arrange
                 let input = ""
                     expected = ((ExitSuccess, output, ""), False)
@@ -188,24 +177,21 @@ spec = describe "CLI" $ do
                 -- Assert
                 action `shouldReturn` expected
 
-withHome :: (FilePath -> IO a) -> IO a
-withHome = withSystemTempDirectory "rockstar-cli"
-
-putCredentials :: FilePath -> Bool -> IO ()
-putCredentials home expired = do
-    now <- unixNow
-    saveLogin
-        (home </> ".rockstar")
-        ( StoredCredentials
-            "fake-access-do-not-print"
-            "fake-refresh-do-not-print"
-            (if expired then 1 else now + 3600)
-            "test-account"
+putCredentials :: Bool -> IO ()
+putCredentials expired = do
+    now <- floor <$> getPOSIXTime
+    evalStateT
+        ( save $
+            Credentials
+                "fake-access-do-not-print"
+                "fake-refresh-do-not-print"
+                (if expired then 1 else now + 3600)
+                "test-account"
         )
+        Nothing
 
 banner :: String -> String
 banner model =
     "rockstar · "
         <> model
-        <> " · reasoning max · fast on\n"
-        <> "Type /exit to quit. Conversation history is not saved.\n\n"
+        <> " · reasoning max · fast on\nType /exit to quit. Conversation history is not saved.\n\n"

@@ -32,7 +32,6 @@ library:
     optparse-applicative: {}
     process: {}
     stm: {}
-    temporary: {}
     text: {}
     time: {}
     transformers: {}
@@ -56,3 +55,4 @@ tests:
     dependencies:
       <<: *implementation-dependencies
       hspec: {}
+      temporary: {}

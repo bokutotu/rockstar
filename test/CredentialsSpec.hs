@@ -1,18 +1,16 @@
 module CredentialsSpec (spec) where
 
-import           Control.Exception                (bracket)
 import           Control.Monad.Trans.State.Strict (evalStateT, runStateT)
 import           Data.Aeson                       (Value, object, toJSON, (.=))
 import           Data.Text                        (Text)
 import           Rockstar.Credentials             (Credentials (..), load, save)
 import           System.Directory                 (getHomeDirectory, removeFile)
-import           System.Environment               (lookupEnv, setEnv, unsetEnv)
 import           System.FilePath                  ((</>))
-import           System.IO.Temp                   (withSystemTempDirectory)
 import           Test.Hspec
+import           TestSupport                      (withHome)
 
 spec :: Spec
-spec = around_ withTemporaryHome $ describe "credentials" $ do
+spec = around_ (withHome . const) $ describe "credentials" $ do
     it "loads and caches credentials when auth.json exists" $ do
         -- Arrange
         let input = Credentials "test-access-token" "test-refresh-token" 4600 "test-account"
@@ -49,10 +47,3 @@ spec = around_ withTemporaryHome $ describe "credentials" $ do
 
         -- Assert
         action `shouldReturn` expected
-
-withTemporaryHome :: IO a -> IO a
-withTemporaryHome action = withSystemTempDirectory "rockstar-credentials-test" $ \home ->
-    bracket
-        (lookupEnv "HOME")
-        (maybe (unsetEnv "HOME") (setEnv "HOME"))
-        (\_ -> setEnv "HOME" home >> action)

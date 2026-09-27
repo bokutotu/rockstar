@@ -1,30 +1,36 @@
-module Rockstar.Auth (login, status) where
+module Rockstar.Auth (login, requireSignedIn, loadCredentials) where
 
-import           Control.Concurrent    (forkIO)
-import           Control.Exception     (AsyncException (UserInterrupt),
-                                        IOException, catch, throwIO)
-import           Control.Monad         (void, when)
-import qualified Data.Text             as Text
-import qualified Data.Text.IO          as Text
+import           Control.Concurrent     (forkIO)
+import           Control.Exception      (AsyncException (UserInterrupt),
+                                         IOException, catch, throwIO)
+import           Control.Monad          (void, when)
+import           Control.Monad.IO.Class (liftIO)
+import           Data.Maybe             (isNothing)
+import qualified Data.Text              as Text
+import qualified Data.Text.IO           as Text
+import           Data.Time.Clock.POSIX  (getPOSIXTime)
+import           Network.HTTP.Client    (Manager)
 import           Rockstar.Auth.OAuth
-import           Rockstar.Auth.Storage
-import           Rockstar.Auth.Types
-import qualified Rockstar.Http         as Http
+import           Rockstar.Credentials   (Credentials (..), CredentialsM)
+import qualified Rockstar.Credentials   as Credentials
+import qualified Rockstar.Http          as Http
 import           Rockstar.Interrupt
-import           System.Exit           (ExitCode (ExitSuccess))
-import           System.FilePath       ((</>))
-import           System.Info           (os)
-import           System.IO             (hFlush, stderr, stdout)
+import           System.Exit            (ExitCode (ExitSuccess))
+import           System.Info            (os)
+import           System.IO              (hFlush, stderr, stdout)
 import           System.Process
 
-login :: IO ()
-login =
-    signIn `catch` \interruption -> case interruption of
-        UserInterrupt -> throwIO (Interrupted "Login cancelled")
-        other         -> throwIO other
+login :: CredentialsM ()
+login = do
+    credentials <-
+        liftIO $
+            signIn `catch` \interruption -> case interruption of
+                UserInterrupt -> throwIO (Interrupted "Login cancelled")
+                other         -> throwIO other
+    Credentials.save credentials
+    liftIO $ putStrLn "Signed in."
   where
     signIn = Http.withManager $ \manager -> do
-        directory <- credentialDirectory
         attempt <- beginLogin
         withCallback attempt 1455 $ \_ waitForCode -> do
             let url = authorizationUrl attempt
@@ -36,20 +42,23 @@ login =
             hFlush stdout
             openBrowser (Text.unpack url)
             code <- waitForCode
-            finishOnUserInterrupt $ do
-                credentials <- exchangeCode manager attempt code
-                saveLogin directory credentials
-            putStrLn ("Signed in. Credentials saved to " <> (directory </> "auth.json") <> ".")
+            exchangeCode manager attempt code
 
-status :: IO ()
-status = do
-    directory <- credentialDirectory
-    credentials <- readCredentials directory
-    now <- unixNow
-    putStrLn $ case authStatusAt now credentials of
-        SignedOut -> "Not signed in. Run `rockstar login`."
-        TokenUnexpired -> "Signed in (local token is unexpired; server access has not been checked)."
-        RefreshRequired -> "Signed in; token expired or expires soon. It will refresh before the next request."
+requireSignedIn :: CredentialsM ()
+requireSignedIn = do
+    credentials <- Credentials.load
+    when (isNothing credentials) $ fail "Not signed in. Run `rockstar login` first"
+
+loadCredentials :: Manager -> CredentialsM Credentials
+loadCredentials manager = do
+    stored <- Credentials.load >>= maybe (fail "Not signed in. Run `rockstar login` first") pure
+    now <- liftIO getPOSIXTime
+    if toInteger (expiresAt stored) > floor now + 60
+        then pure stored
+        else do
+            updated <- liftIO $ refreshCredentials manager stored
+            Credentials.save updated
+            pure updated
 
 openBrowser :: String -> IO ()
 openBrowser url = launch `catch` \(_ :: IOException) -> manual

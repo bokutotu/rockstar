@@ -1,24 +1,29 @@
 module Rockstar.Cli (main) where
 
 import           Control.Exception
-import qualified Data.Text           as Text
+import           Control.Monad.IO.Class           (liftIO)
+import           Control.Monad.Trans.State.Strict (evalStateT)
+import qualified Data.Text                        as Text
 import           Options.Applicative
-import qualified Rockstar.Auth       as Auth
-import qualified Rockstar.Chat       as Chat
-import           Rockstar.Chat.Types (defaultModel)
-import           Rockstar.Interrupt  (Interrupted)
+import qualified Rockstar.Auth                    as Auth
+import qualified Rockstar.Chat                    as Chat
+import           Rockstar.Chat.Types              (defaultModel)
+import           Rockstar.Credentials             (CredentialsM)
+import           Rockstar.Interrupt               (Interrupted)
 import           System.Exit
 import           System.IO
-import           System.IO.Error     (isResourceVanishedError)
+import           System.IO.Error                  (ioeGetErrorString,
+                                                   isResourceVanishedError,
+                                                   isUserError)
 
-data Command = Login | AuthStatus | Help [String]
+data Command = Login | Help [String]
 data Cli = Cli Text.Text (Maybe Command)
 
 main :: IO ()
 main = do
     mapM_ (`hSetEncoding` utf8) [stdin, stdout, stderr]
     options <- execParser parserInfo
-    run options `catch` reportError
+    evalStateT (run options) Nothing `catch` reportError
 
 parserInfo :: ParserInfo Cli
 parserInfo =
@@ -43,25 +48,18 @@ parserInfo =
             <*> optional
                 ( hsubparser
                     ( command "login" (info (pure Login) (progDesc "Sign in to Codex through your browser"))
-                        <> command "auth" (info authCommands (progDesc "Inspect locally stored credentials"))
                         <> command
                             "help"
                             (info (Help <$> many (strArgument (metavar "COMMAND"))) (progDesc "Print command help"))
                     )
                 )
-    authCommands =
-        hsubparser
-            ( command
-                "status"
-                (info (pure AuthStatus) (progDesc "Show local authentication status without network requests"))
-            )
 
-run :: Cli -> IO ()
+run :: Cli -> CredentialsM ()
 run (Cli selectedModel command') = case command' of
     Nothing -> Chat.runChat selectedModel
     Just Login -> Auth.login
-    Just AuthStatus -> Auth.status
-    Just (Help commands) -> handleParseResult (execParserPure defaultPrefs parserInfo (commands <> ["--help"])) >>= run
+    Just (Help commands) ->
+        liftIO (handleParseResult (execParserPure defaultPrefs parserInfo (commands <> ["--help"]))) >>= run
 
 reportError :: SomeException -> IO ()
 reportError exception
@@ -73,5 +71,7 @@ reportError exception
   where
     -- GHC's SomeException display also includes backtraces; the CLI needs only
     -- the underlying exception's safe, user-facing diagnostic.
-    message = case exception of SomeException error' -> displayException error'
+    message
+        | Just error' <- fromException exception, isUserError error' = ioeGetErrorString error'
+        | otherwise = case exception of SomeException error' -> displayException error'
     interrupted = hPutStrLn stderr message >> exitWith (ExitFailure 130)

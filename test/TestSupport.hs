@@ -6,7 +6,8 @@ module TestSupport (
     sse,
     withServer,
     streamApp,
-    withCredentialDirectory,
+    withHome,
+    managerAt,
     cliProcess,
     runCli,
     within,
@@ -15,20 +16,24 @@ module TestSupport (
 ) where
 
 import           Control.Concurrent.Async   (concurrently)
-import           Control.Exception          (evaluate)
+import           Control.Exception          (bracket, evaluate)
 import           Data.Aeson
 import qualified Data.ByteString.Base64.URL as Base64
 import qualified Data.ByteString.Lazy       as LBS
 import           Data.Text                  (Text)
 import           Data.Text.Encoding         (decodeUtf8)
 import           Data.Word                  (Word64)
+import           Network.HTTP.Client        (Manager, ManagerSettings (..),
+                                             Request (..),
+                                             defaultManagerSettings, newManager,
+                                             parseRequest)
 import           Network.HTTP.Types         (status200)
 import           Network.Wai                (Application, responseLBS)
 import           Network.Wai.Handler.Warp   (testWithApplication)
-import           Rockstar.Auth.Types
-import           System.Environment         (getEnvironment)
+import           Rockstar.Credentials       (Credentials (..))
+import           System.Environment         (getEnvironment, lookupEnv, setEnv,
+                                             unsetEnv)
 import           System.Exit                (ExitCode)
-import           System.FilePath            ((</>))
 import           System.IO                  (Handle, hGetContents)
 import           System.IO.Temp             (withSystemTempDirectory)
 import           System.Process
@@ -48,8 +53,8 @@ accessTokenFor expiry =
             )
         <> ".test-signature"
 
-credentials :: Word64 -> StoredCredentials
-credentials expiry = StoredCredentials (accessTokenFor expiry) "test-refresh-token" expiry "test-account"
+credentials :: Word64 -> Credentials
+credentials expiry = Credentials (accessTokenFor expiry) "test-refresh-token" expiry "test-account"
 
 message :: Text -> Value
 message text =
@@ -80,8 +85,21 @@ withServer app action = testWithApplication (pure app) $ \port -> action ("http:
 streamApp :: LBS.ByteString -> Application
 streamApp body _ respond = respond (responseLBS status200 [("Content-Type", "text/event-stream; charset=utf-8")] body)
 
-withCredentialDirectory :: (FilePath -> IO a) -> IO a
-withCredentialDirectory action = withSystemTempDirectory "rockstar-test" $ \home -> action (home </> ".rockstar")
+withHome :: (FilePath -> IO a) -> IO a
+withHome action = withSystemTempDirectory "rockstar-test" $ \home ->
+    bracket
+        (lookupEnv "HOME")
+        (maybe (unsetEnv "HOME") (setEnv "HOME"))
+        (\_ -> setEnv "HOME" home >> action home)
+
+managerAt :: String -> IO Manager
+managerAt url = do
+    endpoint <- parseRequest url
+    newManager
+        defaultManagerSettings
+            { managerModifyRequest = \request ->
+                pure request{host = host endpoint, port = port endpoint, secure = secure endpoint, proxy = Nothing}
+            }
 
 -- Outbound provider traffic must fail, even if a test accidentally requests it.
 testEnvironment :: [(String, String)]
