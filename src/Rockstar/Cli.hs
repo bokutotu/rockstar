@@ -5,11 +5,11 @@ import           Control.Monad.IO.Class           (liftIO)
 import           Control.Monad.Trans.State.Strict (evalStateT)
 import qualified Data.Text                        as Text
 import           Options.Applicative
-import qualified Rockstar.Auth                    as Auth
 import qualified Rockstar.Chat                    as Chat
 import           Rockstar.Chat.Types              (defaultModel)
 import           Rockstar.Credentials             (CredentialsM)
 import           Rockstar.Interrupt               (Interrupted)
+import qualified Rockstar.Login                   as Login
 import           System.Exit
 import           System.IO
 import           System.IO.Error                  (ioeGetErrorString,
@@ -57,7 +57,7 @@ parserInfo =
 run :: Cli -> CredentialsM ()
 run (Cli selectedModel command') = case command' of
     Nothing -> Chat.runChat selectedModel
-    Just Login -> Auth.login
+    Just Login -> Login.login
     Just (Help commands) ->
         liftIO (handleParseResult (execParserPure defaultPrefs parserInfo (commands <> ["--help"]))) >>= run
 

@@ -1,5 +1,4 @@
 module Rockstar.Codex (
-    withClient,
     fetchReply,
     fetchReplyAt,
     replyText,
@@ -7,33 +6,28 @@ module Rockstar.Codex (
     CodexError (..),
 ) where
 
-import           Control.Exception                (Exception, catch, throwIO,
-                                                   try)
-import           Control.Monad                    (unless, when)
-import           Control.Monad.IO.Class           (liftIO)
-import           Control.Monad.Trans.State.Strict (StateT (..))
+import           Control.Exception     (Exception, catch, throwIO, try)
+import           Control.Monad         (unless, when)
 import           Data.Aeson
-import qualified Data.Aeson.KeyMap                as KeyMap
-import           Data.Aeson.Types                 (parseMaybe)
-import qualified Data.ByteString                  as BS
-import qualified Data.ByteString.Char8            as BS8
-import           Data.Char                        (isSpace, toLower)
-import           Data.Foldable                    (toList)
+import qualified Data.Aeson.KeyMap     as KeyMap
+import           Data.Aeson.Types      (parseMaybe)
+import qualified Data.ByteString       as BS
+import qualified Data.ByteString.Char8 as BS8
+import           Data.Char             (isSpace, toLower)
+import           Data.Foldable         (toList)
 import           Data.IORef
-import qualified Data.Map.Strict                  as Map
-import           Data.Maybe                       (isJust)
-import           Data.Text                        (Text)
-import qualified Data.Text                        as Text
-import           Data.Text.Encoding               (encodeUtf8)
-import           Data.Word                        (Word64)
-import           Network.HTTP.Client              hiding (requestBody)
-import qualified Network.HTTP.Client              as HTTP
-import           Network.HTTP.Types               (statusCode)
-import qualified Rockstar.Auth                    as Auth
+import qualified Data.Map.Strict       as Map
+import           Data.Maybe            (isJust)
+import           Data.Text             (Text)
+import qualified Data.Text             as Text
+import           Data.Text.Encoding    (encodeUtf8)
+import           Data.Word             (Word64)
+import           Network.HTTP.Client   hiding (requestBody)
+import qualified Network.HTTP.Client   as HTTP
+import           Network.HTTP.Types    (statusCode)
 import           Rockstar.Chat.Types
-import           Rockstar.Credentials             (Credentials (..),
-                                                   CredentialsM)
-import qualified Rockstar.Http                    as Http
+import           Rockstar.Credentials  (Credentials (..))
+import qualified Rockstar.Http         as Http
 
 data CodexError
     = AuthenticationRejected
@@ -61,17 +55,10 @@ instance Show CodexError where
     show GenerationIncomplete = "Codex generation was incomplete; the incomplete turn was not saved"
     show (CodexNetwork operation) = "Network error during " <> Text.unpack operation
 
-withClient :: (Manager -> CredentialsM a) -> CredentialsM a
-withClient action = do
-    Auth.requireSignedIn
-    StateT $ \state -> Http.withManager $ \manager -> runStateT (action manager) state
-
-fetchReply :: Manager -> Conversation -> CredentialsM (Either CodexError Reply)
-fetchReply manager conversation = do
-    credentials <- Auth.loadCredentials manager
-    liftIO $
-        try $
-            fetchReplyAt "https://chatgpt.com/backend-api/codex/responses" manager credentials conversation
+fetchReply :: Manager -> Credentials -> Conversation -> IO (Either CodexError Reply)
+fetchReply manager credentials conversation =
+    try $
+        fetchReplyAt "https://chatgpt.com/backend-api/codex/responses" manager credentials conversation
 
 fetchReplyAt :: String -> Manager -> Credentials -> Conversation -> IO Reply
 fetchReplyAt url manager auth conversation =

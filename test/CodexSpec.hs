@@ -1,26 +1,26 @@
 module CodexSpec (spec) where
 
-import           Control.Exception                (try)
-import           Control.Monad                    (forM_)
-import           Control.Monad.Trans.State.Strict (runStateT)
+import           Control.Exception       (try)
+import           Control.Monad           (forM_)
 import           Data.Aeson
-import qualified Data.ByteString                  as BS
-import qualified Data.ByteString.Builder          as Builder
-import qualified Data.ByteString.Char8            as BS8
-import qualified Data.ByteString.Lazy             as LBS
+import qualified Data.Bifunctor          as Bifunctor
+import qualified Data.ByteString         as BS
+import qualified Data.ByteString.Builder as Builder
+import qualified Data.ByteString.Char8   as BS8
+import qualified Data.ByteString.Lazy    as LBS
 import           Data.IORef
-import           Data.List                        (sort)
-import           Data.Text                        (Text)
-import qualified Data.Text                        as Text
-import           Data.Text.Encoding               (encodeUtf8)
-import           Data.Time.Clock.POSIX            (getPOSIXTime)
+import           Data.List               (sort)
+import           Data.Text               (Text)
+import qualified Data.Text               as Text
+import           Data.Text.Encoding      (encodeUtf8)
 import           Network.HTTP.Types
 import           Network.Wai
 import           Rockstar.Chat.Types
 import           Rockstar.Codex
-import           Rockstar.Credentials             (Credentials (..))
-import qualified Rockstar.Http                    as Http
-import           System.FilePath                  ((</>))
+import           Rockstar.Credentials    (Credentials (..))
+import qualified Rockstar.Http           as Http
+import           System.Directory        (doesPathExist)
+import           System.FilePath         ((</>))
 import           Test.Hspec
 import           TestSupport
 
@@ -119,66 +119,61 @@ spec = describe "Codex transport" $ do
             -- Assert
             action `shouldReturn` expected
 
-    it "keeps refreshed credentials across failed requests" $ withHome $ \home -> do
+    it "uses supplied expired credentials without refreshing or creating storage" $ withHome $ \home -> do
         -- Arrange
-        now <- floor <$> getPOSIXTime
         received <- newIORef []
-        let expiry = now + 3600
-            token = accessTokenFor expiry
+        let auth = credentials 1
             conversation = Conversation defaultModel []
-            expectedCredentials =
-                object
-                    [ "accessToken" .= token
-                    , "refreshToken" .= ("rotated-refresh" :: Text)
-                    , "expiresAt" .= expiry
-                    , "accountId" .= ("test-account" :: Text)
-                    ]
             expected =
                 ( Left RateLimited
                 , Right $ Reply [message "hello"]
-                , Just expectedCredentials
-                , Just expectedCredentials
                 ,
-                    [ ("/oauth/token", Nothing)
-                    , ("/backend-api/codex/responses", Just $ "Bearer " <> encodeUtf8 token)
-                    , ("/backend-api/codex/responses", Just $ "Bearer " <> encodeUtf8 token)
+                    [ ("/backend-api/codex/responses", Just $ "Bearer " <> encodeUtf8 (accessTokenFor 1))
+                    , ("/backend-api/codex/responses", Just $ "Bearer " <> encodeUtf8 (accessTokenFor 1))
                     ]
+                , False
                 )
             app request respond = do
                 previous <- readIORef received
                 modifyIORef' received (<> [(rawPathInfo request, lookup "Authorization" $ requestHeaders request)])
-                if pathInfo request == ["oauth", "token"]
-                    then
-                        respond $
-                            responseLBS status200 [] $
-                                encode $
-                                    object
-                                        [ "access_token" .= token
-                                        , "refresh_token" .= ("rotated-refresh" :: Text)
-                                        , "expires_in" .= (3600 :: Int)
-                                        ]
+                if null previous
+                    then respond $ responseLBS status429 [] "rate limited"
                     else
-                        if length previous == 1
-                            then respond $ responseLBS status429 [] "rate limited"
-                            else
-                                respond $
-                                    responseLBS status200 [("Content-Type", "text/event-stream")] $
-                                        sse [completeEvent [message "hello"]]
+                        respond $
+                            responseLBS status200 [("Content-Type", "text/event-stream")] $
+                                sse [completeEvent [message "hello"]]
 
         -- Act
         let action = withServer app $ \url -> do
                 manager <- managerAt url
-                ((first, second), cached) <-
-                    runStateT
-                        ( do
-                            first <- fetchReply manager conversation
-                            second <- fetchReply manager conversation
-                            pure (first, second)
-                        )
-                        (Just $ credentials 1)
-                stored <- decodeStrict' <$> BS.readFile (home </> ".rockstar" </> "auth.json")
+                firstReply <- fetchReply manager auth conversation
+                secondReply <- fetchReply manager auth conversation
                 requests <- readIORef received
-                pure (first, second, toJSON <$> cached, stored, requests)
+                exists <- doesPathExist (home </> ".rockstar")
+                pure (firstReply, secondReply, requests, exists)
+
+        -- Assert
+        action `shouldReturn` expected
+
+    it "asks for login on authentication rejection without refreshing or retrying" $ do
+        -- Arrange
+        received <- newIORef []
+        let auth = credentials 1
+            conversation = Conversation defaultModel []
+            expected =
+                ( Left "Codex rejected authentication; run `rockstar login` again" :: Either String Reply
+                , [("/backend-api/codex/responses", Just $ "Bearer " <> encodeUtf8 (accessTokenFor 1))]
+                )
+            app request respond = do
+                modifyIORef' received (<> [(rawPathInfo request, lookup "Authorization" $ requestHeaders request)])
+                respond $ responseLBS status401 [] "secret upstream diagnostics"
+
+        -- Act
+        let action = withServer app $ \url -> do
+                manager <- managerAt url
+                result <- Bifunctor.first show <$> fetchReply manager auth conversation
+                requests <- readIORef received
+                pure (result, requests)
 
         -- Assert
         action `shouldReturn` expected
@@ -320,20 +315,21 @@ spec = describe "Codex transport" $ do
             , (status403, AccessDenied)
             , (status429, RateLimited)
             , (status502, RequestRejected 502)
-            ] $ \(status', error') -> do
-            -- Arrange
-            calls <- newIORef (0 :: Int)
-            let app _ respond = modifyIORef' calls (+ 1) >> respond (responseLBS status' [] "secret diagnostics")
-                expected = (Left error', 1)
+            ]
+            $ \(status', error') -> do
+                -- Arrange
+                calls <- newIORef (0 :: Int)
+                let app _ respond = modifyIORef' calls (+ 1) >> respond (responseLBS status' [] "secret diagnostics")
+                    expected = (Left error', 1)
 
-            -- Act
-            let action = withServer app $ \url -> do
-                    result <- try (fetchReplyAt url manager (credentials 4600) (Conversation defaultModel []))
-                    count <- readIORef calls
-                    pure (result, count)
+                -- Act
+                let action = withServer app $ \url -> do
+                        result <- try (fetchReplyAt url manager (credentials 4600) (Conversation defaultModel []))
+                        count <- readIORef calls
+                        pure (result, count)
 
-            -- Assert
-            action `shouldReturn` expected
+                -- Assert
+                action `shouldReturn` expected
 
     it "rejects explicitly non-SSE Content-Types" $ Http.withManager $ \manager ->
         forM_ ["application/json", "text/html", ""] $ \contentType -> do

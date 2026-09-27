@@ -2,6 +2,7 @@ module CliSpec (spec) where
 
 import           Control.Monad                    (forM_)
 import           Control.Monad.Trans.State.Strict (evalStateT)
+import           Data.Aeson                       (decodeStrict', object, (.=))
 import qualified Data.ByteString                  as BS
 import qualified Data.Text                        as Text
 import           Data.Text.Encoding               (decodeUtf8, encodeUtf8)
@@ -34,35 +35,41 @@ spec = describe "CLI" $ do
         -- Assert
         action `shouldReturn` expected
 
-    it "rejects the removed auth command without creating storage" $ withHome $ \home -> do
-        -- Arrange
-        let arguments = ["auth", "status"]
-            input = ""
-            expected =
-                (
-                    ( ExitFailure 1
-                    , ""
-                    , unlines
-                        [ "Invalid argument `auth'"
+    forM_
+        [ (["auth"], "auth")
+        , (["auth", "status"], "auth")
+        , (["auth", "logout"], "auth")
+        , (["status"], "status")
+        , (["logout"], "logout")
+        ] $ \(arguments, command) ->
+        it ("rejects " <> unwords arguments <> " without creating storage") $ withHome $ \home -> do
+            -- Arrange
+            let input = ""
+                expected =
+                    (
+                        ( ExitFailure 1
                         , ""
-                        , "Usage: rockstar [--model MODEL] [COMMAND] [-V|--version]"
-                        , ""
-                        , "  An independent Codex chat harness"
-                        ]
+                        , unlines
+                            [ "Invalid argument `" <> command <> "'"
+                            , ""
+                            , "Usage: rockstar [--model MODEL] [COMMAND] [-V|--version]"
+                            , ""
+                            , "  An independent Codex chat harness"
+                            ]
+                        )
+                    , False
                     )
-                , False
-                )
 
-        -- Act
-        let action = do
-                result <- runCli home arguments input
-                exists <- doesPathExist (home </> ".rockstar")
-                pure (result, exists)
+            -- Act
+            let action = do
+                    result <- runCli home arguments input
+                    exists <- doesPathExist (home </> ".rockstar")
+                    pure (result, exists)
 
-        -- Assert
-        action `shouldReturn` expected
+            -- Assert
+            action `shouldReturn` expected
 
-    it "does not refresh expired credentials until a request is sent" $ withHome $ \home -> do
+    it "starts and exits with expired credentials without sending requests" $ withHome $ \home -> do
         -- Arrange
         putCredentials True
         let arguments = []
@@ -71,6 +78,36 @@ spec = describe "CLI" $ do
 
         -- Act
         let action = runCli home arguments input
+
+        -- Assert
+        action `shouldReturn` expected
+
+    it "attempts a chat request with expired credentials without refreshing or rewriting storage" $ withHome $ \home -> do
+        -- Arrange
+        putCredentials True
+        let arguments = []
+            input = "hello\n"
+            expectedCredentials =
+                object
+                    [ "accessToken" .= ("fake-access-do-not-print" :: Text.Text)
+                    , "refreshToken" .= ("fake-refresh-do-not-print" :: Text.Text)
+                    , "expiresAt" .= (1 :: Int)
+                    , "accountId" .= ("test-account" :: Text.Text)
+                    ]
+            expected =
+                (
+                    ( ExitSuccess
+                    , banner "gpt-6-astra" <> "> \n\n> \n"
+                    , "error: Network error during requesting a Codex response\n"
+                    )
+                , Just expectedCredentials
+                )
+
+        -- Act
+        let action = do
+                result <- runCli home arguments input
+                stored <- decodeStrict' <$> BS.readFile (home </> ".rockstar" </> "auth.json")
+                pure (result, stored)
 
         -- Assert
         action `shouldReturn` expected

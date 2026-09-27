@@ -1,4 +1,5 @@
-module Rockstar.Auth.OAuth (
+module Rockstar.Login (
+    login,
     LoginAttempt (..),
     beginLogin,
     authorizationUrl,
@@ -6,16 +7,18 @@ module Rockstar.Auth.OAuth (
     withCallback,
     exchangeCode,
     exchangeCodeAt,
-    refreshCredentials,
-    refreshAt,
     parseTokens,
 ) where
 
 import           Control.Applicative        ((<|>))
+import           Control.Concurrent         (forkIO)
 import           Control.Concurrent.Async   (race, waitCatch, withAsync)
 import           Control.Concurrent.STM
-import           Control.Exception          (bracket, bracketOnError, catch)
-import           Control.Monad              (unless, when)
+import           Control.Exception          (AsyncException (UserInterrupt),
+                                             IOException, bracket,
+                                             bracketOnError, catch, throwIO)
+import           Control.Monad              (unless, void, when)
+import           Control.Monad.IO.Class     (liftIO)
 import           Crypto.Hash                (Digest, SHA256, hash)
 import           Data.Aeson
 import qualified Data.Aeson.KeyMap          as KeyMap
@@ -28,6 +31,7 @@ import           Data.Text                  (Text)
 import qualified Data.Text                  as Text
 import           Data.Text.Encoding         (decodeUtf8, decodeUtf8',
                                              encodeUtf8)
+import qualified Data.Text.IO               as Text
 import           Data.Time.Clock.POSIX      (getPOSIXTime)
 import           Data.Word                  (Word64)
 import           Network.HTTP.Client        (Manager, responseBody,
@@ -39,10 +43,58 @@ import qualified Network.Socket             as Socket
 import           Network.Wai                (Application, pathInfo, queryString,
                                              requestMethod, responseLBS)
 import           Network.Wai.Handler.Warp
-import           Rockstar.Credentials       (Credentials (..))
+import qualified Rockstar.Credentials       as Credentials
+import           Rockstar.Credentials       (Credentials (..), CredentialsM)
 import qualified Rockstar.Http              as Http
+import           Rockstar.Interrupt         (Interrupted (..))
 import           System.Entropy             (getEntropy)
+import           System.Exit                (ExitCode (ExitSuccess))
+import           System.Info                (os)
+import           System.IO                  (hFlush, stderr, stdout)
+import           System.Process
 import           System.Timeout             (timeout)
+
+login :: CredentialsM ()
+login = do
+    credentials <-
+        liftIO $
+            signIn `catch` \interruption -> case interruption of
+                UserInterrupt -> throwIO (Interrupted "Login cancelled")
+                other         -> throwIO other
+    Credentials.save credentials
+    liftIO $ putStrLn "Signed in."
+  where
+    signIn = Http.withManager $ \manager -> do
+        attempt <- beginLogin
+        withCallback attempt 1455 $ \_ waitForCode -> do
+            let url = authorizationUrl attempt
+            Text.putStrLn
+                ( "Open this URL to sign in:\n"
+                    <> url
+                    <> "\n\nWaiting for authorization (10-minute timeout; Ctrl+C cancels)..."
+                )
+            hFlush stdout
+            openBrowser (Text.unpack url)
+            code <- waitForCode
+            exchangeCode manager attempt code
+
+openBrowser :: String -> IO ()
+openBrowser url = launch `catch` \(_ :: IOException) -> manual
+  where
+    manual = Text.hPutStrLn stderr "Could not open a browser automatically. Open the URL above manually."
+    launch = do
+        let command = if os == "darwin" then "open" else "xdg-open"
+        (_, _, _, process) <-
+            createProcess
+                (proc command [url])
+                    { std_in = NoStream
+                    , std_out = NoStream
+                    , std_err = NoStream
+                    , close_fds = True
+                    }
+        void $ forkIO $ do
+            result <- waitForProcess process
+            when (result /= ExitSuccess) manual
 
 -- Public Codex client ID, not a client secret. The originator identifies rockstar.
 clientId, redirectUri :: BS.ByteString
@@ -88,61 +140,30 @@ exchangeCode :: Manager -> LoginAttempt -> Text -> IO Credentials
 exchangeCode = exchangeCodeAt tokenUrl
 
 exchangeCodeAt :: String -> Manager -> LoginAttempt -> Text -> IO Credentials
-exchangeCodeAt url manager attempt code =
-    requestTokens
-        url
-        manager
-        Nothing
-        [ ("grant_type", "authorization_code")
-        , ("client_id", clientId)
-        , ("code", encodeUtf8 code)
-        , ("code_verifier", encodeUtf8 (pkceVerifier attempt))
-        , ("redirect_uri", redirectUri)
-        ]
-
-refreshCredentials :: Manager -> Credentials -> IO Credentials
-refreshCredentials = refreshAt tokenUrl
-
-refreshAt :: String -> Manager -> Credentials -> IO Credentials
-refreshAt url manager previous =
-    requestTokens
-        url
-        manager
-        (Just previous)
-        [ ("grant_type", "refresh_token")
-        , ("client_id", clientId)
-        , ("refresh_token", encodeUtf8 (refreshToken previous))
-        ]
-
-requestTokens
-    :: String
-    -> Manager
-    -> Maybe Credentials
-    -> [(BS.ByteString, BS.ByteString)]
-    -> IO Credentials
-requestTokens url manager previous form = do
+exchangeCodeAt url manager attempt code = do
     now <- floor <$> getPOSIXTime
-    let operation = case previous of
-            Nothing -> "exchanging the authorization code"
-            Just _  -> "refreshing credentials"
+    let operation = "exchanging the authorization code"
+        form =
+            [ ("grant_type", "authorization_code")
+            , ("client_id", clientId)
+            , ("code", encodeUtf8 code)
+            , ("code_verifier", encodeUtf8 (pkceVerifier attempt))
+            , ("redirect_uri", redirectUri)
+            ]
     result <-
         ( timeout (30 * 1000000) $ Http.network operation $ do
             base <- Http.request url
             let request = (urlEncodedBody form base){responseTimeout = responseTimeoutMicro (30 * 1000000)}
             withResponse request manager $ \response -> do
-                let code = statusCode (responseStatus response)
-                unless (code >= 200 && code < 300) $ ioError $ userError $ case previous of
-                    Nothing ->
-                        "OpenAI rejected the authorization-code exchange (HTTP "
-                            <> show code
-                            <> "); run `rockstar login` again"
-                    Just _
-                        | code `elem` [400, 401, 403] ->
-                            "OpenAI rejected the refresh token (HTTP " <> show code <> "); run `rockstar login` again"
-                        | otherwise ->
-                            "Token endpoint failed (HTTP " <> show code <> "); existing credentials were preserved"
+                let status = statusCode (responseStatus response)
+                unless (status >= 200 && status < 300) $
+                    ioError $
+                        userError $
+                            "OpenAI rejected the authorization-code exchange (HTTP "
+                                <> show status
+                                <> "); run `rockstar login` again"
                 body <- Http.limitedBody (256 * 1024) (responseBody response)
-                either (ioError . userError) pure (parseTokens now previous body)
+                either (ioError . userError) pure (parseTokens now body)
         )
             `catch` \(_ :: Http.HttpError) -> ioError $ userError $ "Network error during " <> Text.unpack operation
     maybe (ioError $ userError $ "Network error during " <> Text.unpack operation) pure result
@@ -156,8 +177,8 @@ instance FromJSON TokenResponse where
             <*> o .:? "id_token"
             <*> o .:? "expires_in"
 
-parseTokens :: Word64 -> Maybe Credentials -> BS.ByteString -> Either String Credentials
-parseTokens now previous body = do
+parseTokens :: Word64 -> BS.ByteString -> Either String Credentials
+parseTokens now body = do
     TokenResponse access refresh idToken ttl <-
         either
             (const $ Left "Invalid token endpoint response: malformed or missing token fields")
@@ -170,9 +191,7 @@ parseTokens now previous body = do
         maybe
             (Left "Invalid token endpoint response: missing ChatGPT account ID")
             Right
-            ((accessClaims >>= claimAccount) <|> (idClaims >>= claimAccount) <|> (accountId <$> previous))
-    when (maybe False ((/= account) . accountId) previous) $
-        Left "Refreshed credentials belong to a different account; run `rockstar login` again"
+            ((accessClaims >>= claimAccount) <|> (idClaims >>= claimAccount))
     expiry <- case (ttl, jwtExpiry) of
         (Just seconds, jwt) -> do
             let total = toInteger now + toInteger seconds
@@ -187,7 +206,7 @@ parseTokens now previous body = do
         maybe
             (Left "Invalid token endpoint response: missing refresh token")
             Right
-            (refresh <|> (refreshToken <$> previous))
+            refresh
     unless (all (not . Text.null) [access, refreshToken', account]) $
         Left "Invalid token endpoint response: empty credential fields"
     pure (Credentials access refreshToken' expiry account)

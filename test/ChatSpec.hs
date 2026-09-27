@@ -1,19 +1,16 @@
 module ChatSpec (spec) where
 
-import           Control.Exception                (AsyncException (UserInterrupt),
-                                                   throwIO, try, tryJust)
-import           Control.Monad                    (forM_)
-import           Control.Monad.IO.Class           (liftIO)
-import           Control.Monad.Trans.State.Strict (evalStateT, runStateT)
+import           Control.Exception      (AsyncException (UserInterrupt),
+                                         throwIO, try, tryJust)
+import           Control.Monad          (forM_)
 import           Data.Aeson
 import           Data.IORef
-import           Data.Text                        (Text)
+import           Data.Text              (Text)
 import           Rockstar.Chat.Internal
 import           Rockstar.Chat.Types
 import           Rockstar.Codex
-import           Rockstar.Credentials             (Credentials (..), save)
-import qualified Rockstar.Http                    as Http
-import           Rockstar.Interrupt               (Interrupted (..))
+import qualified Rockstar.Http          as Http
+import           Rockstar.Interrupt     (Interrupted (..))
 import           Test.Hspec
 import           TestSupport
 
@@ -67,9 +64,8 @@ spec = describe "chat" $ do
 
         -- Act
         let action = withServer (streamApp body) $ \url -> do
-                let send conversation = liftIO $ try $ fetchReplyAt url manager (credentials 4600) conversation
-                next <-
-                    evalStateT (sendTurn send original "hi" (\text' -> modifyIORef' display (<> [text']))) Nothing
+                let send conversation = try $ fetchReplyAt url manager (credentials 4600) conversation
+                next <- sendTurn send original "hi" (\text' -> modifyIORef' display (<> [text']))
                 displayed <- readIORef display
                 pure (next, displayed)
 
@@ -95,54 +91,26 @@ spec = describe "chat" $ do
 
             -- Act
             let action = withServer (streamApp $ sse (partial : events)) $ \url -> do
-                    let send conversation = liftIO $ try $ fetchReplyAt url manager (credentials 4600) conversation
-                    result <-
-                        evalStateT (sendTurn send original "hi" (\text -> modifyIORef' display (<> [text]))) Nothing
+                    let send conversation = try $ fetchReplyAt url manager (credentials 4600) conversation
+                    result <- sendTurn send original "hi" (\text -> modifyIORef' display (<> [text]))
                     displayed <- readIORef display
                     pure (result, displayed)
 
             -- Assert
             action `shouldReturn` expected
 
-    it "keeps updated credentials when a turn fails" $ withHome $ \_ -> do
-        -- Arrange
-        display <- newIORef []
-        let original = Conversation defaultModel [message "previous"]
-            updated = Credentials "new-access" "new-refresh" 4600 "test-account"
-            send _ = save updated >> pure (Left RateLimited)
-            expectedCredentials =
-                object
-                    [ "accessToken" .= ("new-access" :: Text)
-                    , "refreshToken" .= ("new-refresh" :: Text)
-                    , "expiresAt" .= (4600 :: Int)
-                    , "accountId" .= ("test-account" :: Text)
-                    ]
-            expected = (Left RateLimited, Just expectedCredentials, [])
-
-        -- Act
-        let action = do
-                (result, cached) <-
-                    runStateT
-                        (sendTurn send original "hi" (\text -> modifyIORef' display (<> [text])))
-                        (Just $ credentials 1)
-                displayed <- readIORef display
-                pure (result, toJSON <$> cached, displayed)
-
-        -- Assert
-        action `shouldReturn` expected
-
     it "does not display or return a conversation when interrupted" $ do
         -- Arrange
         display <- newIORef []
         let original = Conversation defaultModel [message "previous"]
-            cancelled _ = liftIO $ throwIO UserInterrupt
+            cancelled _ = throwIO UserInterrupt
             expected = (Left "Interrupted; the incomplete turn was not saved", [])
 
         -- Act
         let action = do
                 result <-
                     tryJust (\(Interrupted reason) -> Just reason) $
-                        evalStateT (sendTurn cancelled original "hi" (\text -> modifyIORef' display (<> [text]))) Nothing
+                        sendTurn cancelled original "hi" (\text -> modifyIORef' display (<> [text]))
                 displayed <- readIORef display
                 pure (result, displayed)
 
