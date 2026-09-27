@@ -10,5 +10,6 @@ auth.json
 .env.*
 !.env.example
 /cabal.project.local
+*.cabal
 *.hi
 *.o

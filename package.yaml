@@ -14,10 +14,6 @@ dependencies:
 
 library:
   source-dirs: src
-  exposed-modules:
-    - Rockstar.Auth
-    - Rockstar.Chat
-    - Rockstar.Cli
   dependencies: &implementation-dependencies
     aeson: ">=2.2"
     async: {}
