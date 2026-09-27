@@ -1,0 +1,61 @@
+spec-version: 0.36.0
+name: rockstar
+version: 0.1.0.0
+synopsis: An independent Codex chat harness
+extra-source-files: package.yaml
+verbatim:
+  cabal-version: 3.0
+
+language: GHC2024
+default-extensions: OverloadedStrings
+ghc-options: -Wall
+dependencies:
+  base: ">=4.20 && <5"
+
+library:
+  source-dirs: src
+  exposed-modules:
+    - Rockstar.Auth
+    - Rockstar.Chat
+    - Rockstar.Cli
+  dependencies: &implementation-dependencies
+    aeson: ">=2.2"
+    async: {}
+    base64-bytestring: {}
+    bytestring: {}
+    containers: {}
+    crypton: {}
+    directory: {}
+    entropy: {}
+    filepath: {}
+    http-client: {}
+    http-client-tls: {}
+    http-types: {}
+    memory: {}
+    network: {}
+    optparse-applicative: {}
+    process: {}
+    stm: {}
+    temporary: {}
+    text: {}
+    time: {}
+    unix: ">=2.8.7"
+    wai: {}
+    warp: {}
+
+executables:
+  rockstar:
+    main: Main.hs
+    source-dirs: app
+    ghc-options: [-threaded, -rtsopts]
+    dependencies: [rockstar]
+
+tests:
+  rockstar-test:
+    main: Main.hs
+    source-dirs: [test, src]
+    ghc-options: [-threaded, -rtsopts]
+    build-tools: [rockstar:rockstar]
+    dependencies:
+      <<: *implementation-dependencies
+      hspec: {}

@@ -5,7 +5,6 @@ module Rockstar.Auth.Storage (
     readCredentials,
     saveLogin,
     saveUnlocked,
-    removeCredentials,
     withLock,
 ) where
 
@@ -23,8 +22,7 @@ import           Foreign.C.Types        (CInt (..))
 import           GHC.Clock              (getMonotonicTimeNSec)
 import           Rockstar.Auth.Error
 import           Rockstar.Auth.Types
-import           System.Directory       (getHomeDirectory, removeFile,
-                                         renameFile)
+import           System.Directory       (getHomeDirectory, renameFile)
 import           System.FilePath        ((</>))
 import           System.IO              (hClose, hFlush, hSetBinaryMode)
 import           System.IO.Error        (isAlreadyExistsError,
@@ -78,13 +76,6 @@ saveUnlocked directoryPath credentials = credentialIO "save credentials" $ do
         bracket (openPrivate temporary False) closeFd fileSynchronise
         renameFile temporary path
         syncDirectory directoryPath
-
-removeCredentials :: FilePath -> IO ()
-removeCredentials directoryPath = credentialIO "remove auth.json" $ do
-    exists <- privateDirectory directoryPath False
-    when exists $ withLock directoryPath $ do
-        removed <- missingOK (removeFile (directoryPath </> "auth.json"))
-        when (removed /= Nothing) $ syncDirectory directoryPath
 
 -- Never unlink auth.lock: separate inodes would allow concurrent lock owners.
 

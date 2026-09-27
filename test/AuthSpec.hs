@@ -47,21 +47,43 @@ spec = do
             authStatusAt 939 Nothing `shouldBe` SignedOut
 
     describe "private credential storage" $ do
-        it "round-trips, enforces permissions, and logs out idempotently" $ withCredentialDirectory $ \directory -> do
-            fmap toJSON <$> readCredentials directory `shouldReturn` Nothing
-            removeCredentials directory
-            doesPathExist directory `shouldReturn` False
-            saveLogin directory (credentials 4600)
-            fmap toJSON <$> readCredentials directory `shouldReturn` Just (toJSON $ credentials 4600)
-            modes <-
-                mapM
-                    (fmap ((.&. 0o777) . fileMode) . getFileStatus)
-                    [directory, directory </> "auth.json", directory </> "auth.lock"]
-            modes `shouldBe` [0o700, 0o600, 0o600]
-            removeCredentials directory
-            removeCredentials directory
-            doesFileExist (directory </> "auth.lock") `shouldReturn` True
-            fmap toJSON <$> readCredentials directory `shouldReturn` Nothing
+        it "does not create storage when credentials are absent" $ withCredentialDirectory $ \directory -> do
+            -- Arrange
+            let expected = (Nothing :: Maybe Value, False)
+
+            -- Act
+            let action = do
+                    stored <- readCredentials directory
+                    exists <- doesPathExist directory
+                    pure (toJSON <$> stored, exists)
+
+            -- Assert
+            action `shouldReturn` expected
+
+        it "round-trips credentials with private permissions" $ withCredentialDirectory $ \directory -> do
+            -- Arrange
+            let input = StoredCredentials "test-access-token" "test-refresh-token" 4600 "test-account"
+                paths = [directory, directory </> "auth.json", directory </> "auth.lock"]
+                expected =
+                    ( Just $
+                        object
+                            [ "access_token" .= ("test-access-token" :: Text)
+                            , "refresh_token" .= ("test-refresh-token" :: Text)
+                            , "expires_at" .= (4600 :: Int)
+                            , "account_id" .= ("test-account" :: Text)
+                            ]
+                    , [0o700, 0o600, 0o600]
+                    )
+
+            -- Act
+            let action = do
+                    saveLogin directory input
+                    stored <- readCredentials directory
+                    modes <- mapM (fmap ((.&. 0o777) . fileMode) . getFileStatus) paths
+                    pure (toJSON <$> stored, modes)
+
+            -- Assert
+            action `shouldReturn` expected
 
         it "rejects corrupt and oversized files without quoting their contents" $ withCredentialDirectory $ \directory -> do
             saveLogin directory (credentials 4600)
@@ -271,22 +293,6 @@ spec = do
                 concurrently run run `shouldReturn` ((ExitSuccess, "", ""), (ExitSuccess, "", ""))
             readIORef calls `shouldReturn` 1
             fmap toJSON <$> readCredentials directory `shouldReturn` Just (toJSON updated)
-
-        it "makes logout wait for refresh without resurrecting credentials" $ withCredentialDirectory $ \directory -> do
-            now <- unixNow
-            saveLogin directory (credentials 1)
-            started <- newEmptyMVar
-            release <- newEmptyMVar
-            let refresh _ = putMVar started () >> takeMVar release >> pure (credentials $ now + 3600)
-            withAsync (loadChatAuthIn directory refresh) $ \updating -> do
-                within $ takeMVar started
-                withAsync (removeCredentials directory) $ \loggingOut -> do
-                    threadDelay 50000
-                    maybe True (const False) <$> poll loggingOut `shouldReturn` True
-                    putMVar release ()
-                    void $ within $ wait updating
-                    within $ wait loggingOut
-            fmap toJSON <$> readCredentials directory `shouldReturn` Nothing
 
         it "persists the rotating token before propagating interruption" $ withCredentialDirectory $ \directory -> do
             now <- unixNow

@@ -1,81 +1,130 @@
 cabal-version: 3.0
-name: rockstar
-version: 0.1.0.0
-synopsis: An independent Codex chat harness
-build-type: Simple
 
-common settings
-  default-language: GHC2021
-  default-extensions: OverloadedStrings LambdaCase
-  ghc-options: -Wall
-  build-depends:
-    base >=4.20 && <5,
-    aeson >=2.2,
-    async,
-    base64-bytestring,
-    bytestring,
-    containers,
-    crypton,
-    directory,
-    entropy,
-    filepath,
-    http-client,
-    http-client-tls,
-    http-types,
-    memory,
-    network,
-    optparse-applicative,
-    process,
-    stm,
-    temporary,
-    text,
-    time,
-    unix >=2.8.7,
-    wai,
-    warp
+-- This file has been generated from package.yaml by hpack version 0.38.3.
+--
+-- see: https://github.com/sol/hpack
 
-common implementation
-  hs-source-dirs: src
-  other-modules:
-    Rockstar.Auth.Error
-    Rockstar.Auth.Internal
-    Rockstar.Auth.OAuth
-    Rockstar.Auth.Storage
-    Rockstar.Auth.Types
-    Rockstar.Chat.Internal
-    Rockstar.Chat.Types
-    Rockstar.Codex
-    Rockstar.Http
-    Rockstar.Interrupt
+name:           rockstar
+version:        0.1.0.0
+synopsis:       An independent Codex chat harness
+build-type:     Simple
+extra-source-files:
+    package.yaml
 
 library
-  import: settings, implementation
   exposed-modules:
-    Rockstar.Auth
-    Rockstar.Chat
-    Rockstar.Cli
+      Rockstar.Auth
+      Rockstar.Chat
+      Rockstar.Cli
+  other-modules:
+      Rockstar.Auth.Error
+      Rockstar.Auth.Internal
+      Rockstar.Auth.OAuth
+      Rockstar.Auth.Storage
+      Rockstar.Auth.Types
+      Rockstar.Chat.Internal
+      Rockstar.Chat.Types
+      Rockstar.Codex
+      Rockstar.Http
+      Rockstar.Interrupt
+  hs-source-dirs:
+      src
+  default-extensions:
+      OverloadedStrings
+  ghc-options: -Wall
+  build-depends:
+      aeson >=2.2
+    , async
+    , base >=4.20 && <5
+    , base64-bytestring
+    , bytestring
+    , containers
+    , crypton
+    , directory
+    , entropy
+    , filepath
+    , http-client
+    , http-client-tls
+    , http-types
+    , memory
+    , network
+    , optparse-applicative
+    , process
+    , stm
+    , temporary
+    , text
+    , time
+    , unix >=2.8.7
+    , wai
+    , warp
+  default-language: GHC2024
 
 executable rockstar
-  default-language: GHC2021
-  ghc-options: -Wall -threaded -rtsopts
-  hs-source-dirs: app
   main-is: Main.hs
-  build-depends: base, rockstar
+  hs-source-dirs:
+      app
+  default-extensions:
+      OverloadedStrings
+  ghc-options: -Wall -threaded -rtsopts
+  build-depends:
+      base >=4.20 && <5
+    , rockstar
+  default-language: GHC2024
 
 test-suite rockstar-test
-  import: settings, implementation
   type: exitcode-stdio-1.0
-  hs-source-dirs: test
   main-is: Main.hs
-  ghc-options: -threaded -rtsopts
   other-modules:
-    Rockstar.Auth
-    Rockstar.Chat
-    Rockstar.Cli
-    AuthSpec
-    ChatSpec
-    CliSpec
-    CodexSpec
-    TestSupport
-  build-depends: hspec
-  build-tool-depends: rockstar:rockstar
+      AuthSpec
+      ChatSpec
+      CliSpec
+      CodexSpec
+      TestSupport
+      Rockstar.Auth
+      Rockstar.Auth.Error
+      Rockstar.Auth.Internal
+      Rockstar.Auth.OAuth
+      Rockstar.Auth.Storage
+      Rockstar.Auth.Types
+      Rockstar.Chat
+      Rockstar.Chat.Internal
+      Rockstar.Chat.Types
+      Rockstar.Cli
+      Rockstar.Codex
+      Rockstar.Http
+      Rockstar.Interrupt
+  hs-source-dirs:
+      test
+      src
+  default-extensions:
+      OverloadedStrings
+  ghc-options: -Wall -threaded -rtsopts
+  build-tool-depends:
+      rockstar:rockstar
+  build-depends:
+      aeson >=2.2
+    , async
+    , base >=4.20 && <5
+    , base64-bytestring
+    , bytestring
+    , containers
+    , crypton
+    , directory
+    , entropy
+    , filepath
+    , hspec
+    , http-client
+    , http-client-tls
+    , http-types
+    , memory
+    , network
+    , optparse-applicative
+    , process
+    , stm
+    , temporary
+    , text
+    , time
+    , unix >=2.8.7
+    , wai
+    , warp
+  default-language: GHC2024

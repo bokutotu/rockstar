@@ -1,4 +1,4 @@
-module Rockstar.Auth (login, status, logout) where
+module Rockstar.Auth (login, status) where
 
 import           Control.Concurrent    (forkIO)
 import           Control.Exception     (AsyncException (UserInterrupt),
@@ -50,12 +50,6 @@ status = do
         SignedOut -> "Not signed in. Run `rockstar login`."
         TokenUnexpired -> "Signed in (local token is unexpired; server access has not been checked)."
         RefreshRequired -> "Signed in; token expired or expires soon. It will refresh before the next request."
-
-logout :: IO ()
-logout = do
-    directory <- credentialDirectory
-    removeCredentials directory
-    putStrLn "Local credentials removed."
 
 openBrowser :: String -> IO ()
 openBrowser url = launch `catch` \(_ :: IOException) -> manual

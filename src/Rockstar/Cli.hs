@@ -11,7 +11,7 @@ import           System.Exit
 import           System.IO
 import           System.IO.Error     (isResourceVanishedError)
 
-data Command = Login | AuthStatus | AuthLogout | Help [String]
+data Command = Login | AuthStatus | Help [String]
 data Cli = Cli Text.Text (Maybe Command)
 
 main :: IO ()
@@ -43,7 +43,7 @@ parserInfo =
             <*> optional
                 ( hsubparser
                     ( command "login" (info (pure Login) (progDesc "Sign in to Codex through your browser"))
-                        <> command "auth" (info authCommands (progDesc "Inspect or remove locally stored credentials"))
+                        <> command "auth" (info authCommands (progDesc "Inspect locally stored credentials"))
                         <> command
                             "help"
                             (info (Help <$> many (strArgument (metavar "COMMAND"))) (progDesc "Print command help"))
@@ -54,9 +54,6 @@ parserInfo =
             ( command
                 "status"
                 (info (pure AuthStatus) (progDesc "Show local authentication status without network requests"))
-                <> command
-                    "logout"
-                    (info (pure AuthLogout) (progDesc "Remove local credentials (does not revoke other sessions)"))
             )
 
 run :: Cli -> IO ()
@@ -64,7 +61,6 @@ run (Cli selectedModel command') = case command' of
     Nothing -> Chat.runChat selectedModel
     Just Login -> Auth.login
     Just AuthStatus -> Auth.status
-    Just AuthLogout -> Auth.logout
     Just (Help commands) -> handleParseResult (execParserPure defaultPrefs parserInfo (commands <> ["--help"])) >>= run
 
 reportError :: SomeException -> IO ()

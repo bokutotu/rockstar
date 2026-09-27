@@ -1,5 +1,6 @@
 module CliSpec (spec) where
 
+import           Control.Monad         (forM_)
 import qualified Data.ByteString       as BS
 import qualified Data.Text             as Text
 import           Data.Text.Encoding    (decodeUtf8, encodeUtf8)
@@ -17,23 +18,73 @@ import           TestSupport
 
 spec :: Spec
 spec = describe "CLI" $ do
-    it "status/logout do not create storage and missing login is actionable" $ withHome $ \home -> do
-        runCli home ["auth", "status"] ""
-            `shouldReturn` (ExitSuccess, "Not signed in. Run `rockstar login`.\n", "")
-        runCli home ["auth", "logout"] "" `shouldReturn` (ExitSuccess, "Local credentials removed.\n", "")
-        doesPathExist (home </> ".rockstar") `shouldReturn` False
-        runCli home [] ""
-            `shouldReturn` (ExitFailure 1, "", "error: Not signed in. Run `rockstar login` first\n")
+    it "shows signed-out status without creating storage" $ withHome $ \home -> do
+        -- Arrange
+        let arguments = ["auth", "status"]
+            input = ""
+            expected = ((ExitSuccess, "Not signed in. Run `rockstar login`.\n", ""), False)
 
-    it "shows local status and logs out without displaying tokens" $ withHome $ \home -> do
+        -- Act
+        let action = do
+                result <- runCli home arguments input
+                exists <- doesPathExist (home </> ".rockstar")
+                pure (result, exists)
+
+        -- Assert
+        action `shouldReturn` expected
+
+    it "reports missing login" $ withHome $ \home -> do
+        -- Arrange
+        let arguments = []
+            input = ""
+            expected = (ExitFailure 1, "", "error: Not signed in. Run `rockstar login` first\n")
+
+        -- Act
+        let action = runCli home arguments input
+
+        -- Assert
+        action `shouldReturn` expected
+
+    it "shows local status without displaying tokens" $ withHome $ \home -> do
+        -- Arrange
         putCredentials home False
-        runCli home ["auth", "status"] ""
-            `shouldReturn` (ExitSuccess, "Signed in (local token is unexpired; server access has not been checked).\n", "")
-        runCli home ["auth", "logout"] "" `shouldReturn` (ExitSuccess, "Local credentials removed.\n", "")
-        runCli home ["auth", "logout"] "" `shouldReturn` (ExitSuccess, "Local credentials removed.\n", "")
-        runCli home ["auth", "status"] ""
-            `shouldReturn` (ExitSuccess, "Not signed in. Run `rockstar login`.\n", "")
-        doesPathExist (home </> ".rockstar" </> "auth.json") `shouldReturn` False
+        let arguments = ["auth", "status"]
+            input = ""
+            expected = (ExitSuccess, "Signed in (local token is unexpired; server access has not been checked).\n", "")
+
+        -- Act
+        let action = runCli home arguments input
+
+        -- Assert
+        action `shouldReturn` expected
+
+    it "rejects the removed logout command without creating storage" $ withHome $ \home -> do
+        -- Arrange
+        let arguments = ["auth", "logout"]
+            input = ""
+            expected =
+                (
+                    ( ExitFailure 1
+                    , ""
+                    , unlines
+                        [ "Invalid argument `logout'"
+                        , ""
+                        , "Usage: rockstar auth COMMAND"
+                        , ""
+                        , "  Inspect locally stored credentials"
+                        ]
+                    )
+                , False
+                )
+
+        -- Act
+        let action = do
+                result <- runCli home arguments input
+                exists <- doesPathExist (home </> ".rockstar")
+                pure (result, exists)
+
+        -- Assert
+        action `shouldReturn` expected
 
     it "reports expiration locally without refreshing" $ withHome $ \home -> do
         putCredentials home True
@@ -82,7 +133,7 @@ spec = describe "CLI" $ do
         runCli home ["auth", "status"] ""
             `shouldReturn` (ExitFailure 1, "", "error: Invalid auth.json; run `rockstar login` to replace it\n")
 
-    it "supports help/version without creating files" $ withHome $ \home -> do
+    describe "help and version" $ do
         let help =
                 unlines
                     [ "Usage: rockstar [--model MODEL] [COMMAND] [-V|--version]"
@@ -97,16 +148,45 @@ spec = describe "CLI" $ do
                     , ""
                     , "Available commands:"
                     , "  login                    Sign in to Codex through your browser"
-                    , "  auth                     Inspect or remove locally stored credentials"
+                    , "  auth                     Inspect locally stored credentials"
                     , "  help                     Print command help"
                     , ""
                     , "Run without a subcommand to chat. Type /exit or send EOF to quit. Defaults:"
                     , "gpt-6-astra, reasoning=max, Fast mode on (priority)."
                     ]
-        runCli home ["--help"] "" `shouldReturn` (ExitSuccess, help, "")
-        runCli home ["help"] "" `shouldReturn` (ExitSuccess, help, "")
-        runCli home ["--version"] "" `shouldReturn` (ExitSuccess, "rockstar 0.1.0\n", "")
-        doesPathExist (home </> ".rockstar") `shouldReturn` False
+            authHelp =
+                unlines
+                    [ "Usage: rockstar auth COMMAND"
+                    , ""
+                    , "  Inspect locally stored credentials"
+                    , ""
+                    , "Available options:"
+                    , "  -h,--help                Show this help text"
+                    , ""
+                    , "Available commands:"
+                    , "  status                   Show local authentication status without network"
+                    , "                           requests"
+                    ]
+        forM_
+            [ (["--help"], help)
+            , (["help"], help)
+            , (["auth", "--help"], authHelp)
+            , (["help", "auth"], authHelp)
+            , (["--version"], "rockstar 0.1.0\n")
+            ]
+            $ \(arguments, output) -> it ("supports " <> unwords arguments <> " without creating files") $ withHome $ \home -> do
+                -- Arrange
+                let input = ""
+                    expected = ((ExitSuccess, output, ""), False)
+
+                -- Act
+                let action = do
+                        result <- runCli home arguments input
+                        exists <- doesPathExist (home </> ".rockstar")
+                        pure (result, exists)
+
+                -- Assert
+                action `shouldReturn` expected
 
 withHome :: (FilePath -> IO a) -> IO a
 withHome = withSystemTempDirectory "rockstar-cli"
