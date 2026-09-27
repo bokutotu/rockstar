@@ -35,6 +35,7 @@ library:
     temporary: {}
     text: {}
     time: {}
+    transformers: {}
     unix: ">=2.8.7"
     wai: {}
     warp: {}
@@ -48,10 +49,10 @@ executables:
 
 tests:
   rockstar-test:
-    main: Main.hs
+    main: Spec.hs
     source-dirs: [test, src]
     ghc-options: [-threaded, -rtsopts]
-    build-tools: [rockstar:rockstar]
+    build-tools: [hspec-discover:hspec-discover, rockstar:rockstar]
     dependencies:
       <<: *implementation-dependencies
       hspec: {}

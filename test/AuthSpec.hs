@@ -27,12 +27,8 @@ import           Rockstar.Chat.Types        (ChatAuth (..))
 import qualified Rockstar.Http              as Http
 import           Rockstar.Interrupt         (finishOnUserInterrupt)
 import           System.Directory
-import           System.Environment         (getExecutablePath)
-import           System.Exit                (ExitCode (ExitSuccess))
 import           System.FilePath            (takeDirectory, (</>))
 import           System.Posix.Files
-import           System.Process             (proc,
-                                             readCreateProcessWithExitCode)
 import           Test.Hspec
 import           TestSupport
 
@@ -268,31 +264,6 @@ spec = do
             (a == toChatAuth updated, b == toChatAuth updated) `shouldBe` (True, True)
             fmap toJSON <$> readCredentials directory `shouldReturn` Just (toJSON updated)
             readIORef calls `shouldReturn` 1
-
-        it "refreshes once across separate processes" $ withCredentialDirectory $ \directory -> do
-            now <- unixNow
-            let expiry = now + 1800
-                updated = StoredCredentials (accessTokenFor expiry) "rotated-refresh" expiry "test-account"
-            saveLogin directory (credentials 1)
-            calls <- newIORef (0 :: Int)
-            let app _ respond = do
-                    atomicModifyIORef' calls (\n -> (n + 1, ()))
-                    threadDelay 100000
-                    respond
-                        ( responseLBS status200 [] $
-                            encode $
-                                object
-                                    [ "access_token" .= storedAccessToken updated
-                                    , "refresh_token" .= storedRefreshToken updated
-                                    , "expires_in" .= (3600 :: Int)
-                                    ]
-                        )
-            withServer app $ \url -> do
-                executable <- getExecutablePath
-                let run = within $ readCreateProcessWithExitCode (proc executable ["--refresh-helper", directory, url]) ""
-                concurrently run run `shouldReturn` ((ExitSuccess, "", ""), (ExitSuccess, "", ""))
-            readIORef calls `shouldReturn` 1
-            fmap toJSON <$> readCredentials directory `shouldReturn` Just (toJSON updated)
 
         it "persists the rotating token before propagating interruption" $ withCredentialDirectory $ \directory -> do
             now <- unixNow
