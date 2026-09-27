@@ -8,7 +8,6 @@ import           Options.Applicative
 import qualified Rockstar.Chat                    as Chat
 import           Rockstar.Chat.Types              (defaultModel)
 import           Rockstar.Credentials             (CredentialsM)
-import           Rockstar.Interrupt               (Interrupted)
 import qualified Rockstar.Login                   as Login
 import           System.Exit
 import           System.IO
@@ -64,7 +63,6 @@ run (Cli selectedModel command') = case command' of
 reportError :: SomeException -> IO ()
 reportError exception
     | Just code <- fromException exception = exitWith (code :: ExitCode)
-    | Just (_ :: Interrupted) <- fromException exception = interrupted
     | Just UserInterrupt <- fromException exception = interrupted
     | Just ioError' <- fromException exception, isResourceVanishedError ioError' = exitSuccess
     | otherwise = hPutStrLn stderr ("error: " <> message) >> exitFailure

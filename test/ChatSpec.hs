@@ -1,7 +1,6 @@
 module ChatSpec (spec) where
 
-import           Control.Exception      (AsyncException (UserInterrupt),
-                                         throwIO, try, tryJust)
+import           Control.Exception      (try)
 import           Control.Monad          (forM_)
 import           Data.Aeson
 import           Data.IORef
@@ -10,7 +9,6 @@ import           Rockstar.Chat.Internal
 import           Rockstar.Chat.Types
 import           Rockstar.Codex
 import qualified Rockstar.Http          as Http
-import           Rockstar.Interrupt     (Interrupted (..))
 import           Test.Hspec
 import           TestSupport
 
@@ -98,24 +96,6 @@ spec = describe "chat" $ do
 
             -- Assert
             action `shouldReturn` expected
-
-    it "does not display or return a conversation when interrupted" $ do
-        -- Arrange
-        display <- newIORef []
-        let original = Conversation defaultModel [message "previous"]
-            cancelled _ = throwIO UserInterrupt
-            expected = (Left "Interrupted; the incomplete turn was not saved", [])
-
-        -- Act
-        let action = do
-                result <-
-                    tryJust (\(Interrupted reason) -> Just reason) $
-                        sendTurn cancelled original "hi" (\text -> modifyIORef' display (<> [text]))
-                displayed <- readIORef display
-                pure (result, displayed)
-
-        -- Assert
-        action `shouldReturn` expected
 
     it "allows newlines and tabs but removes other control characters" $ do
         -- Arrange

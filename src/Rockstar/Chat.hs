@@ -12,7 +12,6 @@ import qualified Rockstar.Codex         as Codex
 import           Rockstar.Credentials   (CredentialsM)
 import qualified Rockstar.Credentials   as Credentials
 import qualified Rockstar.Http          as Http
-import           Rockstar.Interrupt     (Interrupted)
 import           System.IO              (hFlush, stderr, stdout)
 import           System.IO.Error        (isEOFError)
 
@@ -39,7 +38,10 @@ runChat selectedModel = do
                             Left error' -> do
                                 Text.hPutStrLn stderr ("error: " <> Text.pack (show error'))
                                 loop conversation
-            onInterrupt action = action `catch` \(interrupted :: Interrupted) -> Text.putStrLn "\n" >> throwIO interrupted
+            onInterrupt action =
+                action `catch` \interruption -> case interruption of
+                    UserInterrupt -> Text.putStrLn "\n" >> throwIO interruption
+                    other         -> throwIO other
         loop (Conversation selectedModel [])
 
 readInput :: IO (Maybe Text)

@@ -14,9 +14,8 @@ import           Control.Applicative        ((<|>))
 import           Control.Concurrent         (forkIO)
 import           Control.Concurrent.Async   (race, waitCatch, withAsync)
 import           Control.Concurrent.STM
-import           Control.Exception          (AsyncException (UserInterrupt),
-                                             IOException, bracket,
-                                             bracketOnError, catch, throwIO)
+import           Control.Exception          (IOException, bracket,
+                                             bracketOnError, catch)
 import           Control.Monad              (unless, void, when)
 import           Control.Monad.IO.Class     (liftIO)
 import           Crypto.Hash                (Digest, SHA256, hash)
@@ -43,10 +42,9 @@ import qualified Network.Socket             as Socket
 import           Network.Wai                (Application, pathInfo, queryString,
                                              requestMethod, responseLBS)
 import           Network.Wai.Handler.Warp
-import qualified Rockstar.Credentials       as Credentials
 import           Rockstar.Credentials       (Credentials (..), CredentialsM)
+import qualified Rockstar.Credentials       as Credentials
 import qualified Rockstar.Http              as Http
-import           Rockstar.Interrupt         (Interrupted (..))
 import           System.Entropy             (getEntropy)
 import           System.Exit                (ExitCode (ExitSuccess))
 import           System.Info                (os)
@@ -56,11 +54,7 @@ import           System.Timeout             (timeout)
 
 login :: CredentialsM ()
 login = do
-    credentials <-
-        liftIO $
-            signIn `catch` \interruption -> case interruption of
-                UserInterrupt -> throwIO (Interrupted "Login cancelled")
-                other         -> throwIO other
+    credentials <- liftIO signIn
     Credentials.save credentials
     liftIO $ putStrLn "Signed in."
   where
