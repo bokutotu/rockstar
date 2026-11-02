@@ -6,12 +6,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use gpui_kit::{HeadlessAppContext, assets::Assets};
+use gpui_kit::{HeadlessAppContext, assets::Assets, point, px, size};
 use image::{Rgba, RgbaImage};
 
-use super::{load_source, open_markdown_window};
+use super::open_chat_window;
+use crate::agent::{AgentError, CodingAgent, Message};
 
-const CASES: [&str; 3] = ["math", "mermaid", "code_blocks"];
+const CASES: [&str; 4] = ["conversation", "math", "mermaid", "code_blocks"];
 const TIMEOUT: Duration = Duration::from_secs(35);
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 static RENDER_LOCK: Mutex<()> = Mutex::new(());
@@ -26,6 +27,36 @@ impl fmt::Debug for Screenshot {
             .field("dimensions", &self.0.dimensions())
             .finish_non_exhaustive()
     }
+}
+
+struct MockCodingAgent {
+    messages: Vec<Message>,
+}
+
+impl CodingAgent for MockCodingAgent {
+    async fn prompt(&mut self, _: String) -> Result<Vec<Message>, AgentError> {
+        Ok(std::mem::take(&mut self.messages))
+    }
+}
+
+fn sample(name: &str) -> (String, MockCodingAgent) {
+    let request = match name {
+        "conversation" => "Markdown の表示例を見せてください。",
+        "math" => "数式を含む説明をお願いします。",
+        "mermaid" => "処理の流れを図にしてください。",
+        "code_blocks" => "Rust、Python、TypeScript のコード例を見せてください。",
+        _ => unreachable!(),
+    };
+    let response = fs::read_to_string(fixture(name, "md")).expect("read the response fixture");
+    let agent = MockCodingAgent {
+        messages: vec![Message::User(request.into()), Message::Assistant(response)],
+    };
+    (request.into(), agent)
+}
+
+#[test]
+fn conversation() {
+    assert_snapshot("conversation");
 }
 
 #[test]
@@ -51,7 +82,8 @@ fn fixture(name: &str, extension: &str) -> PathBuf {
 
 fn assert_snapshot(name: &str) {
     // Arrange
-    let input = fixture(name, "md");
+    let (input, agent) = sample(name);
+    let draft = "次は別の例をお願いします。";
     let expected = Screenshot(
         image::open(fixture(name, "png"))
             .expect("read the committed reference image; do not generate it during a test")
@@ -59,7 +91,7 @@ fn assert_snapshot(name: &str) {
     );
 
     // Act
-    let actual = capture(&input, Some(&expected));
+    let actual = capture(agent, &input, draft, Some(&expected));
 
     // Assert
     if actual != expected {
@@ -68,7 +100,12 @@ fn assert_snapshot(name: &str) {
     assert_eq!(actual, expected, "visual regression in {name}");
 }
 
-fn capture(input: &std::path::Path, expected: Option<&Screenshot>) -> Screenshot {
+fn capture(
+    agent: MockCodingAgent,
+    input: &str,
+    draft: &str,
+    expected: Option<&Screenshot>,
+) -> Screenshot {
     let _guard = RENDER_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -77,22 +114,42 @@ fn capture(input: &std::path::Path, expected: Option<&Screenshot>) -> Screenshot
         Arc::new(Assets),
         gpui_kit::platform::current_headless_renderer,
     );
-    let source = load_source(input).expect("read the Markdown fixture");
-    let window = cx
-        .update(|cx| open_markdown_window(source, cx))
-        .expect("open the production Markdown view in the headless platform");
+    let (window, view) = cx
+        .update(|cx| open_chat_window(agent, cx))
+        .expect("open the production chat view with a mock agent");
+    cx.update_window(window, |_, window, cx| {
+        window.resize(size(px(960.0), px(1100.0)));
+        window.bounds_changed(cx);
+        view.update(cx, |view, cx| {
+            view.input
+                .update(cx, |state, cx| state.set_value(input, window, cx));
+            view.submit(window, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, cx| {
+            view.input
+                .update(cx, |state, cx| state.set_value(draft, window, cx));
+            view.scroll.set_offset(point(px(0.0), px(0.0)));
+        });
+        // A stable, unfocused editor avoids cursor-blink differences in snapshots.
+        window.blur(cx);
+    })
+    .unwrap();
     let started = Instant::now();
     let mut last_change = Instant::now();
     let mut previous = None;
 
     loop {
-        // Drive GPUI tasks and frames, without reading application entities or caches.
+        // Correctness is determined only by rendered pixels, not private view state.
         cx.run_until_parked();
         cx.update_window(window, |_, window, cx| {
             window.refresh();
             window.draw(cx).clear(cx);
         })
-        .expect("draw the Markdown window");
+        .expect("draw the chat window");
         let actual = Screenshot(
             cx.capture_screenshot(window)
                 .expect("real offscreen rendering is required; run through test-visual"),
@@ -148,7 +205,8 @@ fn save_difference(name: &str, actual: &Screenshot, expected: &Screenshot) {
 #[ignore = "rewrites reference PNGs; run test-visual update_snapshots -- --ignored, then review them"]
 fn update_snapshots() {
     for name in CASES {
-        let actual = capture(&fixture(name, "md"), None);
+        let (input, agent) = sample(name);
+        let actual = capture(agent, &input, "次は別の例をお願いします。", None);
         let path = fixture(name, "png");
         actual.0.save(&path).expect("write the reference image");
         eprintln!("Review {}", path.display());

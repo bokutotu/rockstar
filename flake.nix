@@ -1,5 +1,5 @@
 {
-  description = "A minimal GPUI Markdown viewer for Linux";
+  description = "A minimal GPUI chat client for pi with Markdown rendering";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -96,7 +96,7 @@
             '';
 
             meta = {
-              description = "A minimal GPUI Markdown viewer";
+              description = "A minimal GPUI chat client for pi";
               mainProgram = "rockstar";
               platforms = systems;
             };
@@ -108,7 +108,7 @@
         default = {
           type = "app";
           program = "${self.packages.${system}.default}/bin/rockstar";
-          meta.description = "Display a Markdown file";
+          meta.description = "Chat with pi in the current directory";
         };
       });
 

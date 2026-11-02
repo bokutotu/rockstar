@@ -3,10 +3,12 @@ name = "rockstar"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
-description = "A minimal GPUI Markdown viewer for Linux"
+description = "A minimal GPUI chat client for pi with Markdown rendering"
 publish = false
 
 [dependencies]
+anyhow = "1"
+async-channel = "2"
 gpui-kit = { version = "0.8.1", features = ["tree-sitter-languages"] }
 latex-rust = "3.0.1"
 merman = "0.9.3"
