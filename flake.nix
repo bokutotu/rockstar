@@ -1,152 +1,151 @@
 {
-  description = "ROCKSTAR BY DaBaby";
+  description = "A minimal GPUI Markdown viewer for Linux";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs =
-    { nixpkgs, ... }:
+    { self, nixpkgs }:
     let
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "aarch64-darwin"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      # Match aoewif's GHC/HLS toolchain, including its GHC 9.14 compatibility fixes.
-      mkHaskellPackages =
-        pkgs:
-        let
-          hlib = pkgs.haskell.lib;
-          disableFlags =
-            flags: package: builtins.foldl' (result: flag: hlib.disableCabalFlag result flag) package flags;
-        in
-        pkgs.haskell.packages.ghc9141.override {
-          overrides = self: super: {
-            algebraic-graphs = super.algebraic-graphs_0_8;
-            constraints-extras = hlib.doJailbreak super.constraints-extras;
-            dependent-map = hlib.doJailbreak super.dependent-map;
-            enummapset = hlib.dontCheck super.enummapset;
-            generic-lens = hlib.dontCheck super.generic-lens;
-            ghcide = hlib.doJailbreak super.ghcide;
-            ghc-trace-events = hlib.doJailbreak super.ghc-trace-events;
-            hiedb = hlib.dontCheck (hlib.doJailbreak super.hiedb);
-            hie-compat = hlib.doJailbreak super.hie-compat;
-            lucid = hlib.doJailbreak super.lucid;
-            lsp = hlib.doJailbreak super.lsp;
-            lsp-test = hlib.doJailbreak super.lsp-test;
-            lsp-types = hlib.doJailbreak super.lsp-types;
-            ordered-containers = hlib.doJailbreak super.ordered-containers;
-            rebase = hlib.doJailbreak super.rebase;
-            regex-tdfa = hlib.dontCheck super.regex-tdfa;
-            string-interpolate = hlib.doJailbreak super.string-interpolate;
-            tasty-hspec = hlib.doJailbreak super.tasty-hspec;
-            toml-reader = hlib.dontCheck super.toml-reader;
-            weeder = hlib.justStaticExecutables (hlib.dontCheck (hlib.doJailbreak super.weeder));
-            haskell-language-server =
-              hlib.overrideCabal
-                (disableFlags
-                  [
-                    "cabal"
-                    "cabalfmt"
-                    "cabalgild"
-                    "floskell"
-                    "fourmolu"
-                    "ghc-lib"
-                    "hlint"
-                    "ormolu"
-                    "retrie"
-                    "splice"
-                    "stan"
-                    "stylishHaskell"
-                  ]
-                  (
-                    super.haskell-language-server.overrideScope (
-                      _: _: {
-                        Cabal = null;
-                        Cabal-syntax = null;
-                        apply-refact = null;
-                        cabal-add = null;
-                        eventlog2html = null;
-                        fourmolu = null;
-                        hlint = null;
-                        ormolu = null;
-                        refact = null;
-                        shake-bench = null;
-                        stan = null;
-                        stylish-haskell = null;
-                      }
-                    )
-                  )
-                )
-                (_: {
-                  buildDepends = [ ];
-                });
-          };
-        };
-    in
-    {
-      devShells = forAllSystems (
+      configFor =
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          haskellPackages = mkHaskellPackages pkgs;
-          ghc = haskellPackages.ghcWithPackages (h: [
-            h.aeson
-            h.async
-            h.base64-bytestring
-            h.crypton
-            h.entropy
-            h.hspec
-            h.http-client
-            h.http-client-tls
-            h.http-types
-            h.memory
-            h.network
-            h.optparse-applicative
-            h.temporary
-            h.wai
-            h.warp
-          ]);
-          hls = pkgs.writeShellScriptBin "hls" ''
-            exec ${haskellPackages.haskell-language-server}/bin/haskell-language-server-wrapper "$@"
-          '';
-          haskellFormat = pkgs.writeShellApplication {
-            name = "format";
-            runtimeInputs = [
-              pkgs.fourmolu
-              pkgs.stylish-haskell
+          libraries = with pkgs; [
+            fontconfig
+            freetype
+            libGL
+            libx11
+            libxcb
+            libxkbcommon
+            vulkan-loader
+            wayland
+          ];
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          fontconfigFile = pkgs.makeFontsConf {
+            fontDirectories = with pkgs; [
+              dejavu_fonts
+              (noto-fonts-cjk-sans.override { static = true; })
             ];
-            text = ''
-              if (( $# == 0 )); then
-                shopt -s globstar nullglob
-                set -- {app,src,test}/**/*.{hs,lhs,hs-boot,lhs-boot}
-              fi
-
-              if (( $# > 0 )); then
-                fourmolu --mode inplace "$@"
-                stylish-haskell --inplace "$@"
-              fi
+          };
+          testSetup = ''
+            export FONTCONFIG_FILE=${fontconfigFile}
+            export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath libraries}
+            export VK_DRIVER_FILES=${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json
+            export __EGL_VENDOR_LIBRARY_FILENAMES=${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json
+            export LIBGL_ALWAYS_SOFTWARE=1
+            unset DISPLAY WAYLAND_DISPLAY
+            export XDG_RUNTIME_DIR
+            XDG_RUNTIME_DIR="$(mktemp -d)"
+          '';
+          testRunner = pkgs.writeShellApplication {
+            name = "test-visual";
+            runtimeInputs = [
+              pkgs.cargo
+              pkgs.coreutils
+            ];
+            text = testSetup + ''
+              trap 'rm -rf "$XDG_RUNTIME_DIR"' EXIT
+              cargo test --locked "$@"
             '';
           };
         in
         {
-          default = pkgs.mkShell {
-            packages = [
-              ghc
-              pkgs.cabal-install
-              pkgs.haskellPackages.fast-tags
-              pkgs.fourmolu
-              pkgs.haskellPackages.hpack
-              haskellPackages.haskell-language-server
-              haskellPackages.weeder
-              pkgs.stylish-haskell
-              pkgs.hlint
-              hls
-              haskellFormat
-            ];
+          inherit
+            pkgs
+            libraries
+            nativeBuildInputs
+            fontconfigFile
+            testSetup
+            testRunner
+            ;
+        };
+    in
+    {
+      packages = forAllSystems (
+        system:
+        let
+          inherit (configFor system)
+            pkgs
+            libraries
+            nativeBuildInputs
+            fontconfigFile
+            testSetup
+            ;
+        in
+        {
+          default = pkgs.rustPlatform.buildRustPackage {
+            pname = "rockstar";
+            version = "0.1.0";
+            src = pkgs.lib.cleanSource ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+
+            nativeBuildInputs = nativeBuildInputs ++ [ pkgs.makeWrapper ];
+            buildInputs = libraries;
+            preCheck = testSetup;
+
+            postFixup = ''
+              wrapProgram "$out/bin/rockstar" \
+                --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath libraries}" \
+                --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.xdg-utils ]}" \
+                --set FONTCONFIG_FILE "${fontconfigFile}"
+            '';
+
+            meta = {
+              description = "A minimal GPUI Markdown viewer";
+              mainProgram = "rockstar";
+              platforms = systems;
+            };
           };
         }
       );
+
+      apps = forAllSystems (system: {
+        default = {
+          type = "app";
+          program = "${self.packages.${system}.default}/bin/rockstar";
+          meta.description = "Display a Markdown file";
+        };
+      });
+
+      devShells = forAllSystems (
+        system:
+        let
+          inherit (configFor system)
+            pkgs
+            libraries
+            nativeBuildInputs
+            fontconfigFile
+            testRunner
+            ;
+        in
+        {
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              cargo
+              clippy
+              rust-analyzer
+              rustc
+              rustfmt
+              nixfmt
+              xdg-utils
+              testRunner
+            ];
+            inherit nativeBuildInputs;
+            buildInputs = libraries;
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath libraries;
+            FONTCONFIG_FILE = fontconfigFile;
+          };
+        }
+      );
+
+      checks = forAllSystems (system: {
+        default = self.packages.${system}.default;
+      });
 
       formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixfmt);
     };

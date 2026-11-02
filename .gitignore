@@ -1,15 +1,4 @@
-/target
-/dist-newstyle
-.direnv
+/target/
+/.direnv/
 /result
 /result-*
-/tags
-/.rockstar/
-auth.json
-.env
-.env.*
-!.env.example
-/cabal.project.local
-*.cabal
-*.hi
-*.o
