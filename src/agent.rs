@@ -20,9 +20,9 @@ pub enum AgentEvent {
     AssistantStarted,
     AssistantTextDelta(String),
     AssistantFinished(String),
-    PromptFinished(Result<(), AgentError>),
-    NewSessionFinished(Result<(), AgentError>),
-    Disconnected(AgentError),
+    PromptFinished,
+    NewSessionFinished,
+    Error(AgentError),
 }
 
 #[derive(Clone)]

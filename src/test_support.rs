@@ -32,7 +32,7 @@ pub fn reply_with_messages(events: &Sender<AgentEvent>, messages: Vec<Message>) 
             }
         }
     }
-    events.try_send(AgentEvent::PromptFinished(Ok(()))).unwrap();
+    events.try_send(AgentEvent::PromptFinished).unwrap();
 }
 
 pub fn headless_app() -> HeadlessAppContext {

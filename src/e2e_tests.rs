@@ -192,7 +192,7 @@ fn new_session_clears_chat_and_draft_only_after_success() {
     app.assert_draft("An unsent draft");
 
     app.events
-        .try_send(AgentEvent::NewSessionFinished(Ok(())))
+        .try_send(AgentEvent::NewSessionFinished)
         .unwrap();
     app.assert_conversation(false);
     app.assert_draft("");

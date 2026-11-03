@@ -256,7 +256,7 @@ pub fn connect(cwd: &Path) -> Result<AgentConnection, AgentError> {
         records,
         next_request_id: 0,
     };
-    thread::Builder::new()
+    let _ = thread::Builder::new()
         .name("pi-stdout".into())
         .spawn(move || {
             let result = (|| -> Result<(), AgentError> {
@@ -267,7 +267,7 @@ pub fn connect(cwd: &Path) -> Result<AgentConnection, AgentError> {
                         return Ok(());
                     }
                 }
-                bail!("pi closed its output. Restart Rockstar to start a new session.")
+                bail!("pi closed its output")
             })();
             if let Err(error) = result {
                 let _ = record_sender.send_blocking(Err(error));
@@ -290,7 +290,8 @@ impl PiCodingAgent {
         let result = block_on(self.process_requests(&requests, &events));
         requests.close();
         if let Err(error) = result {
-            let _ = events.try_send(AgentEvent::Disconnected(error));
+            eprintln!("rockstar: {error:#}");
+            process::exit(1);
         }
     }
 
@@ -323,15 +324,19 @@ impl PiCodingAgent {
                 Incoming::Record(result) => result.context("pi disconnected")??,
             };
             self.handle_extension(&record)?;
-            if let Some(event) = decode_event(&record) {
-                events.send(event).await?;
+            if let Some(event) = decode_event(&record)
+                && events.send(event).await.is_err()
+            {
+                return Ok(());
             }
             if let Some(event) = active
                 .as_mut()
                 .and_then(|request| request.handle_record(&record))
             {
                 active = None;
-                events.send(event).await?;
+                if events.send(event).await.is_err() {
+                    return Ok(());
+                }
             }
         }
     }
@@ -411,12 +416,12 @@ impl ActiveRequest {
                         match &response.result {
                             Ok(PromptResponseData {
                                 disposition: PromptDisposition::Handled,
-                            }) => return Some(AgentEvent::PromptFinished(Ok(()))),
+                            }) => return Some(AgentEvent::PromptFinished),
                             Ok(PromptResponseData {
                                 disposition: PromptDisposition::Started | PromptDisposition::Queued,
                             }) => *accepted = true,
                             Err(error) => {
-                                return Some(AgentEvent::PromptFinished(Err(anyhow!("{error}"))));
+                                return Some(AgentEvent::Error(anyhow!("{error}")));
                             }
                         }
                     }
@@ -447,8 +452,11 @@ impl ActiveRequest {
                     }
                     _ => {}
                 }
-                (*accepted && *settled)
-                    .then(|| AgentEvent::PromptFinished(failure.take().map_or(Ok(()), Err)))
+                (*accepted && *settled).then(|| {
+                    failure
+                        .take()
+                        .map_or(AgentEvent::PromptFinished, AgentEvent::Error)
+                })
             }
             Self::NewSession { id } => {
                 let PiIncomingRecord::Response(PiResponse::NewSession(response)) = record else {
@@ -457,14 +465,16 @@ impl ActiveRequest {
                 if response.id.as_deref() != Some(id.as_str()) {
                     return None;
                 }
-                let result = match &response.result {
-                    Ok(NewSessionResponseData { cancelled: false }) => Ok(()),
-                    Ok(NewSessionResponseData { cancelled: true }) => {
-                        Err(anyhow!("New session cancelled."))
+                let event = match &response.result {
+                    Ok(NewSessionResponseData { cancelled: false }) => {
+                        AgentEvent::NewSessionFinished
                     }
-                    Err(error) => Err(anyhow!("{error}")),
+                    Ok(NewSessionResponseData { cancelled: true }) => {
+                        AgentEvent::Error(anyhow!("New session cancelled."))
+                    }
+                    Err(error) => AgentEvent::Error(anyhow!("{error}")),
                 };
-                Some(AgentEvent::NewSessionFinished(result))
+                Some(event)
             }
         }
     }

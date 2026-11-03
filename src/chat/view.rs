@@ -93,16 +93,14 @@ impl ChatView {
                     conversation.finish_assistant(text, cx);
                 });
             }
-            AgentEvent::PromptFinished(Ok(())) => {}
-            AgentEvent::NewSessionFinished(Ok(())) => {
+            AgentEvent::PromptFinished => {}
+            AgentEvent::NewSessionFinished => {
                 self.conversation
                     .update(cx, |conversation, cx| conversation.clear(cx));
                 self.composer
                     .update(cx, |composer, cx| composer.clear(window, cx));
             }
-            AgentEvent::PromptFinished(Err(error))
-            | AgentEvent::NewSessionFinished(Err(error))
-            | AgentEvent::Disconnected(error) => {
+            AgentEvent::Error(error) => {
                 window.push_notification(Notification::error(error.to_string()).autohide(false), cx)
             }
         }
