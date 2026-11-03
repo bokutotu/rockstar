@@ -9,7 +9,7 @@ use gpui_kit::{
 use crate::{
     agent::{AgentConnection, AgentHandle, AgentRequest},
     chat::ChatView,
-    command_palette::{self, Command, CommandPalette, CommandPaletteEvent},
+    command_palette::{Command, CommandPalette},
     interaction::{Interaction, InteractionMode},
 };
 
@@ -47,8 +47,8 @@ impl AppView {
             this.apply_mode(interaction.read(cx).mode(), window, cx);
         })
         .detach();
-        cx.subscribe_in(&palette, window, |this, _, event, window, cx| {
-            this.handle_palette_event(event, window, cx);
+        cx.subscribe_in(&palette, window, |this, _, command, window, cx| {
+            this.handle_command(command, window, cx);
         })
         .detach();
         let mode = interaction.read(cx).mode();
@@ -73,24 +73,15 @@ impl AppView {
         cx.notify();
     }
 
-    fn handle_palette_event(
-        &mut self,
-        event: &CommandPaletteEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match event {
-            CommandPaletteEvent::Confirmed(Command::NewSession) => {
-                match self.agent.send(AgentRequest::NewSession) {
-                    Ok(()) => self.interaction.update(cx, |interaction, cx| {
-                        interaction.set_mode(InteractionMode::Normal, cx);
-                    }),
-                    Err(error) => window.push_notification(
-                        Notification::error(error.to_string()).autohide(false),
-                        cx,
-                    ),
-                }
-            }
+    fn handle_command(&mut self, command: &Command, window: &mut Window, cx: &mut Context<Self>) {
+        match command {
+            Command::NewSession => match self.agent.send(AgentRequest::NewSession) {
+                Ok(()) => self.interaction.update(cx, |interaction, cx| {
+                    interaction.set_mode(InteractionMode::Normal, cx);
+                }),
+                Err(error) => window
+                    .push_notification(Notification::error(error.to_string()).autohide(false), cx),
+            },
         }
     }
 }
@@ -130,7 +121,6 @@ pub fn open_chat_window(
     cx: &mut App,
 ) -> gpui_kit::Result<(AnyWindowHandle, Entity<ChatView>)> {
     gpui_kit::init(cx);
-    command_palette::init(cx);
     Theme::change(ThemeMode::Light, None, cx);
     Theme::update(cx, |theme| {
         theme.font_family = "JetBrainsMono Nerd Font".into();

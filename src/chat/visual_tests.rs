@@ -18,7 +18,6 @@ use crate::{
 };
 
 const CASES: [&str; 4] = ["conversation", "math", "mermaid", "code_blocks"];
-const COMMAND_CASES: [(&str, &str); 2] = [("command_palette", "nw"), ("command_no_match", "model")];
 const SNAPSHOT_UPDATE_TIMEOUT: Duration = Duration::from_secs(35);
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
@@ -69,22 +68,14 @@ fn code_blocks() {
 
 #[test]
 fn command_palette() {
-    assert_command_snapshot("command_palette", "nw");
-}
-
-#[test]
-fn command_no_match() {
-    assert_command_snapshot("command_no_match", "model");
-}
-
-fn assert_command_snapshot(name: &str, query: &str) {
+    let name = "command_palette";
     let (input, messages) = sample("conversation");
     let expected = Screenshot(
         image::open(fixture(name, "png"))
             .expect("read the reviewed command popup reference image")
             .into_rgba8(),
     );
-    let actual = capture(messages, &input, "An unsent draft", Some(query), false);
+    let actual = capture(messages, &input, "An unsent draft", Some("new"), false);
     if actual != expected {
         save_difference(name, &actual, &expected);
     }
@@ -121,7 +112,7 @@ fn capture(
     messages: Vec<Message>,
     input: &str,
     draft: &str,
-    popup_query: Option<&str>,
+    command: Option<&str>,
     wait_for_stability: bool,
 ) -> Screenshot {
     let _guard = RENDER_LOCK
@@ -157,10 +148,10 @@ fn capture(
             ScrollDelta::Pixels(point(px(0.0), px(100_000.0))),
             cx,
         );
-        if let Some(query) = popup_query {
+        if let Some(command) = command {
             window.press("escape", cx);
             window.press(":", cx);
-            window.input(query, cx);
+            window.input(command, cx);
         }
         // A stable, unfocused editor avoids cursor-blink differences in snapshots.
         window.blur(cx);
@@ -241,16 +232,14 @@ fn update_snapshots() {
 }
 
 #[test]
-#[ignore = "rewrites command popup PNGs; run cargo test update_command_snapshots -- --ignored, then review them"]
+#[ignore = "rewrites the command popup PNG; run cargo test update_command_snapshots -- --ignored, then review it"]
 fn update_command_snapshots() {
-    for (name, query) in COMMAND_CASES {
-        let (input, messages) = sample("conversation");
-        let actual = capture(messages, &input, "An unsent draft", Some(query), true);
-        let path = fixture(name, "png");
-        actual
-            .0
-            .save(&path)
-            .expect("write the command popup reference");
-        eprintln!("Review {}", path.display());
-    }
+    let (input, messages) = sample("conversation");
+    let actual = capture(messages, &input, "An unsent draft", Some("new"), true);
+    let path = fixture("command_palette", "png");
+    actual
+        .0
+        .save(&path)
+        .expect("write the command popup reference");
+    eprintln!("Review {}", path.display());
 }

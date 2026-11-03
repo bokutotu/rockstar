@@ -32,16 +32,8 @@ fn main() -> ExitCode {
         }
     }
 
-    let agent = match env::current_dir()
-        .map_err(anyhow::Error::from)
-        .and_then(|cwd| pi::connect(&cwd))
-    {
-        Ok(agent) => agent,
-        Err(error) => {
-            eprintln!("rockstar: {error:#}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let current_dir = env::current_dir().unwrap();
+    let agent = pi::connect(&current_dir).unwrap();
 
     let shutdown_requests = agent.handle.requests.clone();
     let remaining_events = agent.events.clone();
