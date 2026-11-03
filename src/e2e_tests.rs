@@ -65,7 +65,9 @@ impl Driver {
     fn click_input(&mut self) {
         self.ui(|window, cx| {
             let field = window.find_by_label("Message to pi");
-            window.click(field.path().last().unwrap().clone(), cx);
+            window
+                .within("chat")
+                .click(field.path().last().unwrap().clone(), cx);
         });
     }
 
@@ -118,11 +120,13 @@ impl Driver {
     fn start_prompt(&mut self) {
         self.press("i");
         self.type_text("Hello");
-        self.ui(|window, cx| window.click("send", cx));
+        self.press("ctrl-enter");
         match self.requests.try_recv().expect("prompt request") {
             AgentRequest::Prompt(text) => assert_eq!(text, "Hello"),
             AgentRequest::NewSession => panic!("message incorrectly sent as a command"),
         }
+        self.assert_draft("");
+        self.no_requests();
     }
 
     fn finish_prompt(&mut self, messages: Vec<Message>) {
@@ -150,10 +154,19 @@ fn normal_insert_and_popup_are_driven_by_keyboard_and_mouse() {
         let input = window.find_by_label("Message to pi");
         assert_eq!(input.focused(), Some(false));
         assert_eq!(input.placeholder(), Some("NORMAL — i to type · : commands"));
+        assert!(window.try_find("send").is_none());
     });
     app.type_text("abc");
     app.assert_draft("");
     app.press("i");
+    for blank in ["", " \t\n"] {
+        app.type_text(blank);
+        app.press("ctrl-enter");
+        app.assert_draft(blank);
+        app.no_requests();
+    }
+    app.press("ctrl-a");
+    app.press("backspace");
     app.type_text("draft:new");
     app.assert_draft("draft:new");
     app.assert_popup(false);
@@ -182,6 +195,24 @@ fn normal_insert_and_popup_are_driven_by_keyboard_and_mouse() {
     app.press("ctrl-end");
     app.type_text("!");
     app.assert_draft("draft:new!");
+    app.press("enter");
+    app.type_text("Second line");
+    app.assert_draft("draft:new!\nSecond line");
+    app.no_requests();
+    app.press("ctrl-enter");
+    match app.requests.try_recv().expect("prompt request") {
+        AgentRequest::Prompt(text) => assert_eq!(text, "draft:new!\nSecond line"),
+        AgentRequest::NewSession => panic!("message incorrectly sent as a command"),
+    }
+    app.assert_draft("");
+    app.ui(|window, _| assert_eq!(window.find_by_label("Message to pi").focused(), Some(true)));
+    app.no_requests();
+
+    app.type_text("Keep this draft");
+    app.requests.close();
+    app.press("ctrl-enter");
+    app.assert_draft("Keep this draft");
+    app.ui(|window, _| assert!(window.find("notification").visible()));
     app.no_requests();
 }
 
@@ -192,9 +223,16 @@ fn input_click_enters_insert_and_popup_dismissal_does_not_send_draft() {
     app.type_text("An unsent draft");
     app.assert_draft("An unsent draft");
     app.press("escape");
+    app.press("ctrl-enter");
+    app.assert_draft("An unsent draft");
+    app.no_requests();
     app.press(":");
-    // The pointer event hits the overlay, not the Send button behind it.
-    app.ui(|window, cx| window.click("send", cx));
+    app.press("ctrl-enter");
+    app.assert_popup(true);
+    app.assert_draft("An unsent draft");
+    app.no_requests();
+    // The pointer event hits the overlay, not the message input behind it.
+    app.click_input();
     app.assert_popup(false);
     app.assert_draft("An unsent draft");
     app.no_requests();
@@ -268,7 +306,15 @@ fn fuzzy_queries_filter_commands_and_navigation_stays_in_popup() {
     }
     app.press("ctrl-a");
     app.type_text("nw");
-    for key in ["up", "down", "ctrl-p", "ctrl-n", "tab", "shift-tab"] {
+    for key in [
+        "up",
+        "down",
+        "ctrl-p",
+        "ctrl-n",
+        "tab",
+        "shift-tab",
+        "ctrl-enter",
+    ] {
         app.press(key);
         app.assert_popup(true);
         app.ui(|window, _| assert_eq!(window.find_by_label("Command search").value(), Some("nw")));

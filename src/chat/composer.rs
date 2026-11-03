@@ -1,10 +1,9 @@
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EntityId, EventEmitter, Focusable as _, IntoElement,
-    ParentElement as _, Styled as _, View, Window,
+    App, AppContext as _, Context, Entity, EntityId, EventEmitter, Focusable as _,
+    InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, View, Window,
     component::{
-        ActiveTheme as _, Disableable as _,
-        button::{Button, ButtonVariants as _},
-        input::{Textarea, TextareaState},
+        ActiveTheme as _,
+        input::{Enter, Textarea, TextareaState},
     },
     div,
 };
@@ -36,7 +35,6 @@ impl ComposerView {
                 .rows(3)
                 .placeholder(NORMAL_HINT)
         });
-        cx.observe(&input, |_, _, cx| cx.notify()).detach();
         cx.observe_in(&interaction, window, |this, interaction, window, cx| {
             this.apply_mode(interaction.read(cx).mode(), window, cx);
         })
@@ -80,6 +78,16 @@ impl ComposerView {
         cx.notify();
     }
 
+    fn handle_enter(&mut self, action: &Enter, cx: &mut Context<Self>) {
+        if !action.secondary {
+            return;
+        }
+        if matches!(self.interaction.read(cx).mode(), InteractionMode::Insert) {
+            self.request_submit(cx);
+        }
+        cx.stop_propagation();
+    }
+
     fn request_submit(&mut self, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().to_string();
         cx.emit(ComposerEvent::SubmitRequested(text));
@@ -108,11 +116,12 @@ impl View for Composer {
         self.state.update(cx, |state, cx| {
             // A frame may be drawn before mode observers run; synchronize before accepting input.
             state.apply_mode(state.interaction.read(cx).mode(), window, cx);
-            let blank = state.input.read(cx).value().trim().is_empty();
             div()
+                // Capture Ctrl+Enter before the textarea inserts a newline.
+                .capture_action(cx.listener(|this, action: &Enter, _, cx| {
+                    this.handle_enter(action, cx);
+                }))
                 .flex()
-                .items_end()
-                .gap_3()
                 .p_4()
                 .border_t_1()
                 .border_color(cx.theme().border)
@@ -121,13 +130,6 @@ impl View for Composer {
                         .flex_1()
                         .readonly(!state.input_editable)
                         .aria_label("Message to pi"),
-                )
-                .child(
-                    Button::new("send")
-                        .primary()
-                        .label("Send")
-                        .disabled(blank)
-                        .on_click(cx.listener(|this, _, _, cx| this.request_submit(cx))),
                 )
         })
     }

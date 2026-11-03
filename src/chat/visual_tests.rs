@@ -144,7 +144,7 @@ fn capture(
         window.activate_window();
         window.press("i", cx);
         window.input(input, cx);
-        window.click("send", cx);
+        window.press("ctrl-enter", cx);
     })
     .unwrap();
     assert!(matches!(

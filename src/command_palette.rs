@@ -133,8 +133,10 @@ impl Render for CommandPalette {
         div()
             .id("command-overlay")
             .key_context("RockstarCommand")
-            .capture_action(cx.listener(|this, _: &Enter, _, cx| {
-                this.confirm(cx);
+            .capture_action(cx.listener(|this, action: &Enter, _, cx| {
+                if !action.secondary {
+                    this.confirm(cx);
+                }
                 cx.stop_propagation();
             }))
             .capture_action(cx.listener(|this, _: &MoveUp, window, cx| this.keep_focus(window, cx)))
