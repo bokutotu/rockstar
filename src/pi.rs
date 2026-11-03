@@ -1,10 +1,10 @@
 use std::{
     collections::VecDeque,
-    io::{BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Write},
+    os::unix::process::CommandExt,
     path::Path,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{self, ChildStdin, Command, Stdio},
     thread,
-    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, anyhow, bail};
@@ -15,8 +15,7 @@ use serde_json::{Value, json};
 use crate::agent::{AgentConnection, AgentError, AgentEvent, AgentHandle, AgentRequest};
 
 struct PiCodingAgent {
-    child: Child,
-    input: Option<ChildStdin>,
+    input: ChildStdin,
     records: Receiver<Result<Value, AgentError>>,
     next_request_id: u64,
 }
@@ -39,20 +38,43 @@ enum Incoming {
 }
 
 pub fn connect(cwd: &Path) -> Result<AgentConnection, AgentError> {
-    let mut child = Command::new("pi")
+    let parent_pid = process::id() as libc::pid_t;
+    let mut command = Command::new("pi");
+    command
         .args(["--mode", "rpc"])
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    // SAFETY: The child-side hook only makes syscalls and constructs OS-code
+    // errors; it does not allocate or acquire locks after fork.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+                0 as libc::c_ulong,
+            ) == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // Do not start pi if Rockstar exited before the signal was armed.
+            if libc::getppid() != parent_pid {
+                return Err(io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
         .spawn()
         .context("Could not start pi. Make sure pi is installed and available on PATH.")?;
     let input = child.stdin.take().expect("piped pi stdin");
     let output = child.stdout.take().expect("piped pi stdout");
     let (record_sender, records) = async_channel::unbounded();
     let agent = PiCodingAgent {
-        child,
-        input: Some(input),
+        input,
         records,
         next_request_id: 0,
     };
@@ -92,8 +114,6 @@ impl PiCodingAgent {
         if let Err(error) = result {
             let _ = events.try_send(AgentEvent::Disconnected(error));
         }
-        drop(self);
-        drop(events);
     }
 
     async fn process_requests(
@@ -161,7 +181,7 @@ impl PiCodingAgent {
     }
 
     fn write_record(&mut self, record: &Value) -> Result<(), AgentError> {
-        let input = self.input.as_mut().expect("live pi stdin");
+        let input = &mut self.input;
         serde_json::to_writer(&mut *input, record)?;
         input.write_all(b"\n")?;
         input.flush()?;
@@ -302,21 +322,5 @@ fn message_text(message: &Value) -> String {
             .filter_map(|block| block["text"].as_str())
             .collect(),
         _ => String::new(),
-    }
-}
-
-impl Drop for PiCodingAgent {
-    fn drop(&mut self) {
-        self.input.take();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-                _ => break,
-            }
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }

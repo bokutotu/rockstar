@@ -35,9 +35,6 @@ fn main() -> ExitCode {
     let current_dir = env::current_dir().unwrap();
     let agent = pi::connect(&current_dir).unwrap();
 
-    let shutdown_requests = agent.handle.requests.clone();
-    let remaining_events = agent.events.clone();
-
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
@@ -51,9 +48,6 @@ fn main() -> ExitCode {
             open_chat_window(agent, cx).expect("failed to open the chat window");
             cx.activate(true);
         });
-
-    shutdown_requests.close();
-    while remaining_events.recv_blocking().is_ok() {}
 
     ExitCode::SUCCESS
 }
