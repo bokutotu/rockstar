@@ -1,208 +1,312 @@
 use std::{
+    collections::VecDeque,
     io::{BufRead, BufReader, Write},
     path::Path,
     process::{Child, ChildStdin, Command, Stdio},
-    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, anyhow, bail};
-use async_channel::Receiver;
+use async_channel::{Receiver, RecvError, Sender};
+use futures_lite::future::{block_on, or};
 use serde_json::{Value, json};
 
-use crate::agent::{AgentError, CodingAgent, Message};
+use crate::agent::{AgentConnection, AgentError, AgentEvent, AgentHandle, AgentRequest};
 
-type Input = Arc<Mutex<ChildStdin>>;
-
-pub struct PiCodingAgent {
+struct PiCodingAgent {
     child: Child,
-    input: Option<Input>,
+    input: Option<ChildStdin>,
     records: Receiver<Result<Value, AgentError>>,
     next_request_id: u64,
 }
 
-impl PiCodingAgent {
-    pub fn new(cwd: &Path) -> Result<Self, AgentError> {
-        let mut child = Command::new("pi")
-            .args(["--mode", "rpc"])
-            .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .context("Could not start pi. Make sure pi is installed and available on PATH.")?;
-        let input = Arc::new(Mutex::new(child.stdin.take().expect("piped pi stdin")));
-        let output = child.stdout.take().expect("piped pi stdout");
-        let (sender, records) = async_channel::unbounded();
-        let weak_input = Arc::downgrade(&input);
+enum ActiveRequest {
+    Prompt {
+        id: String,
+        accepted: bool,
+        settled: bool,
+        failure: Option<AgentError>,
+    },
+    NewSession {
+        id: String,
+    },
+}
 
-        // Always drain stdout, including while the user is editing. Only queue
-        // completed messages and control records; token deltas are not displayed.
-        thread::spawn(move || {
+enum Incoming {
+    Request(Result<AgentRequest, RecvError>),
+    Record(Result<Result<Value, AgentError>, RecvError>),
+}
+
+pub fn connect(cwd: &Path) -> Result<AgentConnection, AgentError> {
+    let mut child = Command::new("pi")
+        .args(["--mode", "rpc"])
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("Could not start pi. Make sure pi is installed and available on PATH.")?;
+    let input = child.stdin.take().expect("piped pi stdin");
+    let output = child.stdout.take().expect("piped pi stdout");
+    let (record_sender, records) = async_channel::unbounded();
+    let agent = PiCodingAgent {
+        child,
+        input: Some(input),
+        records,
+        next_request_id: 0,
+    };
+    thread::Builder::new()
+        .name("pi-stdout".into())
+        .spawn(move || {
             let result = (|| -> Result<(), AgentError> {
                 for line in BufReader::new(output).lines() {
-                    let record: Value = serde_json::from_str(&line?)
+                    let record = serde_json::from_str(&line?)
                         .context("pi returned an invalid JSONL record")?;
-                    match record["type"].as_str() {
-                        Some("extension_ui_request") => match record["method"].as_str() {
-                            Some("select" | "confirm" | "input" | "editor") => {
-                                let Some(input) = weak_input.upgrade() else {
-                                    return Ok(());
-                                };
-                                write_record(
-                                    &input,
-                                    &json!({
-                                        "type": "extension_ui_response",
-                                        "id": record["id"],
-                                        "cancelled": true,
-                                    }),
-                                )?;
-                                eprintln!(
-                                    "rockstar: cancelled an extension dialog; dialog UI is not available yet"
-                                );
-                            }
-                            Some("notify") => {
-                                if let Some(message) = record["message"].as_str() {
-                                    eprintln!("pi: {message}");
-                                }
-                            }
-                            _ => {}
-                        },
-                        Some("extension_error") => {
-                            eprintln!("pi extension: {}", record["error"]);
-                        }
-                        Some("response" | "message_end" | "agent_start" | "agent_settled") => {
-                            sender.send_blocking(Ok(record))?;
-                        }
-                        _ => {}
+                    if record_sender.send_blocking(Ok(record)).is_err() {
+                        return Ok(());
                     }
                 }
                 bail!("pi closed its output. Restart Rockstar to start a new session.")
             })();
             if let Err(error) = result {
-                let _ = sender.send_blocking(Err(error));
+                let _ = record_sender.send_blocking(Err(error));
             }
-        });
+        })?;
 
-        Ok(Self {
-            child,
-            input: Some(input),
-            records,
-            next_request_id: 0,
-        })
-    }
+    let (requests, receiver) = async_channel::unbounded();
+    let (sender, events) = async_channel::unbounded();
+    thread::Builder::new()
+        .name("pi-rpc".into())
+        .spawn(move || agent.run(receiver, sender))?;
+    Ok(AgentConnection {
+        handle: AgentHandle { requests },
+        events,
+    })
 }
 
-impl CodingAgent for PiCodingAgent {
-    async fn prompt(&mut self, input: String) -> Result<Vec<Message>, AgentError> {
-        if self.records.is_closed() {
-            bail!("pi is no longer connected. Restart Rockstar to start a new session.");
+impl PiCodingAgent {
+    fn run(mut self, requests: Receiver<AgentRequest>, events: Sender<AgentEvent>) {
+        let result = block_on(self.process_requests(&requests, &events));
+        requests.close();
+        if let Err(error) = result {
+            let _ = events.try_send(AgentEvent::Disconnected(error));
         }
+        drop(self);
+        drop(events);
+    }
+
+    async fn process_requests(
+        &mut self,
+        requests: &Receiver<AgentRequest>,
+        events: &Sender<AgentEvent>,
+    ) -> Result<(), AgentError> {
+        let mut pending = VecDeque::new();
+        let mut active: Option<ActiveRequest> = None;
+        loop {
+            if requests.is_closed() || events.is_closed() {
+                return Ok(());
+            }
+            if active.is_none()
+                && let Some(request) = pending.pop_front()
+            {
+                active = Some(self.start_request(request)?);
+            }
+            let incoming = or(async { Incoming::Request(requests.recv().await) }, async {
+                Incoming::Record(self.records.recv().await)
+            })
+            .await;
+            let record = match incoming {
+                Incoming::Request(Ok(request)) => {
+                    pending.push_back(request);
+                    continue;
+                }
+                Incoming::Request(Err(_)) => return Ok(()),
+                Incoming::Record(result) => result.context("pi disconnected")??,
+            };
+            self.handle_extension(&record)?;
+            if let Some(event) = decode_event(&record) {
+                events.send(event).await?;
+            }
+            if let Some(event) = active
+                .as_mut()
+                .and_then(|request| request.handle_record(&record))
+            {
+                active = None;
+                events.send(event).await?;
+            }
+        }
+    }
+
+    fn start_request(&mut self, request: AgentRequest) -> Result<ActiveRequest, AgentError> {
         self.next_request_id += 1;
         let id = self.next_request_id.to_string();
-        write_record(
-            self.input.as_ref().expect("live pi stdin"),
-            &json!({"id": id, "type": "prompt", "message": input}),
-        )?;
+        let (record, active) = match request {
+            AgentRequest::Prompt(text) => (
+                json!({"id": id, "type": "prompt", "message": text}),
+                ActiveRequest::Prompt {
+                    id,
+                    accepted: false,
+                    settled: false,
+                    failure: None,
+                },
+            ),
+            AgentRequest::NewSession => (
+                json!({"id": id, "type": "new_session"}),
+                ActiveRequest::NewSession { id },
+            ),
+        };
+        self.write_record(&record)?;
+        Ok(active)
+    }
 
-        let mut messages = Vec::new();
-        let mut accepted = false;
-        let mut settled = false;
-        let mut failure = None;
-        loop {
-            let record = self.records.recv().await.context("pi disconnected")??;
-            match record["type"].as_str() {
-                Some("response") if record["id"].as_str() == Some(&id) => {
-                    if record["success"] != true {
-                        bail!(
-                            "{}",
-                            record["error"]
-                                .as_str()
-                                .unwrap_or("pi rejected the request")
-                        );
-                    }
-                    if record["data"]["disposition"] == "handled" {
-                        return Ok(messages);
-                    }
-                    accepted = true;
+    fn write_record(&mut self, record: &Value) -> Result<(), AgentError> {
+        let input = self.input.as_mut().expect("live pi stdin");
+        serde_json::to_writer(&mut *input, record)?;
+        input.write_all(b"\n")?;
+        input.flush()?;
+        Ok(())
+    }
+
+    fn handle_extension(&mut self, record: &Value) -> Result<(), AgentError> {
+        match record["type"].as_str() {
+            Some("extension_ui_request") => match record["method"].as_str() {
+                Some("select" | "confirm" | "input" | "editor") => {
+                    self.write_record(&json!({
+                        "type": "extension_ui_response",
+                        "id": record["id"],
+                        "cancelled": true,
+                    }))?;
+                    eprintln!(
+                        "rockstar: cancelled an extension dialog; dialog UI is not available yet"
+                    );
                 }
-                Some("agent_start") => settled = false,
-                Some("message_end") => {
-                    let message = &record["message"];
-                    if message["role"] == "assistant" {
-                        match message["stopReason"].as_str() {
-                            Some("error" | "aborted") => {
-                                failure = Some(anyhow!(
-                                    "{}",
-                                    message["errorMessage"]
-                                        .as_str()
-                                        .unwrap_or("pi could not complete the response")
-                                ));
-                                continue;
-                            }
-                            _ => failure = None,
-                        }
-                    }
-                    if let Some(message) = completed_message(message) {
-                        messages.push(message);
-                    }
-                }
-                Some("agent_settled") => {
-                    settled = true;
-                    if record["aborted"] == true {
-                        failure = Some(anyhow!("The pi request was cancelled."));
+                Some("notify") => {
+                    if let Some(message) = record["message"].as_str() {
+                        eprintln!("pi: {message}");
                     }
                 }
                 _ => {}
+            },
+            Some("extension_error") => eprintln!("pi extension: {}", record["error"]),
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl ActiveRequest {
+    fn handle_record(&mut self, record: &Value) -> Option<AgentEvent> {
+        match self {
+            Self::Prompt {
+                id,
+                accepted,
+                settled,
+                failure,
+            } => {
+                match record["type"].as_str() {
+                    Some("response") if record["id"].as_str() == Some(id.as_str()) => {
+                        if record["success"] != true {
+                            return Some(AgentEvent::PromptFinished(Err(response_error(record))));
+                        }
+                        match record["data"]["disposition"].as_str() {
+                            Some("handled") => return Some(AgentEvent::PromptFinished(Ok(()))),
+                            Some("started" | "queued") => *accepted = true,
+                            _ => {
+                                return Some(AgentEvent::PromptFinished(Err(anyhow!(
+                                    "pi returned an invalid prompt response"
+                                ))));
+                            }
+                        }
+                    }
+                    Some("agent_start") => *settled = false,
+                    Some("message_end") if record["message"]["role"] == "assistant" => {
+                        let message = &record["message"];
+                        *failure = match message["stopReason"].as_str() {
+                            Some("error" | "aborted") => Some(anyhow!(
+                                "{}",
+                                message["errorMessage"]
+                                    .as_str()
+                                    .unwrap_or("pi could not complete the response")
+                            )),
+                            _ => None,
+                        };
+                    }
+                    Some("agent_settled") => {
+                        *settled = true;
+                        if record["aborted"] == true {
+                            *failure = Some(anyhow!("The pi request was cancelled."));
+                        }
+                    }
+                    _ => {}
+                }
+                (*accepted && *settled)
+                    .then(|| AgentEvent::PromptFinished(failure.take().map_or(Ok(()), Err)))
             }
-            // Acceptance is not completion. Retrying and tool execution can
-            // produce several agent_end events before the session settles.
-            if accepted && settled {
-                return match failure {
-                    Some(error) => Err(error),
-                    None => Ok(messages),
+            Self::NewSession { id } => {
+                if record["type"] != "response" || record["id"].as_str() != Some(id.as_str()) {
+                    return None;
+                }
+                let result = if record["success"] != true {
+                    Err(response_error(record))
+                } else {
+                    match record["data"]["cancelled"].as_bool() {
+                        Some(false) => Ok(()),
+                        Some(true) => Err(anyhow!("New session cancelled.")),
+                        None => Err(anyhow!("pi returned an invalid new_session response")),
+                    }
                 };
+                Some(AgentEvent::NewSessionFinished(result))
             }
         }
     }
 }
 
-fn write_record(input: &Input, record: &Value) -> Result<(), AgentError> {
-    let mut input = input.lock().map_err(|_| anyhow!("pi input lock failed"))?;
-    serde_json::to_writer(&mut *input, record)?;
-    input.write_all(b"\n")?;
-    input.flush()?;
-    Ok(())
+fn response_error(record: &Value) -> AgentError {
+    anyhow!(
+        "{}",
+        record["error"]
+            .as_str()
+            .unwrap_or("pi rejected the request")
+    )
 }
 
-fn completed_message(message: &Value) -> Option<Message> {
-    let role = message["role"].as_str()?;
-    if !matches!(role, "user" | "assistant") {
-        return None;
+fn decode_event(record: &Value) -> Option<AgentEvent> {
+    match record["type"].as_str()? {
+        "message_start" if record["message"]["role"] == "assistant" => {
+            Some(AgentEvent::AssistantStarted)
+        }
+        "message_update" if record["assistantMessageEvent"]["type"] == "text_delta" => {
+            let text = record["assistantMessageEvent"]["delta"].as_str()?;
+            (!text.is_empty()).then(|| AgentEvent::AssistantTextDelta(text.into()))
+        }
+        "message_end" => {
+            let message = &record["message"];
+            let text = message_text(message);
+            match message["role"].as_str()? {
+                "user" if !text.is_empty() => Some(AgentEvent::UserMessage(text)),
+                "assistant" => Some(AgentEvent::AssistantFinished(text)),
+                _ => None,
+            }
+        }
+        _ => None,
     }
-    let text = match &message["content"] {
+}
+
+fn message_text(message: &Value) -> String {
+    match &message["content"] {
         Value::String(text) => text.clone(),
         Value::Array(blocks) => blocks
             .iter()
             .filter(|block| block["type"] == "text")
             .filter_map(|block| block["text"].as_str())
-            .collect::<String>(),
-        _ => return None,
-    };
-    if text.is_empty() {
-        return None;
+            .collect(),
+        _ => String::new(),
     }
-    Some(match role {
-        "user" => Message::User(text),
-        _ => Message::Assistant(text),
-    })
 }
 
 impl Drop for PiCodingAgent {
     fn drop(&mut self) {
-        // EOF lets pi dispose its runtime and extensions. Bound the wait so a
-        // broken child cannot keep Rockstar alive indefinitely on shutdown.
         self.input.take();
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {

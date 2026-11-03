@@ -1,21 +1,26 @@
 use std::{
     fmt, fs,
     path::PathBuf,
-    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
-use gpui_kit::{HeadlessAppContext, assets::Assets, point, px, size};
+use gpui_kit::{
+    ScrollDelta, point, px, size,
+    test::{TestQueryExt as _, TestWindowExt as _},
+};
 use image::{Rgba, RgbaImage};
 
-use super::open_chat_window;
-use crate::agent::{AgentError, CodingAgent, Message};
+use crate::{
+    agent::{AgentRequest, Message},
+    app::open_chat_window,
+    test_support::{RENDER_LOCK, headless_app, mock_agent, reply_with_messages},
+};
 
 const CASES: [&str; 4] = ["conversation", "math", "mermaid", "code_blocks"];
+const COMMAND_CASES: [(&str, &str); 2] = [("command_palette", "nw"), ("command_no_match", "model")];
 const TIMEOUT: Duration = Duration::from_secs(35);
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
-static RENDER_LOCK: Mutex<()> = Mutex::new(());
 
 // Compare every pixel, but do not dump megabytes of pixels on assertion failure.
 #[derive(PartialEq)]
@@ -29,17 +34,7 @@ impl fmt::Debug for Screenshot {
     }
 }
 
-struct MockCodingAgent {
-    messages: Vec<Message>,
-}
-
-impl CodingAgent for MockCodingAgent {
-    async fn prompt(&mut self, _: String) -> Result<Vec<Message>, AgentError> {
-        Ok(std::mem::take(&mut self.messages))
-    }
-}
-
-fn sample(name: &str) -> (String, MockCodingAgent) {
+fn sample(name: &str) -> (String, Vec<Message>) {
     let request = match name {
         "conversation" => "Markdown の表示例を見せてください。",
         "math" => "数式を含む説明をお願いします。",
@@ -48,10 +43,8 @@ fn sample(name: &str) -> (String, MockCodingAgent) {
         _ => unreachable!(),
     };
     let response = fs::read_to_string(fixture(name, "md")).expect("read the response fixture");
-    let agent = MockCodingAgent {
-        messages: vec![Message::User(request.into()), Message::Assistant(response)],
-    };
-    (request.into(), agent)
+    let messages = vec![Message::User(request.into()), Message::Assistant(response)];
+    (request.into(), messages)
 }
 
 #[test]
@@ -74,6 +67,36 @@ fn code_blocks() {
     assert_snapshot("code_blocks");
 }
 
+#[test]
+fn command_palette() {
+    assert_command_snapshot("command_palette", "nw");
+}
+
+#[test]
+fn command_no_match() {
+    assert_command_snapshot("command_no_match", "model");
+}
+
+fn assert_command_snapshot(name: &str, query: &str) {
+    let (input, messages) = sample("conversation");
+    let expected = Screenshot(
+        image::open(fixture(name, "png"))
+            .expect("read the reviewed command popup reference image")
+            .into_rgba8(),
+    );
+    let actual = capture(
+        messages,
+        &input,
+        "An unsent draft",
+        Some(query),
+        Some(&expected),
+    );
+    if actual != expected {
+        save_difference(name, &actual, &expected);
+    }
+    assert_eq!(actual, expected, "visual regression in {name}");
+}
+
 fn fixture(name: &str, extension: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/visual")
@@ -82,7 +105,7 @@ fn fixture(name: &str, extension: &str) -> PathBuf {
 
 fn assert_snapshot(name: &str) {
     // Arrange
-    let (input, agent) = sample(name);
+    let (input, messages) = sample(name);
     let draft = "次は別の例をお願いします。";
     let expected = Screenshot(
         image::open(fixture(name, "png"))
@@ -91,7 +114,7 @@ fn assert_snapshot(name: &str) {
     );
 
     // Act
-    let actual = capture(agent, &input, draft, Some(&expected));
+    let actual = capture(messages, &input, draft, None, Some(&expected));
 
     // Assert
     if actual != expected {
@@ -101,39 +124,50 @@ fn assert_snapshot(name: &str) {
 }
 
 fn capture(
-    agent: MockCodingAgent,
+    messages: Vec<Message>,
     input: &str,
     draft: &str,
+    popup_query: Option<&str>,
     expected: Option<&Screenshot>,
 ) -> Screenshot {
     let _guard = RENDER_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let mut cx = HeadlessAppContext::with_platform(
-        gpui_kit::platform::current_platform(true).text_system(),
-        Arc::new(Assets),
-        gpui_kit::platform::current_headless_renderer,
-    );
-    let (window, view) = cx
+    let mut cx = headless_app();
+    let (agent, requests, events) = mock_agent();
+    let (window, _) = cx
         .update(|cx| open_chat_window(agent, cx))
         .expect("open the production chat view with a mock agent");
     cx.update_window(window, |_, window, cx| {
         window.resize(size(px(960.0), px(1100.0)));
         window.bounds_changed(cx);
-        view.update(cx, |view, cx| {
-            view.input
-                .update(cx, |state, cx| state.set_value(input, window, cx));
-            view.submit(window, cx);
-        });
+        window.activate_window();
+        window.press("i", cx);
+        window.input(input, cx);
+        window.click("send", cx);
     })
     .unwrap();
+    assert!(matches!(
+        requests.try_recv(),
+        Ok(AgentRequest::Prompt(text)) if text == input
+    ));
+    reply_with_messages(&events, messages);
     cx.run_until_parked();
     cx.update_window(window, |_, window, cx| {
-        view.update(cx, |view, cx| {
-            view.input
-                .update(cx, |state, cx| state.set_value(draft, window, cx));
-            view.scroll.set_offset(point(px(0.0), px(0.0)));
-        });
+        window.render_frame(cx);
+        let field = window.find_by_label("Message to pi");
+        window.click(field.path().last().unwrap().clone(), cx);
+        window.input(draft, cx);
+        window.scroll(
+            "conversation",
+            ScrollDelta::Pixels(point(px(0.0), px(100_000.0))),
+            cx,
+        );
+        if let Some(query) = popup_query {
+            window.press("escape", cx);
+            window.press(":", cx);
+            window.input(query, cx);
+        }
         // A stable, unfocused editor avoids cursor-blink differences in snapshots.
         window.blur(cx);
     })
@@ -152,7 +186,7 @@ fn capture(
         .expect("draw the chat window");
         let actual = Screenshot(
             cx.capture_screenshot(window)
-                .expect("real offscreen rendering is required; run through test-visual"),
+                .expect("capture the offscreen-rendered window"),
         );
 
         if let Some(expected) = expected {
@@ -202,13 +236,28 @@ fn save_difference(name: &str, actual: &Screenshot, expected: &Screenshot) {
 }
 
 #[test]
-#[ignore = "rewrites reference PNGs; run test-visual update_snapshots -- --ignored, then review them"]
+#[ignore = "rewrites reference PNGs; run cargo test update_snapshots -- --ignored, then review them"]
 fn update_snapshots() {
     for name in CASES {
-        let (input, agent) = sample(name);
-        let actual = capture(agent, &input, "次は別の例をお願いします。", None);
+        let (input, messages) = sample(name);
+        let actual = capture(messages, &input, "次は別の例をお願いします。", None, None);
         let path = fixture(name, "png");
         actual.0.save(&path).expect("write the reference image");
+        eprintln!("Review {}", path.display());
+    }
+}
+
+#[test]
+#[ignore = "rewrites command popup PNGs; run cargo test update_command_snapshots -- --ignored, then review them"]
+fn update_command_snapshots() {
+    for (name, query) in COMMAND_CASES {
+        let (input, messages) = sample("conversation");
+        let actual = capture(messages, &input, "An unsent draft", Some(query), None);
+        let path = fixture(name, "png");
+        actual
+            .0
+            .save(&path)
+            .expect("write the command popup reference");
         eprintln!("Review {}", path.display());
     }
 }
