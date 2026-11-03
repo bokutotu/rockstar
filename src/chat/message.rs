@@ -2,8 +2,7 @@ use gpui_kit::{
     App, AppContext as _, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
     Styled as _,
     base::{TestSupportExt as _, TextView, TextViewState},
-    component::ActiveTheme as _,
-    div, px,
+    div, px, rgb,
 };
 
 use crate::{agent::Message, math::MathPlugin, mermaid::MermaidPlugin};
@@ -62,10 +61,10 @@ impl ChatMessage {
             .update(cx, |document, cx| document.set_text(text, cx));
     }
 
-    pub(super) fn view(&self, index: usize, cx: &App) -> impl IntoElement + use<> {
-        let (label, markdown) = match self {
-            Self::User(markdown) => ("You", markdown),
-            Self::Assistant(markdown) => ("Assistant", markdown),
+    pub(super) fn view(&self, index: usize) -> impl IntoElement + use<> {
+        let (label, color, markdown) = match self {
+            Self::User(markdown) => ("You", rgb(0x2563eb), markdown),
+            Self::Assistant(markdown) => ("Assistant", rgb(0x0f766e), markdown),
         };
         div()
             .id(("message", index))
@@ -78,7 +77,7 @@ impl ChatMessage {
                 div()
                     .text_size(px(13.0))
                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                    .text_color(cx.theme().muted_foreground)
+                    .text_color(color)
                     .child(label),
             )
             .child(markdown.view())

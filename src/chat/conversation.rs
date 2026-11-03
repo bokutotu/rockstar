@@ -71,7 +71,7 @@ impl ConversationView {
 }
 
 impl Render for ConversationView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("conversation")
             .test_support()
@@ -85,7 +85,7 @@ impl Render for ConversationView {
                     self.messages
                         .iter()
                         .enumerate()
-                        .map(|(index, message)| message.view(index, cx)),
+                        .map(|(index, message)| message.view(index)),
                 ),
             )
     }
