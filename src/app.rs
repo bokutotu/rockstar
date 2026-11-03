@@ -1,7 +1,7 @@
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, Styled as _, Subscription, TitlebarOptions, Window,
-    WindowBounds, WindowOptions,
+    AnyWindowHandle, App, AppContext as _, Context, Entity, FocusHandle, Font, FontFallbacks,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, Subscription,
+    TitlebarOptions, Window, WindowBounds, WindowOptions,
     component::{ActiveTheme as _, Theme, ThemeMode, WindowExt as _, notification::Notification},
     div, px, size,
 };
@@ -111,8 +111,15 @@ impl Render for AppView {
             .flex_col()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .font_family("Noto Sans CJK JP")
-            .text_size(px(16.0))
+            .font(Font {
+                family: cx.theme().font_family.clone(),
+                fallbacks: Some(FontFallbacks::from_fonts(vec![
+                    "Noto Sans CJK JP".into(),
+                    "Noto Color Emoji".into(),
+                ])),
+                ..Default::default()
+            })
+            .text_size(cx.theme().font_size)
             .child(self.chat.clone())
             .child(self.palette.clone())
     }
@@ -125,6 +132,13 @@ pub fn open_chat_window(
     gpui_kit::init(cx);
     command_palette::init(cx);
     Theme::change(ThemeMode::Light, None, cx);
+    Theme::update(cx, |theme| {
+        theme.font_family = "JetBrainsMono Nerd Font".into();
+        // Match Alacritty's 6 pt at 96 dpi.
+        theme.font_size = px(8.0);
+        theme.mono_font_family = theme.font_family.clone();
+        theme.mono_font_size = theme.font_size;
+    });
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(960.0), px(720.0)), cx)),
         window_min_size: Some(size(px(360.0), px(240.0))),

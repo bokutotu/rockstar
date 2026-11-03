@@ -19,7 +19,7 @@ use crate::{
 
 const CASES: [&str; 4] = ["conversation", "math", "mermaid", "code_blocks"];
 const COMMAND_CASES: [(&str, &str); 2] = [("command_palette", "nw"), ("command_no_match", "model")];
-const TIMEOUT: Duration = Duration::from_secs(35);
+const SNAPSHOT_UPDATE_TIMEOUT: Duration = Duration::from_secs(35);
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 // Compare every pixel, but do not dump megabytes of pixels on assertion failure.
@@ -84,13 +84,7 @@ fn assert_command_snapshot(name: &str, query: &str) {
             .expect("read the reviewed command popup reference image")
             .into_rgba8(),
     );
-    let actual = capture(
-        messages,
-        &input,
-        "An unsent draft",
-        Some(query),
-        Some(&expected),
-    );
+    let actual = capture(messages, &input, "An unsent draft", Some(query), false);
     if actual != expected {
         save_difference(name, &actual, &expected);
     }
@@ -114,7 +108,7 @@ fn assert_snapshot(name: &str) {
     );
 
     // Act
-    let actual = capture(messages, &input, draft, None, Some(&expected));
+    let actual = capture(messages, &input, draft, None, false);
 
     // Assert
     if actual != expected {
@@ -128,7 +122,7 @@ fn capture(
     input: &str,
     draft: &str,
     popup_query: Option<&str>,
-    expected: Option<&Screenshot>,
+    wait_for_stability: bool,
 ) -> Screenshot {
     let _guard = RENDER_LOCK
         .lock()
@@ -189,24 +183,23 @@ fn capture(
                 .expect("capture the offscreen-rendered window"),
         );
 
-        if let Some(expected) = expected {
-            if actual == *expected || started.elapsed() >= TIMEOUT {
-                return actual;
-            }
-        } else {
-            // Only the explicit reference-update command uses visual stability.
-            // Stability does not establish correctness: review every updated PNG.
-            if previous.as_ref() != Some(&actual) {
-                last_change = Instant::now();
-            } else if last_change.elapsed() >= Duration::from_secs(1) {
-                return actual;
-            }
-            assert!(
-                started.elapsed() < TIMEOUT,
-                "reference image did not settle"
-            );
-            previous = Some(actual);
+        // Regression tests capture once; a mismatch must fail without retrying.
+        if !wait_for_stability {
+            return actual;
         }
+
+        // Only the explicit reference-update command uses visual stability.
+        // Stability does not establish correctness: review every updated PNG.
+        if previous.as_ref() != Some(&actual) {
+            last_change = Instant::now();
+        } else if last_change.elapsed() >= Duration::from_secs(1) {
+            return actual;
+        }
+        assert!(
+            started.elapsed() < SNAPSHOT_UPDATE_TIMEOUT,
+            "reference image did not settle"
+        );
+        previous = Some(actual);
         cx.advance_clock(FRAME_INTERVAL);
         thread::sleep(FRAME_INTERVAL);
     }
@@ -240,7 +233,7 @@ fn save_difference(name: &str, actual: &Screenshot, expected: &Screenshot) {
 fn update_snapshots() {
     for name in CASES {
         let (input, messages) = sample(name);
-        let actual = capture(messages, &input, "次は別の例をお願いします。", None, None);
+        let actual = capture(messages, &input, "次は別の例をお願いします。", None, true);
         let path = fixture(name, "png");
         actual.0.save(&path).expect("write the reference image");
         eprintln!("Review {}", path.display());
@@ -252,7 +245,7 @@ fn update_snapshots() {
 fn update_command_snapshots() {
     for (name, query) in COMMAND_CASES {
         let (input, messages) = sample("conversation");
-        let actual = capture(messages, &input, "An unsent draft", Some(query), None);
+        let actual = capture(messages, &input, "An unsent draft", Some(query), true);
         let path = fixture(name, "png");
         actual
             .0

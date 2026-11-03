@@ -29,7 +29,9 @@
           fontconfigFile = pkgs.makeFontsConf {
             fontDirectories = with pkgs; [
               dejavu_fonts
+              nerd-fonts.jetbrains-mono
               (noto-fonts-cjk-sans.override { static = true; })
+              noto-fonts-color-emoji
             ];
           };
           renderEnvironment = {

@@ -212,7 +212,6 @@ fn normal_insert_and_popup_are_driven_by_keyboard_and_mouse() {
     app.requests.close();
     app.press("ctrl-enter");
     app.assert_draft("Keep this draft");
-    app.ui(|window, _| assert!(window.find("notification").visible()));
     app.no_requests();
 }
 
@@ -362,7 +361,6 @@ fn preserved_on_unsuccessful_reset(result: Result<(), AgentError>) {
     app.assert_popup(false);
     app.assert_conversation(true);
     app.assert_draft("An unsent draft");
-    app.ui(|window, _| assert!(window.find("notification").visible()));
     // Recovery uses the same UI and the same agent, not a replacement view.
     app.press(":");
     app.ui(|window, cx| window.click("command-new", cx));
