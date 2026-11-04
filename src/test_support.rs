@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use async_channel::{Receiver, Sender};
+use async_channel::Sender;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, HeadlessAppContext, TitlebarOptions, WindowBounds,
     WindowOptions,
@@ -10,23 +10,14 @@ use gpui_kit::{
 };
 
 use crate::{
-    agent::{AgentConnection, AgentEvent, AgentHandle, AgentRequest, Message},
+    agent::{self, Agent, AgentBackend, AgentEvent, Message},
     app::AppView,
 };
 
 pub static RENDER_LOCK: Mutex<()> = Mutex::new(());
 
-pub fn mock_agent() -> (AgentConnection, Receiver<AgentRequest>, Sender<AgentEvent>) {
-    let (sender, requests) = async_channel::unbounded();
-    let (events, receiver) = async_channel::unbounded();
-    (
-        AgentConnection {
-            handle: AgentHandle { requests: sender },
-            events: receiver,
-        },
-        requests,
-        events,
-    )
+pub fn mock_agent() -> (Agent, AgentBackend) {
+    agent::channel()
 }
 
 pub fn reply_with_messages(events: &Sender<AgentEvent>, messages: Vec<Message>) {
@@ -54,15 +45,12 @@ pub fn headless_app() -> HeadlessAppContext {
     )
 }
 
-pub(crate) fn open_app_window(
-    agent: AgentConnection,
-    cx: &mut App,
-) -> gpui_kit::Result<AnyWindowHandle> {
+pub(crate) fn open_app_window(agent: Agent, cx: &mut App) -> gpui_kit::Result<AnyWindowHandle> {
     gpui_kit::init(cx);
     Theme::change(ThemeMode::Light, None, cx);
     Theme::update(cx, |theme| {
         theme.font_family = "JetBrainsMono Nerd Font".into();
-        theme.font_size = px(8.0);
+        theme.font_size = px(11.0);
         theme.mono_font_family = theme.font_family.clone();
         theme.mono_font_size = theme.font_size;
     });

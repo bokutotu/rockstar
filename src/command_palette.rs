@@ -1,68 +1,57 @@
+use async_channel::Sender;
 use gpui_kit::{
-    AppContext as _, Context, Empty, Entity, EventEmitter, InteractiveElement as _, IntoElement,
+    AppContext as _, Context, Empty, Entity, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, Role, StatefulInteractiveElement as _, Styled as _, Window,
     base::TestSupportExt as _,
     component::{
-        ActiveTheme as _,
+        ActiveTheme as _, WindowExt as _,
         input::{Enter, Input, InputState},
+        notification::Notification,
     },
     div, px,
 };
 
-use crate::interaction::{Interaction, InteractionMode};
-
-pub(crate) enum Command {
-    NewSession,
-}
+use crate::{
+    agent::{DISCONNECTED_MESSAGE, NewSessionRequest},
+    interaction::{Interaction, InteractionMode},
+};
 
 pub(crate) struct CommandPalette {
     input: Entity<InputState>,
     interaction: Entity<Interaction>,
-    visible: bool,
+    new_sessions: Sender<NewSessionRequest>,
 }
-
-impl EventEmitter<Command> for CommandPalette {}
 
 impl CommandPalette {
     pub(crate) fn new(
+        new_sessions: Sender<NewSessionRequest>,
         interaction: Entity<Interaction>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Command…"));
-        cx.observe_in(&interaction, window, |this, interaction, window, cx| {
-            this.apply_mode(interaction.read(cx).mode(), window, cx);
-        })
-        .detach();
-        let mode = interaction.read(cx).mode();
-        let mut view = Self {
+        cx.observe(&interaction, |_, _, cx| cx.notify()).detach();
+        Self {
             input,
             interaction,
-            visible: false,
-        };
-        view.apply_mode(mode, window, cx);
-        view
+            new_sessions,
+        }
     }
 
-    fn apply_mode(&mut self, mode: InteractionMode, window: &mut Window, cx: &mut Context<Self>) {
-        let visible = matches!(mode, InteractionMode::CommandPalette);
-        if self.visible == visible {
-            return;
-        }
-        self.visible = visible;
-        if visible {
-            self.input.update(cx, |input, cx| {
-                input.set_value("", window, cx);
-                input.focus(window, cx);
-            });
-        }
-        cx.notify();
-    }
-
-    fn confirm(&mut self, cx: &mut Context<Self>) {
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let command = self.input.read(cx).value();
         if command.trim().eq_ignore_ascii_case("new") {
-            cx.emit(Command::NewSession);
+            match self.new_sessions.try_send(NewSessionRequest) {
+                Ok(()) => {
+                    self.input
+                        .update(cx, |input, cx| input.set_value("", window, cx));
+                    self.dismiss(cx);
+                }
+                Err(_) => window.push_notification(
+                    Notification::error(DISCONNECTED_MESSAGE).autohide(false),
+                    cx,
+                ),
+            }
         }
     }
 
@@ -74,16 +63,18 @@ impl CommandPalette {
 }
 
 impl Render for CommandPalette {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.apply_mode(self.interaction.read(cx).mode(), window, cx);
-        if !self.visible {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !matches!(
+            self.interaction.read(cx).mode(),
+            InteractionMode::CommandPalette
+        ) {
             return Empty.into_any_element();
         }
         div()
             .id("command-overlay")
-            .capture_action(cx.listener(|this, action: &Enter, _, cx| {
+            .capture_action(cx.listener(|this, action: &Enter, window, cx| {
                 if !action.secondary {
-                    this.confirm(cx);
+                    this.confirm(window, cx);
                 }
                 cx.stop_propagation();
             }))

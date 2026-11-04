@@ -1,22 +1,20 @@
 //! Drive the production AppView in a test window through public UI events. Only the agent is mocked.
 use std::sync::MutexGuard;
 
-use async_channel::{Receiver, Sender};
 use gpui_kit::{
     AnyWindowHandle, App, HeadlessAppContext, Window,
     test::{TestQueryExt as _, TestWindowExt as _},
 };
 
 use crate::{
-    agent::{AgentEvent, AgentRequest, Message},
+    agent::{AgentBackend, AgentEvent, Message, NewSessionRequest, PromptRequest},
     test_support::{RENDER_LOCK, headless_app, mock_agent, open_app_window, reply_with_messages},
 };
 
 struct Driver {
     cx: HeadlessAppContext,
     window: AnyWindowHandle,
-    requests: Receiver<AgentRequest>,
-    events: Sender<AgentEvent>,
+    backend: AgentBackend,
     // Drop the App (and its renderer) before releasing the lock.
     _render_guard: MutexGuard<'static, ()>,
 }
@@ -27,15 +25,14 @@ impl Driver {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let mut cx = headless_app();
-        let (agent, requests, events) = mock_agent();
+        let (agent, backend) = mock_agent();
         let window = cx.update(|cx| open_app_window(agent, cx).unwrap());
         cx.update_window(window, |_, window, _| window.activate_window())
             .unwrap();
         Self {
             cx,
             window,
-            requests,
-            events,
+            backend,
             _render_guard: render_guard,
         }
     }
@@ -68,6 +65,11 @@ impl Driver {
         });
     }
 
+    fn assert_no_requests(&self) {
+        assert!(self.backend.prompts.is_empty());
+        assert!(self.backend.new_sessions.is_empty());
+    }
+
     fn assert_draft(&mut self, expected: &str) {
         self.ui(|window, _| {
             assert_eq!(
@@ -98,19 +100,6 @@ impl Driver {
 }
 
 #[test]
-fn i_and_escape_switch_input_mode() {
-    let mut app = Driver::open();
-    app.type_text("abc");
-    app.assert_draft("");
-    app.press("i");
-    app.type_text("Hello");
-    app.assert_draft("Hello");
-    app.press("escape");
-    app.type_text("abc");
-    app.assert_draft("Hello");
-}
-
-#[test]
 fn input_click_enables_typing() {
     let mut app = Driver::open();
     app.click_input();
@@ -121,25 +110,25 @@ fn input_click_enables_typing() {
 #[test]
 fn enter_inserts_newline_without_sending() {
     let mut app = Driver::open();
-    app.press("i");
+    app.click_input();
     app.type_text("First line");
     app.press("enter");
     app.type_text("Second line");
     app.assert_draft("First line\nSecond line");
-    assert!(app.requests.is_empty());
+    app.assert_no_requests();
 }
 
 #[test]
 fn ctrl_enter_sends_once_and_clears_draft() {
     let mut app = Driver::open();
-    app.press("i");
+    app.click_input();
     app.type_text("Hello");
     app.press("ctrl-enter");
     assert!(matches!(
-        app.requests.try_recv(),
-        Ok(AgentRequest::Prompt(text)) if text == "Hello"
+        app.backend.prompts.try_recv(),
+        Ok(PromptRequest { text }) if text == "Hello"
     ));
-    assert!(app.requests.is_empty());
+    app.assert_no_requests();
     app.assert_draft("");
 }
 
@@ -155,7 +144,7 @@ fn colon_opens_palette_and_escape_closes_it() {
 #[test]
 fn outside_click_closes_palette_without_sending_or_clearing_draft() {
     let mut app = Driver::open();
-    app.press("i");
+    app.click_input();
     app.type_text("An unsent draft");
     app.press("escape");
     app.press(":");
@@ -164,33 +153,41 @@ fn outside_click_closes_palette_without_sending_or_clearing_draft() {
     app.click_input();
     app.assert_popup(false);
     app.assert_draft("An unsent draft");
-    assert!(app.requests.is_empty());
+    app.assert_no_requests();
 }
 
 #[test]
 fn new_session_clears_chat_and_draft_only_after_success() {
     let mut app = Driver::open();
     reply_with_messages(
-        &app.events,
+        &app.backend.events,
         vec![
             Message::User("Hello".into()),
             Message::Assistant("Hello from the mock agent.".into()),
         ],
     );
-    app.press("i");
+    app.click_input();
     app.type_text("An unsent draft");
     app.press("escape");
     app.press(":");
+    app.ui(|window, cx| {
+        let mut popup = window.within("command-popup");
+        let field = popup.find_by_label("Command");
+        popup.click(field.path().last().unwrap().clone(), cx);
+    });
     app.type_text("new");
     app.press("enter");
     assert!(matches!(
-        app.requests.try_recv(),
-        Ok(AgentRequest::NewSession)
+        app.backend.new_sessions.try_recv(),
+        Ok(NewSessionRequest)
     ));
     app.assert_conversation(true);
     app.assert_draft("An unsent draft");
 
-    app.events.try_send(AgentEvent::NewSessionFinished).unwrap();
+    app.backend
+        .events
+        .try_send(AgentEvent::NewSessionFinished)
+        .unwrap();
     app.assert_conversation(false);
     app.assert_draft("");
 }

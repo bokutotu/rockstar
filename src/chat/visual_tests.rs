@@ -12,7 +12,7 @@ use gpui_kit::{
 use image::{Rgba, RgbaImage};
 
 use crate::{
-    agent::{AgentRequest, Message},
+    agent::{Message, PromptRequest},
     test_support::{RENDER_LOCK, headless_app, mock_agent, open_app_window, reply_with_messages},
 };
 
@@ -118,7 +118,7 @@ fn capture(
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let mut cx = headless_app();
-    let (agent, requests, events) = mock_agent();
+    let (agent, backend) = mock_agent();
     let window = cx
         .update(|cx| open_app_window(agent, cx))
         .expect("open the production app view with a mock agent");
@@ -126,16 +126,22 @@ fn capture(
         window.resize(size(px(960.0), px(1100.0)));
         window.bounds_changed(cx);
         window.activate_window();
-        window.press("i", cx);
+        window.render_frame(cx);
+        let field = window.find_by_label("Message to pi");
+        window.click(field.path().last().unwrap().clone(), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
         window.input(input, cx);
         window.press("ctrl-enter", cx);
     })
     .unwrap();
     assert!(matches!(
-        requests.try_recv(),
-        Ok(AgentRequest::Prompt(text)) if text == input
+        backend.prompts.try_recv(),
+        Ok(PromptRequest { text }) if text == input
     ));
-    reply_with_messages(&events, messages);
+    reply_with_messages(&backend.events, messages);
     cx.run_until_parked();
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
@@ -150,6 +156,9 @@ fn capture(
         if let Some(command) = command {
             window.press("escape", cx);
             window.press(":", cx);
+            let mut popup = window.within("command-popup");
+            let field = popup.find_by_label("Command");
+            popup.click(field.path().last().unwrap().clone(), cx);
             window.input(command, cx);
         }
         // A stable, unfocused editor avoids cursor-blink differences in snapshots.

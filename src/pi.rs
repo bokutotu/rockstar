@@ -8,11 +8,13 @@ use std::{
 };
 
 use anyhow::{Context as _, anyhow, bail};
-use async_channel::{Receiver, RecvError, Sender};
-use futures_lite::future::{block_on, or};
+use async_channel::{Receiver, RecvError};
+use futures_lite::future::{block_on, or, pending, race};
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{AgentConnection, AgentError, AgentEvent, AgentHandle, AgentRequest};
+use crate::agent::{
+    self, Agent, AgentBackend, AgentError, AgentEvent, NewSessionRequest, PromptRequest,
+};
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -211,11 +213,13 @@ enum ActiveRequest {
 }
 
 enum Incoming {
-    Request(Result<AgentRequest, RecvError>),
+    Prompt(Result<PromptRequest, RecvError>),
+    NewSession(Result<NewSessionRequest, RecvError>),
     Record(Result<Result<PiIncomingRecord, AgentError>, RecvError>),
+    ResultsClosed,
 }
 
-pub fn connect(cwd: &Path) -> Result<AgentConnection, AgentError> {
+pub fn connect(cwd: &Path) -> Result<Agent, AgentError> {
     let parent_pid = process::id() as libc::pid_t;
     let mut command = Command::new("pi");
     command
@@ -251,7 +255,7 @@ pub fn connect(cwd: &Path) -> Result<AgentConnection, AgentError> {
     let input = child.stdin.take().expect("piped pi stdin");
     let output = child.stdout.take().expect("piped pi stdout");
     let (record_sender, records) = async_channel::unbounded();
-    let agent = PiCodingAgent {
+    let pi = PiCodingAgent {
         input,
         records,
         next_request_id: 0,
@@ -274,58 +278,86 @@ pub fn connect(cwd: &Path) -> Result<AgentConnection, AgentError> {
             }
         })?;
 
-    let (requests, receiver) = async_channel::unbounded();
-    let (sender, events) = async_channel::unbounded();
+    let (agent, backend) = agent::channel();
     thread::Builder::new()
         .name("pi-rpc".into())
-        .spawn(move || agent.run(receiver, sender))?;
-    Ok(AgentConnection {
-        handle: AgentHandle { requests },
-        events,
-    })
+        .spawn(move || pi.run(backend))?;
+    Ok(agent)
 }
 
 impl PiCodingAgent {
-    fn run(mut self, requests: Receiver<AgentRequest>, events: Sender<AgentEvent>) {
-        let result = block_on(self.process_requests(&requests, &events));
-        requests.close();
+    fn run(mut self, backend: AgentBackend) {
+        let result = block_on(self.process_requests(&backend));
+        // Close both request endpoints even when the RPC loop fails.
+        drop(backend);
         if let Err(error) = result {
             eprintln!("rockstar: {error:#}");
             process::exit(1);
         }
     }
 
-    async fn process_requests(
-        &mut self,
-        requests: &Receiver<AgentRequest>,
-        events: &Sender<AgentEvent>,
-    ) -> Result<(), AgentError> {
-        let mut pending = VecDeque::new();
+    async fn process_requests(&mut self, backend: &AgentBackend) -> Result<(), AgentError> {
+        let mut queued = VecDeque::new();
         let mut active: Option<ActiveRequest> = None;
+        let mut prompts_open = true;
+        let mut sessions_open = true;
         loop {
-            if requests.is_closed() || events.is_closed() {
+            if (!prompts_open && !sessions_open) || backend.events.is_closed() {
                 return Ok(());
             }
             if active.is_none()
-                && let Some(request) = pending.pop_front()
+                && let Some((record, request)) = queued.pop_front()
             {
-                active = Some(self.start_request(request)?);
+                self.write_record(&record)?;
+                active = Some(request);
             }
-            let incoming = or(async { Incoming::Request(requests.recv().await) }, async {
-                Incoming::Record(self.records.recv().await)
-            })
+            let incoming = or(
+                async {
+                    backend.events.closed().await;
+                    Incoming::ResultsClosed
+                },
+                or(
+                    async { Incoming::Record(self.records.recv().await) },
+                    race(
+                        async {
+                            if !prompts_open {
+                                pending::<()>().await;
+                            }
+                            Incoming::Prompt(backend.prompts.recv().await)
+                        },
+                        async {
+                            if !sessions_open {
+                                pending::<()>().await;
+                            }
+                            Incoming::NewSession(backend.new_sessions.recv().await)
+                        },
+                    ),
+                ),
+            )
             .await;
             let record = match incoming {
-                Incoming::Request(Ok(request)) => {
-                    pending.push_back(request);
+                Incoming::Prompt(Ok(request)) => {
+                    queued.push_back(self.prepare_prompt(request));
                     continue;
                 }
-                Incoming::Request(Err(_)) => return Ok(()),
+                Incoming::NewSession(Ok(request)) => {
+                    queued.push_back(self.prepare_new_session(request));
+                    continue;
+                }
+                Incoming::Prompt(Err(_)) => {
+                    prompts_open = false;
+                    continue;
+                }
+                Incoming::NewSession(Err(_)) => {
+                    sessions_open = false;
+                    continue;
+                }
                 Incoming::Record(result) => result.context("pi disconnected")??,
+                Incoming::ResultsClosed => return Ok(()),
             };
             self.handle_extension(&record)?;
             if let Some(event) = decode_event(&record)
-                && events.send(event).await.is_err()
+                && backend.events.try_send(event).is_err()
             {
                 return Ok(());
             }
@@ -334,36 +366,40 @@ impl PiCodingAgent {
                 .and_then(|request| request.handle_record(&record))
             {
                 active = None;
-                if events.send(event).await.is_err() {
+                if backend.events.try_send(event).is_err() {
                     return Ok(());
                 }
             }
         }
     }
 
-    fn start_request(&mut self, request: AgentRequest) -> Result<ActiveRequest, AgentError> {
+    fn next_id(&mut self) -> String {
         self.next_request_id += 1;
-        let id = self.next_request_id.to_string();
-        let (record, active) = match request {
-            AgentRequest::Prompt(message) => (
-                PiOutgoingRecord::Prompt {
-                    id: id.clone(),
-                    message,
-                },
-                ActiveRequest::Prompt {
-                    id,
-                    accepted: false,
-                    settled: false,
-                    failure: None,
-                },
-            ),
-            AgentRequest::NewSession => (
-                PiOutgoingRecord::NewSession { id: id.clone() },
-                ActiveRequest::NewSession { id },
-            ),
-        };
-        self.write_record(&record)?;
-        Ok(active)
+        self.next_request_id.to_string()
+    }
+
+    fn prepare_prompt(&mut self, request: PromptRequest) -> (PiOutgoingRecord, ActiveRequest) {
+        let id = self.next_id();
+        (
+            PiOutgoingRecord::Prompt {
+                id: id.clone(),
+                message: request.text,
+            },
+            ActiveRequest::Prompt {
+                id,
+                accepted: false,
+                settled: false,
+                failure: None,
+            },
+        )
+    }
+
+    fn prepare_new_session(&mut self, _: NewSessionRequest) -> (PiOutgoingRecord, ActiveRequest) {
+        let id = self.next_id();
+        (
+            PiOutgoingRecord::NewSession { id: id.clone() },
+            ActiveRequest::NewSession { id },
+        )
     }
 
     fn write_record(&mut self, record: &PiOutgoingRecord) -> Result<(), AgentError> {

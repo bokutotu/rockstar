@@ -1,14 +1,13 @@
 use gpui_kit::{
     AppContext as _, Context, Entity, FocusHandle, Font, FontFallbacks, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, Styled as _, Subscription, Window,
-    component::{ActiveTheme as _, WindowExt as _, notification::Notification},
-    div,
+    component::ActiveTheme as _, div,
 };
 
 use crate::{
-    agent::{AgentConnection, AgentHandle, AgentRequest},
+    agent::Agent,
     chat::ChatView,
-    command_palette::{Command, CommandPalette},
+    command_palette::CommandPalette,
     interaction::{Interaction, InteractionMode},
 };
 
@@ -16,22 +15,28 @@ pub(crate) struct AppView {
     interaction: Entity<Interaction>,
     normal_focus: FocusHandle,
     normal_active: bool,
-    agent: AgentHandle,
     chat: Entity<ChatView>,
     palette: Entity<CommandPalette>,
     _key_subscription: Subscription,
 }
 
 impl AppView {
-    pub(crate) fn new(
-        connection: AgentConnection,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub(crate) fn new(mut agent: Agent, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let interaction = cx.new(|_| Interaction::new());
-        let agent = connection.handle.clone();
-        let chat = cx.new(|cx| ChatView::new(connection, interaction.clone(), window, cx));
-        let palette = cx.new(|cx| CommandPalette::new(interaction.clone(), window, cx));
+        let chat = cx.new(|cx| {
+            ChatView::new(
+                agent.prompt_sender(),
+                agent
+                    .take_results()
+                    .expect("agent results belong to the chat"),
+                interaction.clone(),
+                window,
+                cx,
+            )
+        });
+        let palette = cx.new(|cx| {
+            CommandPalette::new(agent.new_session_sender(), interaction.clone(), window, cx)
+        });
         let key_subscription = cx.intercept_keystrokes({
             let interaction = interaction.clone();
             let window_handle = window.window_handle();
@@ -50,16 +55,11 @@ impl AppView {
             this.apply_mode(interaction.read(cx).mode(), window, cx);
         })
         .detach();
-        cx.subscribe_in(&palette, window, |this, _, command, window, cx| {
-            this.handle_command(command, window, cx);
-        })
-        .detach();
         let mode = interaction.read(cx).mode();
         let mut view = Self {
             interaction,
             normal_focus: cx.focus_handle(),
             normal_active: false,
-            agent,
             chat,
             palette,
             _key_subscription: key_subscription,
@@ -74,18 +74,6 @@ impl AppView {
             self.normal_focus.focus(window, cx);
         }
         cx.notify();
-    }
-
-    fn handle_command(&mut self, command: &Command, window: &mut Window, cx: &mut Context<Self>) {
-        match command {
-            Command::NewSession => match self.agent.send(AgentRequest::NewSession) {
-                Ok(()) => self.interaction.update(cx, |interaction, cx| {
-                    interaction.set_mode(InteractionMode::Normal, cx);
-                }),
-                Err(error) => window
-                    .push_notification(Notification::error(error.to_string()).autohide(false), cx),
-            },
-        }
     }
 }
 

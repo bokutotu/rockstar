@@ -55,7 +55,7 @@ fn main() -> ExitCode {
             Theme::change(ThemeMode::Light, None, cx);
             Theme::update(cx, |theme| {
                 theme.font_family = "JetBrainsMono Nerd Font".into();
-                theme.font_size = px(8.0);
+                theme.font_size = px(11.0);
                 theme.mono_font_family = theme.font_family.clone();
                 theme.mono_font_size = theme.font_size;
             });
