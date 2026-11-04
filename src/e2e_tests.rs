@@ -1,4 +1,4 @@
-//! Drive the production window through public UI events. Only the agent is mocked.
+//! Drive the production AppView in a test window through public UI events. Only the agent is mocked.
 use std::sync::MutexGuard;
 
 use async_channel::{Receiver, Sender};
@@ -9,8 +9,7 @@ use gpui_kit::{
 
 use crate::{
     agent::{AgentEvent, AgentRequest, Message},
-    app::open_chat_window,
-    test_support::{RENDER_LOCK, headless_app, mock_agent, reply_with_messages},
+    test_support::{RENDER_LOCK, headless_app, mock_agent, open_app_window, reply_with_messages},
 };
 
 struct Driver {
@@ -29,7 +28,7 @@ impl Driver {
             .unwrap_or_else(|error| error.into_inner());
         let mut cx = headless_app();
         let (agent, requests, events) = mock_agent();
-        let (window, _) = cx.update(|cx| open_chat_window(agent, cx).unwrap());
+        let window = cx.update(|cx| open_app_window(agent, cx).unwrap());
         cx.update_window(window, |_, window, _| window.activate_window())
             .unwrap();
         Self {
@@ -191,9 +190,7 @@ fn new_session_clears_chat_and_draft_only_after_success() {
     app.assert_conversation(true);
     app.assert_draft("An unsent draft");
 
-    app.events
-        .try_send(AgentEvent::NewSessionFinished)
-        .unwrap();
+    app.events.try_send(AgentEvent::NewSessionFinished).unwrap();
     app.assert_conversation(false);
     app.assert_draft("");
 }

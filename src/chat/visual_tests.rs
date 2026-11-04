@@ -13,8 +13,7 @@ use image::{Rgba, RgbaImage};
 
 use crate::{
     agent::{AgentRequest, Message},
-    app::open_chat_window,
-    test_support::{RENDER_LOCK, headless_app, mock_agent, reply_with_messages},
+    test_support::{RENDER_LOCK, headless_app, mock_agent, open_app_window, reply_with_messages},
 };
 
 const CASES: [&str; 4] = ["conversation", "math", "mermaid", "code_blocks"];
@@ -120,9 +119,9 @@ fn capture(
         .unwrap_or_else(|error| error.into_inner());
     let mut cx = headless_app();
     let (agent, requests, events) = mock_agent();
-    let (window, _) = cx
-        .update(|cx| open_chat_window(agent, cx))
-        .expect("open the production chat view with a mock agent");
+    let window = cx
+        .update(|cx| open_app_window(agent, cx))
+        .expect("open the production app view with a mock agent");
     cx.update_window(window, |_, window, cx| {
         window.resize(size(px(960.0), px(1100.0)));
         window.bounds_changed(cx);

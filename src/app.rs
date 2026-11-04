@@ -1,9 +1,8 @@
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Context, Entity, FocusHandle, Font, FontFallbacks,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, Subscription,
-    TitlebarOptions, Window, WindowBounds, WindowOptions,
-    component::{ActiveTheme as _, Theme, ThemeMode, WindowExt as _, notification::Notification},
-    div, px, size,
+    AppContext as _, Context, Entity, FocusHandle, Font, FontFallbacks, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, Styled as _, Subscription, Window,
+    component::{ActiveTheme as _, WindowExt as _, notification::Notification},
+    div,
 };
 
 use crate::{
@@ -13,7 +12,7 @@ use crate::{
     interaction::{Interaction, InteractionMode},
 };
 
-struct AppView {
+pub(crate) struct AppView {
     interaction: Entity<Interaction>,
     normal_focus: FocusHandle,
     normal_active: bool,
@@ -24,7 +23,11 @@ struct AppView {
 }
 
 impl AppView {
-    fn new(connection: AgentConnection, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(
+        connection: AgentConnection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let interaction = cx.new(|_| Interaction::new());
         let agent = connection.handle.clone();
         let chat = cx.new(|cx| ChatView::new(connection, interaction.clone(), window, cx));
@@ -114,33 +117,4 @@ impl Render for AppView {
             .child(self.chat.clone())
             .child(self.palette.clone())
     }
-}
-
-pub fn open_chat_window(
-    agent: AgentConnection,
-    cx: &mut App,
-) -> gpui_kit::Result<(AnyWindowHandle, Entity<ChatView>)> {
-    gpui_kit::init(cx);
-    Theme::change(ThemeMode::Light, None, cx);
-    Theme::update(cx, |theme| {
-        theme.font_family = "JetBrainsMono Nerd Font".into();
-        // Match Alacritty's 6 pt at 96 dpi.
-        theme.font_size = px(8.0);
-        theme.mono_font_family = theme.font_family.clone();
-        theme.mono_font_size = theme.font_size;
-    });
-    let options = WindowOptions {
-        window_bounds: Some(WindowBounds::centered(size(px(960.0), px(720.0)), cx)),
-        window_min_size: Some(size(px(360.0), px(240.0))),
-        titlebar: Some(TitlebarOptions {
-            title: Some("Rockstar — pi".into()),
-            ..Default::default()
-        }),
-        app_id: Some("rockstar".into()),
-        ..Default::default()
-    };
-    let (window, app) = gpui_kit::open_window(options, cx, |window, cx| {
-        cx.new(|cx| AppView::new(agent, window, cx))
-    })?;
-    Ok((window, app.read(cx).chat.clone()))
 }

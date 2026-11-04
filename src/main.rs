@@ -14,7 +14,13 @@ mod test_support;
 
 use std::{env, process::ExitCode};
 
-use app::open_chat_window;
+use gpui_kit::{
+    AppContext as _, TitlebarOptions, WindowBounds, WindowOptions,
+    component::{Theme, ThemeMode},
+    px, size,
+};
+
+use app::AppView;
 
 const USAGE: &str = "Usage: rockstar\n\nChat with pi in the current directory.";
 
@@ -45,7 +51,28 @@ fn main() -> ExitCode {
             })
             .detach();
 
-            open_chat_window(agent, cx).expect("failed to open the chat window");
+            gpui_kit::init(cx);
+            Theme::change(ThemeMode::Light, None, cx);
+            Theme::update(cx, |theme| {
+                theme.font_family = "JetBrainsMono Nerd Font".into();
+                theme.font_size = px(8.0);
+                theme.mono_font_family = theme.font_family.clone();
+                theme.mono_font_size = theme.font_size;
+            });
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::centered(size(px(960.0), px(720.0)), cx)),
+                window_min_size: Some(size(px(360.0), px(240.0))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Rockstar — pi".into()),
+                    ..Default::default()
+                }),
+                app_id: Some("rockstar".into()),
+                ..Default::default()
+            };
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| AppView::new(agent, window, cx))
+            })
+            .expect("failed to open the app window");
             cx.activate(true);
         });
 
