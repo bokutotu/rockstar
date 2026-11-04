@@ -13,27 +13,24 @@ use gpui_kit::{
 
 use crate::{
     agent::{DISCONNECTED_MESSAGE, NewSessionRequest},
-    interaction::{Interaction, InteractionMode},
+    mode::Mode,
 };
 
 pub(crate) struct CommandPalette {
     input: Entity<InputState>,
-    interaction: Entity<Interaction>,
     new_sessions: Sender<NewSessionRequest>,
 }
 
 impl CommandPalette {
     pub(crate) fn new(
         new_sessions: Sender<NewSessionRequest>,
-        interaction: Entity<Interaction>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Command…"));
-        cx.observe(&interaction, |_, _, cx| cx.notify()).detach();
+        cx.observe_global::<Mode>(|_, cx| cx.notify()).detach();
         Self {
             input,
-            interaction,
             new_sessions,
         }
     }
@@ -56,18 +53,13 @@ impl CommandPalette {
     }
 
     fn dismiss(&mut self, cx: &mut Context<Self>) {
-        self.interaction.update(cx, |interaction, cx| {
-            interaction.set_mode(InteractionMode::Normal, cx);
-        });
+        cx.set_global(Mode::Normal);
     }
 }
 
 impl Render for CommandPalette {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !matches!(
-            self.interaction.read(cx).mode(),
-            InteractionMode::CommandPalette
-        ) {
+        if *cx.global::<Mode>() != Mode::CommandPalette {
             return Empty.into_any_element();
         }
         div()

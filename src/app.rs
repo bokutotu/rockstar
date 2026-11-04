@@ -8,13 +8,11 @@ use crate::{
     agent::Agent,
     chat::ChatView,
     command_palette::CommandPalette,
-    interaction::{Interaction, InteractionMode},
+    mode::{self, Mode},
 };
 
 pub(crate) struct AppView {
-    interaction: Entity<Interaction>,
     normal_focus: FocusHandle,
-    normal_active: bool,
     chat: Entity<ChatView>,
     palette: Entity<CommandPalette>,
     _key_subscription: Subscription,
@@ -22,67 +20,49 @@ pub(crate) struct AppView {
 
 impl AppView {
     pub(crate) fn new(mut agent: Agent, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let interaction = cx.new(|_| Interaction::new());
+        mode::init(cx);
         let chat = cx.new(|cx| {
             ChatView::new(
                 agent.prompt_sender(),
                 agent
                     .take_results()
                     .expect("agent results belong to the chat"),
-                interaction.clone(),
                 window,
                 cx,
             )
         });
-        let palette = cx.new(|cx| {
-            CommandPalette::new(agent.new_session_sender(), interaction.clone(), window, cx)
-        });
+        let palette = cx.new(|cx| CommandPalette::new(agent.new_session_sender(), window, cx));
         let key_subscription = cx.intercept_keystrokes({
-            let interaction = interaction.clone();
             let window_handle = window.window_handle();
             move |event, window, cx| {
                 // Intercept before keybindings, regardless of the focused view.
-                if window.window_handle() == window_handle
-                    && interaction.update(cx, |interaction, cx| {
-                        interaction.handle_key(&event.keystroke, cx)
-                    })
+                if window.window_handle() == window_handle && mode::handle_key(&event.keystroke, cx)
                 {
                     cx.stop_propagation();
                 }
             }
         });
-        cx.observe_in(&interaction, window, |this, interaction, window, cx| {
-            this.apply_mode(interaction.read(cx).mode(), window, cx);
+        cx.observe_global_in::<Mode>(window, |this, window, cx| {
+            if *cx.global::<Mode>() == Mode::Normal {
+                this.normal_focus.focus(window, cx);
+            }
         })
         .detach();
-        let mode = interaction.read(cx).mode();
-        let mut view = Self {
-            interaction,
-            normal_focus: cx.focus_handle(),
-            normal_active: false,
+        let normal_focus = cx.focus_handle();
+        if *cx.global::<Mode>() == Mode::Normal {
+            normal_focus.focus(window, cx);
+        }
+        Self {
+            normal_focus,
             chat,
             palette,
             _key_subscription: key_subscription,
-        };
-        view.apply_mode(mode, window, cx);
-        view
-    }
-
-    fn apply_mode(&mut self, mode: InteractionMode, window: &mut Window, cx: &mut Context<Self>) {
-        self.normal_active = matches!(mode, InteractionMode::Normal);
-        if self.normal_active {
-            self.normal_focus.focus(window, cx);
         }
-        cx.notify();
     }
 }
 
 impl Render for AppView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mode = self.interaction.read(cx).mode();
-        if self.normal_active != matches!(mode, InteractionMode::Normal) {
-            self.apply_mode(mode, window, cx);
-        }
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("app")
             .track_focus(&self.normal_focus)

@@ -12,11 +12,11 @@ use gpui_kit::{
 
 use crate::{
     agent::{DISCONNECTED_MESSAGE, PromptRequest},
-    interaction::{Interaction, InteractionMode},
+    mode::Mode,
 };
 
-fn input_hint(mode: InteractionMode) -> &'static str {
-    if matches!(mode, InteractionMode::Insert) {
+fn input_hint(mode: Mode) -> &'static str {
+    if mode == Mode::Insert {
         "Ask pi…"
     } else {
         "NORMAL — click to type · : commands"
@@ -25,39 +25,31 @@ fn input_hint(mode: InteractionMode) -> &'static str {
 
 pub(super) struct ComposerView {
     input: Entity<TextareaState>,
-    interaction: Entity<Interaction>,
     prompts: Sender<PromptRequest>,
 }
 
 impl ComposerView {
     pub(super) fn new(
         prompts: Sender<PromptRequest>,
-        interaction: Entity<Interaction>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let hint = input_hint(interaction.read(cx).mode());
+        let hint = input_hint(*cx.global::<Mode>());
         let input = cx.new(|cx| TextareaState::new(window, cx).rows(3).placeholder(hint));
-        cx.observe_in(&interaction, window, |this, interaction, window, cx| {
-            let hint = input_hint(interaction.read(cx).mode());
+        cx.observe_global_in::<Mode>(window, |this, window, cx| {
+            let hint = input_hint(*cx.global::<Mode>());
             this.input
                 .update(cx, |input, cx| input.set_placeholder(hint, window, cx));
             cx.notify();
         })
         .detach();
-        cx.on_focus(&input.focus_handle(cx), window, |this, _, cx| {
-            this.interaction.update(cx, |interaction, cx| {
-                if matches!(interaction.mode(), InteractionMode::Normal) {
-                    interaction.set_mode(InteractionMode::Insert, cx);
-                }
-            });
+        cx.on_focus(&input.focus_handle(cx), window, |_, _, cx| {
+            if *cx.global::<Mode>() == Mode::Normal {
+                cx.set_global(Mode::Insert);
+            }
         })
         .detach();
-        Self {
-            input,
-            interaction,
-            prompts,
-        }
+        Self { input, prompts }
     }
 
     pub(super) fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -70,7 +62,7 @@ impl ComposerView {
         if !action.secondary {
             return;
         }
-        if matches!(self.interaction.read(cx).mode(), InteractionMode::Insert) {
+        if *cx.global::<Mode>() == Mode::Insert {
             self.submit(window, cx);
         }
         cx.stop_propagation();
@@ -111,7 +103,7 @@ impl View for Composer {
 
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         self.state.update(cx, |state, cx| {
-            let mode = state.interaction.read(cx).mode();
+            let mode = *cx.global::<Mode>();
             div()
                 // Capture Ctrl+Enter before the textarea inserts a newline.
                 .capture_action(cx.listener(|this, action: &Enter, window, cx| {
@@ -124,7 +116,7 @@ impl View for Composer {
                 .child(
                     Textarea::new(&state.input)
                         .flex_1()
-                        .readonly(!matches!(mode, InteractionMode::Insert))
+                        .readonly(mode != Mode::Insert)
                         .aria_label("Message to pi"),
                 )
         })

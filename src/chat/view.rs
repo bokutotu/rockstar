@@ -10,10 +10,7 @@ use super::{
     composer::{Composer, ComposerView},
     conversation::ConversationView,
 };
-use crate::{
-    agent::{AgentEvent, Message, PromptRequest},
-    interaction::Interaction,
-};
+use crate::agent::{AgentEvent, Message, PromptRequest};
 
 pub struct ChatView {
     conversation: Entity<ConversationView>,
@@ -25,12 +22,11 @@ impl ChatView {
     pub(crate) fn new(
         prompts: Sender<PromptRequest>,
         events: Receiver<AgentEvent>,
-        interaction: Entity<Interaction>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let conversation = cx.new(|_| ConversationView::new());
-        let composer = cx.new(|cx| ComposerView::new(prompts, interaction, window, cx));
+        let composer = cx.new(|cx| ComposerView::new(prompts, window, cx));
         let events_task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(event) = events.recv().await {
                 if this

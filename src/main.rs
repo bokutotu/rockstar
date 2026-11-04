@@ -2,9 +2,9 @@ mod agent;
 mod app;
 mod chat;
 mod command_palette;
-mod interaction;
 mod math;
 mod mermaid;
+mod mode;
 mod pi;
 
 #[cfg(test)]
