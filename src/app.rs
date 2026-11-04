@@ -1,26 +1,18 @@
 use gpui_kit::{
     AppContext as _, Context, Entity, FocusHandle, Font, FontFallbacks, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, Styled as _, Subscription, Window,
-    component::ActiveTheme as _, div,
+    IntoElement, ParentElement as _, Render, Styled as _, Window, component::ActiveTheme as _, div,
 };
 
-use crate::{
-    agent::Agent,
-    chat::ChatView,
-    command_palette::CommandPalette,
-    mode::{self, Mode},
-};
+use crate::{agent::Agent, chat::ChatView, command_palette::CommandPalette, mode::Mode};
 
 pub(crate) struct AppView {
     normal_focus: FocusHandle,
     chat: Entity<ChatView>,
     palette: Entity<CommandPalette>,
-    _key_subscription: Subscription,
 }
 
 impl AppView {
     pub(crate) fn new(mut agent: Agent, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        mode::init(cx);
         let chat = cx.new(|cx| {
             ChatView::new(
                 agent.prompt_sender(),
@@ -32,16 +24,6 @@ impl AppView {
             )
         });
         let palette = cx.new(|cx| CommandPalette::new(agent.new_session_sender(), window, cx));
-        let key_subscription = cx.intercept_keystrokes({
-            let window_handle = window.window_handle();
-            move |event, window, cx| {
-                // Intercept before keybindings, regardless of the focused view.
-                if window.window_handle() == window_handle && mode::handle_key(&event.keystroke, cx)
-                {
-                    cx.stop_propagation();
-                }
-            }
-        });
         cx.observe_global_in::<Mode>(window, |this, window, cx| {
             if *cx.global::<Mode>() == Mode::Normal {
                 this.normal_focus.focus(window, cx);
@@ -56,7 +38,6 @@ impl AppView {
             normal_focus,
             chat,
             palette,
-            _key_subscription: key_subscription,
         }
     }
 }

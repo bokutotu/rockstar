@@ -15,7 +15,7 @@ mod test_support;
 use std::{env, process::ExitCode};
 
 use gpui_kit::{
-    AppContext as _, TitlebarOptions, WindowBounds, WindowOptions,
+    App, AppContext as _, TitlebarOptions, WindowBounds, WindowOptions,
     component::{Theme, ThemeMode},
     px, size,
 };
@@ -23,6 +23,17 @@ use gpui_kit::{
 use app::AppView;
 
 const USAGE: &str = "Usage: rockstar\n\nChat with pi in the current directory.";
+
+fn init_key_handling(cx: &mut App) {
+    mode::init(cx);
+    cx.intercept_keystrokes(|event, _, cx| {
+        // Intercept before keybindings in every window, regardless of the focused view.
+        if mode::handle_key(&event.keystroke, cx) {
+            cx.stop_propagation();
+        }
+    })
+    .detach();
+}
 
 fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().skip(1).collect();
@@ -52,6 +63,7 @@ fn main() -> ExitCode {
             .detach();
 
             gpui_kit::init(cx);
+            init_key_handling(cx);
             Theme::change(ThemeMode::Light, None, cx);
             Theme::update(cx, |theme| {
                 theme.font_family = "JetBrainsMono Nerd Font".into();
