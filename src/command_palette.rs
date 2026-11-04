@@ -1,7 +1,8 @@
 use async_channel::Sender;
 use gpui_kit::{
-    AppContext as _, Context, Empty, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, Role, StatefulInteractiveElement as _, Styled as _, Window,
+    App, AppContext as _, Context, Empty, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, RenderOnce, Role, StatefulInteractiveElement as _, Styled as _,
+    Window,
     base::TestSupportExt as _,
     component::{
         ActiveTheme as _, WindowExt as _,
@@ -16,19 +17,44 @@ use crate::{
     mode::Mode,
 };
 
-pub(crate) struct CommandPalette {
+/// Mounts the palette view only while command-palette mode is active.
+#[derive(IntoElement)]
+pub(crate) struct CommandPaletteHost {
+    new_sessions: Sender<NewSessionRequest>,
+}
+
+impl CommandPaletteHost {
+    pub(crate) fn new(new_sessions: Sender<NewSessionRequest>) -> Self {
+        Self { new_sessions }
+    }
+}
+
+impl RenderOnce for CommandPaletteHost {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        if *cx.global::<Mode>() != Mode::CommandPalette {
+            return Empty.into_any_element();
+        }
+        window
+            .use_keyed_state("command-palette", cx, |window, cx| {
+                CommandPaletteView::new(self.new_sessions, window, cx)
+            })
+            .into_any_element()
+    }
+}
+
+/// The input and UI retained for one open/close cycle of the palette.
+struct CommandPaletteView {
     input: Entity<InputState>,
     new_sessions: Sender<NewSessionRequest>,
 }
 
-impl CommandPalette {
-    pub(crate) fn new(
+impl CommandPaletteView {
+    fn new(
         new_sessions: Sender<NewSessionRequest>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Command…"));
-        cx.observe_global::<Mode>(|_, cx| cx.notify()).detach();
         Self {
             input,
             new_sessions,
@@ -39,11 +65,7 @@ impl CommandPalette {
         let command = self.input.read(cx).value();
         if command.trim().eq_ignore_ascii_case("new") {
             match self.new_sessions.try_send(NewSessionRequest) {
-                Ok(()) => {
-                    self.input
-                        .update(cx, |input, cx| input.set_value("", window, cx));
-                    self.dismiss(cx);
-                }
+                Ok(()) => self.dismiss(cx),
                 Err(_) => window.push_notification(
                     Notification::error(DISCONNECTED_MESSAGE).autohide(false),
                     cx,
@@ -57,11 +79,8 @@ impl CommandPalette {
     }
 }
 
-impl Render for CommandPalette {
+impl Render for CommandPaletteView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if *cx.global::<Mode>() != Mode::CommandPalette {
-            return Empty.into_any_element();
-        }
         div()
             .id("command-overlay")
             .capture_action(cx.listener(|this, action: &Enter, window, cx| {
@@ -111,6 +130,5 @@ impl Render for CommandPalette {
                             .aria_label("Command"),
                     ),
             )
-            .into_any_element()
     }
 }

@@ -1,14 +1,20 @@
+use async_channel::Sender;
 use gpui_kit::{
     AppContext as _, Context, Entity, FocusHandle, Font, FontFallbacks, InteractiveElement as _,
     IntoElement, ParentElement as _, Render, Styled as _, Window, component::ActiveTheme as _, div,
 };
 
-use crate::{agent::Agent, chat::ChatView, command_palette::CommandPalette, mode::Mode};
+use crate::{
+    agent::{Agent, NewSessionRequest},
+    chat::ChatView,
+    command_palette::CommandPaletteHost,
+    mode::Mode,
+};
 
 pub(crate) struct AppView {
     normal_focus: FocusHandle,
     chat: Entity<ChatView>,
-    palette: Entity<CommandPalette>,
+    new_sessions: Sender<NewSessionRequest>,
 }
 
 impl AppView {
@@ -23,11 +29,11 @@ impl AppView {
                 cx,
             )
         });
-        let palette = cx.new(|cx| CommandPalette::new(agent.new_session_sender(), window, cx));
         cx.observe_global_in::<Mode>(window, |this, window, cx| {
             if *cx.global::<Mode>() == Mode::Normal {
                 this.normal_focus.focus(window, cx);
             }
+            cx.notify();
         })
         .detach();
         let normal_focus = cx.focus_handle();
@@ -37,7 +43,7 @@ impl AppView {
         Self {
             normal_focus,
             chat,
-            palette,
+            new_sessions: agent.new_session_sender(),
         }
     }
 }
@@ -64,6 +70,6 @@ impl Render for AppView {
             })
             .text_size(cx.theme().font_size)
             .child(self.chat.clone())
-            .child(self.palette.clone())
+            .child(CommandPaletteHost::new(self.new_sessions.clone()))
     }
 }
