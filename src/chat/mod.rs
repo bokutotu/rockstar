@@ -1,5 +1,6 @@
 mod composer;
 mod conversation;
+mod ime;
 mod message;
 mod session;
 mod view;

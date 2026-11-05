@@ -18,6 +18,7 @@ use crate::{
 };
 
 mod close;
+mod input_shortcuts;
 
 struct Driver {
     cx: HeadlessAppContext,

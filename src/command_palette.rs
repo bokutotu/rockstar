@@ -12,7 +12,7 @@ use gpui_kit::{
     div, px,
 };
 
-use crate::{mode::Mode, workspace::Workspace};
+use crate::{input_shortcuts, mode::Mode, workspace::Workspace};
 
 pub(crate) fn bind_mode(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
     workspace.update(cx, |workspace, cx| workspace.focus_active(window, cx));
@@ -100,6 +100,7 @@ impl CommandPaletteView {
 impl Render for CommandPaletteView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .key_context(input_shortcuts::CONTEXT)
             .id("command-popup")
             .test_support()
             .role(Role::Group)

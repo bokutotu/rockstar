@@ -14,11 +14,11 @@ use gpui_kit::{
     prelude::FluentBuilder as _,
 };
 
-use super::session::ChatSession;
+use super::{ime::observe_ime_position, session::ChatSession};
 
 use crate::{
     agent::{DISCONNECTED_MESSAGE, PromptRequest},
-    file_search,
+    file_search, input_shortcuts,
     mode::Mode,
 };
 
@@ -67,6 +67,7 @@ impl ComposerView {
     ) -> Self {
         let hint = input_hint(*cx.global::<Mode>());
         let input = cx.new(|cx| TextareaState::new(window, cx).rows(3).placeholder(hint));
+        observe_ime_position(&input, window, cx).detach();
         let draft = session.read(cx).draft.clone();
         input.update(cx, |input, cx| input.set_value(draft, window, cx));
         cx.observe_in(&session, window, |this, session, window, cx| {
@@ -356,6 +357,7 @@ impl View for Composer {
         self.state.update(cx, |state, cx| {
             let mode = *cx.global::<Mode>();
             div()
+                .key_context(input_shortcuts::CONTEXT)
                 // Capture Ctrl+Enter before the textarea inserts a newline.
                 .capture_action(cx.listener(|this, action: &Enter, window, cx| {
                     this.handle_enter(action, window, cx);

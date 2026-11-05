@@ -25,6 +25,10 @@ gpui = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"] 
 gpui-platform = { package = "gpui-pre-platform", version = "=0.3.10", features = ["test-support"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+[patch.crates-io]
+# Keep X11 IME coordinates updating during composition; see vendor/README.md.
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+
 [profile.dev]
 debug = 1
 

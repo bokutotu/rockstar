@@ -3,6 +3,7 @@ mod app;
 mod chat;
 mod command_palette;
 mod file_search;
+mod input_shortcuts;
 mod math;
 mod mermaid;
 mod mode;
@@ -29,6 +30,7 @@ const USAGE: &str = "Usage: rockstar\n\nChat with pi in the current directory.";
 fn init_key_handling(cx: &mut App) {
     mode::init(cx);
     workspace::init(cx);
+    input_shortcuts::init(cx);
     cx.intercept_keystrokes(|event, _, cx| {
         // Intercept before keybindings in every window, regardless of the focused view.
         if mode::handle_key(&event.keystroke, cx) {
