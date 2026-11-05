@@ -7,6 +7,7 @@ use gpui_kit::{
         ActiveTheme as _, WindowExt as _,
         dialog::DialogEntrance,
         input::{Enter, Input, InputState},
+        notification::Notification,
     },
     div, px,
 };
@@ -72,13 +73,22 @@ impl CommandPaletteView {
 
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let command = self.input.read(cx).value();
-        if command.trim().eq_ignore_ascii_case("new")
-            && self
-                .workspace
-                .update(cx, |workspace, cx| workspace.new_chat(window, cx))
-                .is_ok()
-        {
-            self.dismiss(cx);
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let result = if command.trim().eq_ignore_ascii_case("new") {
+            workspace.update(cx, |workspace, cx| workspace.new_chat(window, cx));
+            Ok(())
+        } else if command.trim().eq_ignore_ascii_case("close") {
+            workspace.update(cx, |workspace, cx| workspace.close_active_pane(window, cx))
+        } else {
+            return;
+        };
+        match result {
+            Ok(()) => self.dismiss(cx),
+            Err(error) => {
+                window.push_notification(Notification::error(error.to_string()).autohide(false), cx)
+            }
         }
     }
 

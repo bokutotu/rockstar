@@ -1,11 +1,13 @@
 use std::{
+    fmt,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use gpui_kit::{
-    App, AppContext as _, Bounds, Context, Entity, Focusable as _, InteractiveElement as _,
-    IntoElement, KeyBinding, ParentElement as _, Pixels, Render, Styled as _, Window, actions,
+    App, AppContext as _, Bounds, Context, Entity, EntityId, Focusable as _,
+    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels, Render,
+    Styled as _, Window, actions,
     base::Placement,
     canvas,
     component::{
@@ -27,6 +29,21 @@ use crate::{
 mod dock;
 
 pub(crate) type AgentConnector = Arc<dyn Fn(&Path) -> Result<Agent, AgentError> + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClosePaneError {
+    LastPane,
+}
+
+impl fmt::Display for ClosePaneError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LastPane => f.write_str("Cannot close the last pane."),
+        }
+    }
+}
+
+impl std::error::Error for ClosePaneError {}
 
 actions!(
     workspace,
@@ -100,19 +117,24 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Entity<ChatPane> {
         let pane = cx.new(|cx| ChatPane::new(session, &self.root, window, cx));
-        let index = self.panes.len();
+        let id = pane.entity_id();
         cx.on_focus_in(&pane.focus_handle(cx), window, move |this, _, cx| {
-            this.active = index;
-            cx.notify();
+            this.activate_pane(id, cx);
         })
         .detach();
-        cx.subscribe(&pane, move |this, _, _: &PaneActivated, cx| {
-            this.active = index;
-            cx.notify();
+        cx.subscribe(&pane, |this, pane, _: &PaneActivated, cx| {
+            this.activate_pane(pane.entity_id(), cx);
         })
         .detach();
         self.panes.push(pane.clone());
         pane
+    }
+
+    fn activate_pane(&mut self, id: EntityId, cx: &mut Context<Self>) {
+        if let Some(index) = self.panes.iter().position(|pane| pane.entity_id() == id) {
+            self.active = index;
+            cx.notify();
+        }
     }
 
     pub(crate) fn focus_active(&self, window: &mut Window, cx: &mut App) {
@@ -122,6 +144,24 @@ impl Workspace {
         } else {
             pane.focus_handle(cx).focus(window, cx);
         }
+    }
+
+    pub(crate) fn close_active_pane(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), ClosePaneError> {
+        if self.panes.len() == 1 {
+            return Err(ClosePaneError::LastPane);
+        }
+
+        let pane = self.panes.remove(self.active);
+        self.active = self.active.min(self.panes.len() - 1);
+        self.dock
+            .update(cx, |dock, cx| dock.remove_panel(pane, window, cx));
+        self.focus_active(window, cx);
+        cx.notify();
+        Ok(())
     }
 
     fn show_titles(&self, cx: &mut App) {
@@ -242,30 +282,43 @@ impl Workspace {
     pub(crate) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Keep the command's destination even if the user focuses another pane
         // while pi is starting. A failed connection does not change any session.
-        let pane = self.panes[self.active].clone();
+        let pane_id = self.panes[self.active].entity_id();
         let root = self.root.clone();
         let connect = self.connect.clone();
         let connecting = cx.background_spawn(async move { connect(&root) });
         cx.spawn_in(window, async move |this, cx| {
             let result = connecting.await;
-            let _ = this.update_in(cx, |this, window, cx| match result {
-                Ok(agent) => {
-                    let number = this.sessions.len() + 1;
-                    let session = cx.new(|cx| ChatSession::new(agent, number, window, cx));
-                    this.sessions.push(session.clone());
-                    pane.update(cx, |pane, cx| {
-                        pane.show_session(session, &this.root, window, cx)
-                    });
-                    this.show_titles(cx);
-                    if this.panes[this.active] == pane
-                        && *cx.global::<Mode>() != Mode::CommandPalette
-                    {
-                        this.focus_active(window, cx);
+            let _ = this.update_in(cx, |this, window, cx| {
+                // A closed destination must not retain a view or create a hidden session.
+                let Some(pane) = this
+                    .panes
+                    .iter()
+                    .find(|pane| pane.entity_id() == pane_id)
+                    .cloned()
+                else {
+                    return;
+                };
+                match result {
+                    Ok(agent) => {
+                        let number = this.sessions.len() + 1;
+                        let session = cx.new(|cx| ChatSession::new(agent, number, window, cx));
+                        this.sessions.push(session.clone());
+                        pane.update(cx, |pane, cx| {
+                            pane.show_session(session, &this.root, window, cx)
+                        });
+                        this.show_titles(cx);
+                        if this.panes[this.active] == pane
+                            && *cx.global::<Mode>() != Mode::CommandPalette
+                        {
+                            this.focus_active(window, cx);
+                        }
+                        cx.notify();
                     }
-                    cx.notify();
+                    Err(error) => window.push_notification(
+                        Notification::error(error.to_string()).autohide(false),
+                        cx,
+                    ),
                 }
-                Err(error) => window
-                    .push_notification(Notification::error(error.to_string()).autohide(false), cx),
             });
         })
         .detach();

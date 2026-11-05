@@ -17,11 +17,13 @@ use crate::{
     test_support::{RENDER_LOCK, headless_app, mock_agent, open_app_window_with_connector},
 };
 
+mod close;
+
 struct Driver {
     cx: HeadlessAppContext,
     window: AnyWindowHandle,
     backend: AgentBackend,
-    _new_backends: async_channel::Receiver<AgentBackend>,
+    new_backends: async_channel::Receiver<AgentBackend>,
     // Drop the App (and its renderer) before releasing the lock.
     _render_guard: MutexGuard<'static, ()>,
 }
@@ -51,7 +53,7 @@ impl Driver {
             cx,
             window,
             backend,
-            _new_backends: receiver,
+            new_backends: receiver,
             _render_guard: render_guard,
         }
     }
