@@ -128,6 +128,7 @@
                 rustfmt
                 nixfmt
                 xdg-utils
+                xdotool
               ];
               inherit nativeBuildInputs;
               buildInputs = libraries;
