@@ -1,7 +1,8 @@
 use async_channel::Sender;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, Role, StatefulInteractiveElement as _, Styled as _, Window,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, Role, StatefulInteractiveElement as _, Styled as _,
+    Window,
     base::TestSupportExt as _,
     component::{
         ActiveTheme as _, WindowExt as _,
@@ -101,7 +102,9 @@ impl CommandPaletteView {
 }
 
 impl Render for CommandPaletteView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.input.focus_handle(cx).focus(window, cx);
+
         div()
             .id("command-popup")
             .test_support()
