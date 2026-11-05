@@ -1,8 +1,12 @@
 use async_channel::{Receiver, Sender};
 use gpui_kit::{
-    AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, Styled as _, Task, Window,
-    component::{WindowExt as _, notification::Notification},
+    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, Task, Window,
+    component::{
+        WindowExt as _,
+        dock::{BasePanel, Panel, PanelEvent},
+        notification::Notification,
+    },
     div,
 };
 
@@ -13,6 +17,7 @@ use super::{
 use crate::agent::{AgentEvent, Message, PromptRequest};
 
 pub struct ChatView {
+    focus: FocusHandle,
     conversation: Entity<ConversationView>,
     composer: Entity<ComposerView>,
     _events_task: Task<()>,
@@ -40,6 +45,7 @@ impl ChatView {
             }
         });
         Self {
+            focus: cx.focus_handle(),
             conversation,
             composer,
             _events_task: events_task,
@@ -83,10 +89,43 @@ impl ChatView {
     }
 }
 
+impl BasePanel for ChatView {
+    fn panel_name(&self) -> &'static str {
+        "Chat"
+    }
+
+    fn closable(&self, _: &App) -> bool {
+        false
+    }
+}
+
+impl Panel for ChatView {
+    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        "Chat"
+    }
+
+    fn title_bar(&self, _: &App) -> bool {
+        false
+    }
+
+    fn inner_padding(&self, _: &App) -> bool {
+        false
+    }
+}
+
+impl EventEmitter<PanelEvent> for ChatView {}
+
+impl Focusable for ChatView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
 impl Render for ChatView {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("chat")
+            .track_focus(&self.focus)
             .size_full()
             .flex()
             .flex_col()

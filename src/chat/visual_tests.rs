@@ -153,18 +153,27 @@ fn capture(
             ScrollDelta::Pixels(point(px(0.0), px(100_000.0))),
             cx,
         );
-        if let Some(command) = command {
-            window.press("escape", cx);
-            window.press(":", cx);
+    })
+    .unwrap();
+    if let Some(command) = command {
+        cx.update_window(window, |_, window, cx| window.press("escape", cx))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| window.press(":", cx))
+            .unwrap();
+        // The window's mode observer opens the dialog after the key event.
+        cx.run_until_parked();
+        cx.update_window(window, |_, window, cx| {
             let mut popup = window.within("command-popup");
             let field = popup.find_by_label("Command");
             popup.click(field.path().last().unwrap().clone(), cx);
             window.input(command, cx);
-        }
-        // A stable, unfocused editor avoids cursor-blink differences in snapshots.
-        window.blur(cx);
-    })
-    .unwrap();
+        })
+        .unwrap();
+    }
+    // A stable, unfocused editor avoids cursor-blink differences in snapshots.
+    cx.update_window(window, |_, window, cx| window.blur(cx))
+        .unwrap();
     let started = Instant::now();
     let mut last_change = Instant::now();
     let mut previous = None;

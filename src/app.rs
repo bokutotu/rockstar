@@ -1,24 +1,22 @@
-use async_channel::Sender;
 use gpui_kit::{
-    AppContext as _, Context, Entity, FocusHandle, Font, FontFallbacks, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, Styled as _, Window, component::ActiveTheme as _, div,
+    AnyWindowHandle, App, AppContext as _, Focusable as _, Font, FontFallbacks, Refineable as _,
+    StyleRefinement, Styled as _, WindowOptions,
+    base::Root,
+    component::{
+        ActiveTheme as _,
+        dock::{DockLayout, DockSkin, panel_handle},
+    },
 };
 
-use crate::{
-    agent::{Agent, NewSessionRequest},
-    chat::ChatView,
-    command_palette::CommandPaletteHost,
-    mode::Mode,
-};
+use crate::{agent::Agent, chat::ChatView, command_palette};
 
-pub(crate) struct AppView {
-    normal_focus: FocusHandle,
-    chat: Entity<ChatView>,
-    new_sessions: Sender<NewSessionRequest>,
-}
-
-impl AppView {
-    pub(crate) fn new(mut agent: Agent, window: &mut Window, cx: &mut Context<Self>) -> Self {
+pub(crate) fn open_dock_window(
+    options: WindowOptions,
+    mut agent: Agent,
+    cx: &mut App,
+) -> gpui_kit::Result<AnyWindowHandle> {
+    let new_sessions = agent.new_session_sender();
+    let (handle, dock) = gpui_kit::open_window(options, cx, |window, cx| {
         let chat = cx.new(|cx| {
             ChatView::new(
                 agent.prompt_sender(),
@@ -29,47 +27,33 @@ impl AppView {
                 cx,
             )
         });
-        cx.observe_global_in::<Mode>(window, |this, window, cx| {
-            if *cx.global::<Mode>() == Mode::Normal {
-                this.normal_focus.focus(window, cx);
-            }
+        let (dock, _) = DockSkin::dock_area("workspace", None, window, cx);
+        dock.update(cx, |dock, cx| {
+            dock.set_center(
+                DockLayout::tabs().panel_view(panel_handle(chat), cx),
+                window,
+                cx,
+            );
+        });
+        dock
+    })?;
+    handle.update(cx, |_, window, cx| {
+        Root::update(window, cx, |root, _, cx| {
+            root.style().refine(
+                &StyleRefinement::default()
+                    .font(Font {
+                        family: cx.theme().font_family.clone(),
+                        fallbacks: Some(FontFallbacks::from_fonts(vec![
+                            "Noto Sans CJK JP".into(),
+                            "Noto Color Emoji".into(),
+                        ])),
+                        ..Default::default()
+                    })
+                    .text_size(cx.theme().font_size),
+            );
             cx.notify();
-        })
-        .detach();
-        let normal_focus = cx.focus_handle();
-        if *cx.global::<Mode>() == Mode::Normal {
-            normal_focus.focus(window, cx);
-        }
-        Self {
-            normal_focus,
-            chat,
-            new_sessions: agent.new_session_sender(),
-        }
-    }
-}
-
-impl Render for AppView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("app")
-            .track_focus(&self.normal_focus)
-            .key_context("Rockstar")
-            .relative()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .font(Font {
-                family: cx.theme().font_family.clone(),
-                fallbacks: Some(FontFallbacks::from_fonts(vec![
-                    "Noto Sans CJK JP".into(),
-                    "Noto Color Emoji".into(),
-                ])),
-                ..Default::default()
-            })
-            .text_size(cx.theme().font_size)
-            .child(self.chat.clone())
-            .child(CommandPaletteHost::new(self.new_sessions.clone()))
-    }
+        });
+        command_palette::bind_mode(new_sessions, dock.focus_handle(cx), window, cx);
+    })?;
+    Ok(handle)
 }

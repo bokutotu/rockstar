@@ -1,4 +1,4 @@
-//! Drive the production AppView in a test window through public UI events. Only the agent is mocked.
+//! Drive the production dock window through public UI events. Only the agent is mocked.
 use std::sync::MutexGuard;
 
 use gpui_kit::{

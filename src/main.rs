@@ -15,12 +15,12 @@ mod test_support;
 use std::{env, process::ExitCode};
 
 use gpui_kit::{
-    App, AppContext as _, TitlebarOptions, WindowBounds, WindowOptions,
+    App, TitlebarOptions, WindowBounds, WindowOptions,
     component::{Theme, ThemeMode},
     px, size,
 };
 
-use app::AppView;
+use app::open_dock_window;
 
 const USAGE: &str = "Usage: rockstar\n\nChat with pi in the current directory.";
 
@@ -81,10 +81,7 @@ fn main() -> ExitCode {
                 app_id: Some("rockstar".into()),
                 ..Default::default()
             };
-            gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| AppView::new(agent, window, cx))
-            })
-            .expect("failed to open the app window");
+            open_dock_window(options, agent, cx).expect("failed to open the app window");
             cx.activate(true);
         });
 

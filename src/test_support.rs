@@ -2,8 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use async_channel::Sender;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, HeadlessAppContext, TitlebarOptions, WindowBounds,
-    WindowOptions,
+    AnyWindowHandle, App, HeadlessAppContext, TitlebarOptions, WindowBounds, WindowOptions,
     assets::Assets,
     component::{Theme, ThemeMode},
     px, size,
@@ -11,7 +10,7 @@ use gpui_kit::{
 
 use crate::{
     agent::{self, Agent, AgentBackend, AgentEvent, Message},
-    app::AppView,
+    app::open_dock_window,
     init_key_handling,
 };
 
@@ -69,8 +68,5 @@ pub(crate) fn open_app_window(agent: Agent, cx: &mut App) -> gpui_kit::Result<An
         app_id: Some("rockstar".into()),
         ..Default::default()
     };
-    let (window, _) = gpui_kit::open_window(options, cx, |window, cx| {
-        cx.new(|cx| AppView::new(agent, window, cx))
-    })?;
-    Ok(window)
+    open_dock_window(options, agent, cx)
 }

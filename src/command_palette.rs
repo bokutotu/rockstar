@@ -1,11 +1,11 @@
 use async_channel::Sender;
 use gpui_kit::{
-    App, AppContext as _, Context, Empty, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, RenderOnce, Role, StatefulInteractiveElement as _, Styled as _,
-    Window,
+    App, AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, Role, StatefulInteractiveElement as _, Styled as _, Window,
     base::TestSupportExt as _,
     component::{
         ActiveTheme as _, WindowExt as _,
+        dialog::DialogEntrance,
         input::{Enter, Input, InputState},
         notification::Notification,
     },
@@ -17,29 +17,50 @@ use crate::{
     mode::Mode,
 };
 
-/// Mounts the palette view only while command-palette mode is active.
-#[derive(IntoElement)]
-pub(crate) struct CommandPaletteHost {
+pub(crate) fn bind_mode(
     new_sessions: Sender<NewSessionRequest>,
+    normal_focus: FocusHandle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if *cx.global::<Mode>() == Mode::Normal {
+        normal_focus.focus(window, cx);
+    }
+    window
+        .observe_global::<Mode>(cx, move |window, cx| match *cx.global::<Mode>() {
+            Mode::CommandPalette => {
+                if !window.has_active_dialog(cx) {
+                    open(new_sessions.clone(), window, cx);
+                }
+            }
+            Mode::Normal => {
+                if window.has_active_dialog(cx) {
+                    window.close_dialog(cx);
+                }
+                normal_focus.focus(window, cx);
+            }
+            Mode::Insert => {}
+        })
+        .detach();
 }
 
-impl CommandPaletteHost {
-    pub(crate) fn new(new_sessions: Sender<NewSessionRequest>) -> Self {
-        Self { new_sessions }
-    }
-}
-
-impl RenderOnce for CommandPaletteHost {
-    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        if *cx.global::<Mode>() != Mode::CommandPalette {
-            return Empty.into_any_element();
-        }
-        window
-            .use_keyed_state("command-palette", cx, |window, cx| {
-                CommandPaletteView::new(self.new_sessions, window, cx)
-            })
-            .into_any_element()
-    }
+fn open(new_sessions: Sender<NewSessionRequest>, window: &mut Window, cx: &mut App) {
+    let palette = cx.new(|cx| CommandPaletteView::new(new_sessions, window, cx));
+    window.open_dialog(cx, move |dialog, _, cx| {
+        dialog
+            .centered()
+            .w(px(480.0))
+            .min_h_0()
+            .p_4()
+            .rounded_lg()
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .close_button(false)
+            .entrance(DialogEntrance::None)
+            .on_ok(|_, _, _| false)
+            .on_close(|_, _, cx| cx.set_global(Mode::Normal))
+            .child(palette.clone())
+    });
 }
 
 /// The input and UI retained for one open/close cycle of the palette.
@@ -82,53 +103,21 @@ impl CommandPaletteView {
 impl Render for CommandPaletteView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .id("command-overlay")
+            .id("command-popup")
+            .test_support()
+            .role(Role::Group)
+            .aria_label("Commands")
+            .w_full()
             .capture_action(cx.listener(|this, action: &Enter, window, cx| {
                 if !action.secondary {
                     this.confirm(window, cx);
                 }
                 cx.stop_propagation();
             }))
-            .absolute()
-            .inset_0()
-            .occlude()
-            .bg(gpui_kit::black().opacity(0.25))
-            .flex()
-            .items_center()
-            .justify_center()
-            .p_4()
-            .on_mouse_down(
-                gpui_kit::MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.dismiss(cx);
-                    cx.stop_propagation();
-                }),
-            )
             .child(
-                div()
-                    .id("command-popup")
-                    .test_support()
-                    .role(Role::Dialog)
-                    .aria_label("Commands")
-                    .w_full()
-                    .max_w(px(480.0))
-                    .flex()
-                    .flex_col()
-                    .p_4()
-                    .rounded_lg()
-                    .shadow_lg()
-                    .bg(cx.theme().popover)
-                    .text_color(cx.theme().popover_foreground)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation()
-                    })
-                    .child(
-                        Input::new(&self.input)
-                            .prefix(div().child(":"))
-                            .aria_label("Command"),
-                    ),
+                Input::new(&self.input)
+                    .prefix(div().child(":"))
+                    .aria_label("Command"),
             )
     }
 }
