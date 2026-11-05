@@ -2,6 +2,7 @@ mod agent;
 mod app;
 mod chat;
 mod command_palette;
+mod file_search;
 mod math;
 mod mermaid;
 mod mode;
@@ -81,7 +82,8 @@ fn main() -> ExitCode {
                 app_id: Some("rockstar".into()),
                 ..Default::default()
             };
-            open_dock_window(options, agent, cx).expect("failed to open the app window");
+            open_dock_window(options, agent, current_dir, cx)
+                .expect("failed to open the app window");
             cx.activate(true);
         });
 

@@ -11,6 +11,7 @@ anyhow = "1"
 async-channel = "2"
 futures-lite = "2"
 gpui-kit = { version = "0.8.1", features = ["tree-sitter-languages"] }
+ignore = "0.4"
 latex-rust = "3.0.1"
 libc = "0.2"
 merman = "0.9.3"

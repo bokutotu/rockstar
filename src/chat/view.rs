@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use async_channel::{Receiver, Sender};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
@@ -27,11 +29,12 @@ impl ChatView {
     pub(crate) fn new(
         prompts: Sender<PromptRequest>,
         events: Receiver<AgentEvent>,
+        workspace: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let conversation = cx.new(|_| ConversationView::new());
-        let composer = cx.new(|cx| ComposerView::new(prompts, window, cx));
+        let composer = cx.new(|cx| ComposerView::new(prompts, workspace, window, cx));
         let events_task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(event) = events.recv().await {
                 if this

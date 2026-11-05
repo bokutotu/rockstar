@@ -1,14 +1,16 @@
 //! Drive the production dock window through public UI events. Only the agent is mocked.
-use std::sync::MutexGuard;
+use std::{fs, path::PathBuf, sync::MutexGuard};
 
 use gpui_kit::{
-    AnyWindowHandle, App, HeadlessAppContext, Window,
+    AnyWindowHandle, App, HeadlessAppContext, Role, Window,
     test::{TestQueryExt as _, TestWindowExt as _},
 };
 
 use crate::{
     agent::{AgentBackend, AgentEvent, Message, NewSessionRequest, PromptRequest},
-    test_support::{RENDER_LOCK, headless_app, mock_agent, open_app_window, reply_with_messages},
+    test_support::{
+        RENDER_LOCK, headless_app, mock_agent, open_app_window_in, reply_with_messages,
+    },
 };
 
 struct Driver {
@@ -21,12 +23,16 @@ struct Driver {
 
 impl Driver {
     fn open() -> Self {
+        Self::open_in(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+    }
+
+    fn open_in(workspace: PathBuf) -> Self {
         let render_guard = RENDER_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let mut cx = headless_app();
         let (agent, backend) = mock_agent();
-        let window = cx.update(|cx| open_app_window(agent, cx).unwrap());
+        let window = cx.update(|cx| open_app_window_in(agent, workspace, cx).unwrap());
         cx.update_window(window, |_, window, _| window.activate_window())
             .unwrap();
         Self {
@@ -97,6 +103,15 @@ impl Driver {
             }
         });
     }
+}
+
+#[test]
+fn insert_mode_focuses_input() {
+    let mut app = Driver::open();
+    app.press("i");
+    app.ui(|window, _| {
+        assert_eq!(window.find_by_label("Message to pi").focused(), Some(true));
+    });
 }
 
 #[test]
@@ -190,4 +205,93 @@ fn new_session_clears_chat_and_draft_only_after_success() {
         .unwrap();
     app.assert_conversation(false);
     app.assert_draft("");
+}
+
+fn mention_workspace(name: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("rockstar-e2e-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("README.md"), "").unwrap();
+    fs::write(root.join("src/main.rs"), "").unwrap();
+    fs::write(root.join("src/mermaid.rs"), "").unwrap();
+    root
+}
+
+impl Driver {
+    /// Waits for the background file scan, then returns the offered paths.
+    fn mention_options(&mut self) -> Option<Vec<String>> {
+        for _ in 0..200 {
+            let mut options = None;
+            self.ui(|window, _| {
+                options = window.try_find("file-mention-popup").map(|_| {
+                    window
+                        .within("file-mention-popup")
+                        .find_all_by_role(Role::ListBoxOption)
+                        .iter()
+                        .filter_map(|option| option.label().map(str::to_string))
+                        .collect::<Vec<_>>()
+                });
+            });
+            match options {
+                Some(options) if options.is_empty() => {
+                    self.cx.advance_clock(std::time::Duration::from_millis(10));
+                }
+                options => return options,
+            }
+        }
+        Some(Vec::new())
+    }
+}
+
+#[test]
+fn at_lists_files_and_tab_inserts_mention() {
+    let root = mention_workspace("tab");
+    let mut app = Driver::open_in(root.clone());
+    app.click_input();
+    app.type_text("see @main");
+    assert_eq!(app.mention_options(), Some(vec!["src/main.rs".to_string()]));
+    app.press("tab");
+    app.assert_draft("see @src/main.rs ");
+    assert_eq!(app.mention_options(), None);
+    app.assert_no_requests();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn enter_completes_directories_then_files() {
+    let root = mention_workspace("enter");
+    let mut app = Driver::open_in(root.clone());
+    app.click_input();
+    app.type_text("@src");
+    assert_eq!(
+        app.mention_options().unwrap().first().map(String::as_str),
+        Some("src/")
+    );
+    app.press("enter");
+    app.assert_draft("@src/");
+    app.type_text("m");
+    assert_eq!(
+        app.mention_options(),
+        Some(vec!["src/main.rs".to_string(), "src/mermaid.rs".to_string()])
+    );
+    app.press("down");
+    app.press("enter");
+    app.assert_draft("@src/mermaid.rs ");
+    app.assert_no_requests();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn escape_dismisses_mentions_and_email_addresses_do_not_open_them() {
+    let root = mention_workspace("escape");
+    let mut app = Driver::open_in(root.clone());
+    app.click_input();
+    app.type_text("user@example");
+    assert_eq!(app.mention_options(), None);
+    app.type_text(" @");
+    assert!(app.mention_options().is_some());
+    app.press("escape");
+    assert_eq!(app.mention_options(), None);
+    app.assert_draft("user@example @");
+    fs::remove_dir_all(root).unwrap();
 }

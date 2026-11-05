@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Focusable as _, Font, FontFallbacks, Refineable as _,
     StyleRefinement, Styled as _, WindowOptions,
@@ -13,6 +15,7 @@ use crate::{agent::Agent, chat::ChatView, command_palette};
 pub(crate) fn open_dock_window(
     options: WindowOptions,
     mut agent: Agent,
+    workspace: PathBuf,
     cx: &mut App,
 ) -> gpui_kit::Result<AnyWindowHandle> {
     let new_sessions = agent.new_session_sender();
@@ -23,6 +26,7 @@ pub(crate) fn open_dock_window(
                 agent
                     .take_results()
                     .expect("agent results belong to the chat"),
+                workspace,
                 window,
                 cx,
             )

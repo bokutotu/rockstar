@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use async_channel::Sender;
 use gpui_kit::{
@@ -58,6 +61,14 @@ pub fn headless_app() -> HeadlessAppContext {
 }
 
 pub(crate) fn open_app_window(agent: Agent, cx: &mut App) -> gpui_kit::Result<AnyWindowHandle> {
+    open_app_window_in(agent, PathBuf::from(env!("CARGO_MANIFEST_DIR")), cx)
+}
+
+pub(crate) fn open_app_window_in(
+    agent: Agent,
+    workspace: PathBuf,
+    cx: &mut App,
+) -> gpui_kit::Result<AnyWindowHandle> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(960.0), px(720.0)), cx)),
         window_min_size: Some(size(px(360.0), px(240.0))),
@@ -68,5 +79,5 @@ pub(crate) fn open_app_window(agent: Agent, cx: &mut App) -> gpui_kit::Result<An
         app_id: Some("rockstar".into()),
         ..Default::default()
     };
-    open_dock_window(options, agent, cx)
+    open_dock_window(options, agent, workspace, cx)
 }
