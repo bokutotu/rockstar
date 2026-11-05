@@ -1,138 +1,135 @@
-use std::path::PathBuf;
+use std::{cell::Cell, collections::HashMap, path::Path, rc::Rc};
 
-use async_channel::{Receiver, Sender};
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, Task, Window,
-    component::{
-        WindowExt as _,
-        dock::{BasePanel, Panel, PanelEvent},
-        notification::Notification,
-    },
+    App, AppContext as _, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Render, Role,
+    StatefulInteractiveElement as _, Styled as _, Window,
+    base::TestSupportExt as _,
+    component::dock::{BasePanel, Panel, PanelEvent},
     div,
 };
 
 use super::{
     composer::{Composer, ComposerView},
     conversation::ConversationView,
+    session::ChatSession,
 };
-use crate::agent::{AgentEvent, Message, PromptRequest};
 
-pub struct ChatView {
-    focus: FocusHandle,
+pub(crate) struct PaneActivated;
+
+struct SessionViews {
     conversation: Entity<ConversationView>,
     composer: Entity<ComposerView>,
-    _events_task: Task<()>,
 }
 
-impl ChatView {
+/// One window onto a session. Each pane retains its own scroll and cursor
+/// positions when cycling away from a session and back again.
+pub(crate) struct ChatPane {
+    focus: FocusHandle,
+    pub(crate) session: Entity<ChatSession>,
+    /// The outer dock frame, including the title bar when visible.
+    pub(crate) bounds: Rc<Cell<Bounds<Pixels>>>,
+    views: HashMap<EntityId, SessionViews>,
+    pub(crate) show_title: bool,
+}
+
+impl ChatPane {
     pub(crate) fn new(
-        prompts: Sender<PromptRequest>,
-        events: Receiver<AgentEvent>,
-        workspace: PathBuf,
+        session: Entity<ChatSession>,
+        root: &Path,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let conversation = cx.new(|_| ConversationView::new());
-        let composer = cx.new(|cx| ComposerView::new(prompts, workspace, window, cx));
-        let events_task = cx.spawn_in(window, async move |this, cx| {
-            while let Ok(event) = events.recv().await {
-                if this
-                    .update_in(cx, |this, window, cx| {
-                        this.handle_agent_event(event, window, cx);
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-        Self {
+        let mut pane = Self {
             focus: cx.focus_handle(),
-            conversation,
-            composer,
-            _events_task: events_task,
-        }
+            session: session.clone(),
+            bounds: Rc::default(),
+            views: HashMap::new(),
+            show_title: false,
+        };
+        pane.show_session(session, root, window, cx);
+        pane
     }
 
-    fn handle_agent_event(
+    pub(crate) fn show_session(
         &mut self,
-        event: AgentEvent,
+        session: Entity<ChatSession>,
+        root: &Path,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match event {
-            AgentEvent::UserMessage(text) => self.conversation.update(cx, |conversation, cx| {
-                conversation.append(Message::User(text), cx);
-            }),
-            AgentEvent::AssistantStarted => self.conversation.update(cx, |conversation, _| {
-                conversation.start_assistant();
-            }),
-            AgentEvent::AssistantTextDelta(text) => {
-                self.conversation.update(cx, |conversation, cx| {
-                    conversation.append_assistant(text, cx);
-                });
-            }
-            AgentEvent::AssistantFinished(text) => {
-                self.conversation.update(cx, |conversation, cx| {
-                    conversation.finish_assistant(text, cx);
-                });
-            }
-            AgentEvent::PromptFinished => {}
-            AgentEvent::NewSessionFinished => {
-                self.conversation
-                    .update(cx, |conversation, cx| conversation.clear(cx));
-                self.composer
-                    .update(cx, |composer, cx| composer.clear(window, cx));
-            }
-            AgentEvent::Error(error) => {
-                window.push_notification(Notification::error(error.to_string()).autohide(false), cx)
-            }
-        }
+        self.views
+            .entry(session.entity_id())
+            .or_insert_with(|| SessionViews {
+                conversation: cx.new(|cx| ConversationView::new(&session, cx)),
+                composer: cx
+                    .new(|cx| ComposerView::new(session.clone(), root.to_path_buf(), window, cx)),
+            });
+        self.session = session;
+        cx.emit(PanelEvent::LayoutChanged);
+        cx.notify();
+    }
+
+    pub(crate) fn focus_input(&self, window: &mut Window, cx: &mut App) {
+        self.views[&self.session.entity_id()]
+            .composer
+            .update(cx, |composer, cx| composer.focus(window, cx));
     }
 }
 
-impl BasePanel for ChatView {
+impl BasePanel for ChatPane {
     fn panel_name(&self) -> &'static str {
         "Chat"
     }
-
     fn closable(&self, _: &App) -> bool {
         false
     }
 }
 
-impl Panel for ChatView {
-    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        "Chat"
+impl Panel for ChatPane {
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        format!("Chat {}", self.session.read(cx).number)
     }
-
     fn title_bar(&self, _: &App) -> bool {
-        false
+        self.show_title
     }
-
     fn inner_padding(&self, _: &App) -> bool {
         false
     }
 }
 
-impl EventEmitter<PanelEvent> for ChatView {}
+impl EventEmitter<PanelEvent> for ChatPane {}
+impl EventEmitter<PaneActivated> for ChatPane {}
 
-impl Focusable for ChatView {
+impl Focusable for ChatPane {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
     }
 }
 
-impl Render for ChatView {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+impl Render for ChatPane {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let views = &self.views[&self.session.entity_id()];
         div()
             .id("chat")
+            .test_support()
+            .role(Role::Group)
+            .aria_label(format!("Chat {}", self.session.read(cx).number))
             .track_focus(&self.focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    if !this.focus.contains_focused(window, cx) {
+                        this.focus.focus(window, cx);
+                    }
+                    cx.emit(PaneActivated);
+                }),
+            )
             .size_full()
+            .relative()
             .flex()
             .flex_col()
-            .child(self.conversation.clone())
-            .child(Composer::new(&self.composer))
+            .child(views.conversation.clone())
+            .child(Composer::new(&views.composer))
     }
 }

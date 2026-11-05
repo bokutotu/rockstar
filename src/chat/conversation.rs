@@ -1,72 +1,55 @@
 use gpui_kit::{
-    Context, InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollHandle,
-    StatefulInteractiveElement as _, Styled as _, Window, base::TestSupportExt as _, div, point,
-    px,
+    Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    ScrollHandle, StatefulInteractiveElement as _, Styled as _, Window, base::TestSupportExt as _,
+    div,
 };
 
-use super::message::ChatMessage;
 use crate::agent::Message;
 
+use super::{
+    message::ChatMessage,
+    session::{ChatSession, ConversationChange},
+};
+
+/// Markdown rendering and scroll state belong to a pane, not to the session.
 pub(super) struct ConversationView {
     messages: Vec<ChatMessage>,
-    assistant: Option<usize>,
     scroll: ScrollHandle,
 }
 
 impl ConversationView {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(session: &Entity<ChatSession>, cx: &mut Context<Self>) -> Self {
+        let messages = session
+            .read(cx)
+            .messages
+            .clone()
+            .into_iter()
+            .map(|message| ChatMessage::new(message, cx))
+            .collect();
+        cx.subscribe(session, |this, _, change, cx| {
+            match change {
+                ConversationChange::Append(message) => {
+                    this.messages.push(ChatMessage::new(message.clone(), cx))
+                }
+                ConversationChange::AppendText(index, text) => {
+                    this.messages[*index].append_text(text, cx)
+                }
+                ConversationChange::Replace(index, message) => {
+                    let (Message::User(text) | Message::Assistant(text)) = message;
+                    this.messages[*index].set_text(text, cx)
+                }
+                ConversationChange::Remove(index) => {
+                    this.messages.remove(*index);
+                }
+            }
+            this.scroll.scroll_to_bottom();
+            cx.notify();
+        })
+        .detach();
         Self {
-            messages: Vec::new(),
-            assistant: None,
+            messages,
             scroll: ScrollHandle::new(),
         }
-    }
-
-    pub(super) fn append(&mut self, message: Message, cx: &mut Context<Self>) {
-        self.messages.push(ChatMessage::new(message, cx));
-        self.scroll.scroll_to_bottom();
-        cx.notify();
-    }
-
-    pub(super) fn start_assistant(&mut self) {
-        self.assistant = None;
-    }
-
-    pub(super) fn append_assistant(&mut self, text: String, cx: &mut Context<Self>) {
-        if text.is_empty() {
-            return;
-        }
-        if let Some(index) = self.assistant {
-            self.messages[index].append_text(&text, cx);
-        } else {
-            self.assistant = Some(self.messages.len());
-            self.messages
-                .push(ChatMessage::new(Message::Assistant(text), cx));
-        }
-        self.scroll.scroll_to_bottom();
-        cx.notify();
-    }
-
-    pub(super) fn finish_assistant(&mut self, text: String, cx: &mut Context<Self>) {
-        if let Some(index) = self.assistant.take() {
-            if text.is_empty() {
-                self.messages.remove(index);
-            } else {
-                self.messages[index].set_text(&text, cx);
-            }
-        } else if !text.is_empty() {
-            self.messages
-                .push(ChatMessage::new(Message::Assistant(text), cx));
-        }
-        self.scroll.scroll_to_bottom();
-        cx.notify();
-    }
-
-    pub(super) fn clear(&mut self, cx: &mut Context<Self>) {
-        self.messages.clear();
-        self.assistant = None;
-        self.scroll.set_offset(point(px(0.0), px(0.0)));
-        cx.notify();
     }
 }
 

@@ -1,22 +1,27 @@
 //! Drive the production dock window through public UI events. Only the agent is mocked.
-use std::{fs, path::PathBuf, sync::MutexGuard};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{Arc, MutexGuard},
+    time::Duration,
+};
 
 use gpui_kit::{
-    AnyWindowHandle, App, HeadlessAppContext, Role, Window,
+    AnyWindowHandle, App, Bounds, HeadlessAppContext, Pixels, Rgba, Role, Window,
+    component::ActiveTheme as _,
     test::{TestQueryExt as _, TestWindowExt as _},
 };
 
 use crate::{
-    agent::{AgentBackend, AgentEvent, Message, NewSessionRequest, PromptRequest},
-    test_support::{
-        RENDER_LOCK, headless_app, mock_agent, open_app_window_in, reply_with_messages,
-    },
+    agent::{AgentBackend, PromptRequest},
+    test_support::{RENDER_LOCK, headless_app, mock_agent, open_app_window_with_connector},
 };
 
 struct Driver {
     cx: HeadlessAppContext,
     window: AnyWindowHandle,
     backend: AgentBackend,
+    _new_backends: async_channel::Receiver<AgentBackend>,
     // Drop the App (and its renderer) before releasing the lock.
     _render_guard: MutexGuard<'static, ()>,
 }
@@ -32,13 +37,21 @@ impl Driver {
             .unwrap_or_else(|error| error.into_inner());
         let mut cx = headless_app();
         let (agent, backend) = mock_agent();
-        let window = cx.update(|cx| open_app_window_in(agent, workspace, cx).unwrap());
+        let (new_backends, receiver) = async_channel::unbounded();
+        let connect = Arc::new(move |_: &std::path::Path| {
+            let (agent, backend) = mock_agent();
+            new_backends.try_send(backend).unwrap();
+            Ok(agent)
+        });
+        let window =
+            cx.update(|cx| open_app_window_with_connector(agent, workspace, connect, cx).unwrap());
         cx.update_window(window, |_, window, _| window.activate_window())
             .unwrap();
         Self {
             cx,
             window,
             backend,
+            _new_backends: receiver,
             _render_guard: render_guard,
         }
     }
@@ -73,7 +86,6 @@ impl Driver {
 
     fn assert_no_requests(&self) {
         assert!(self.backend.prompts.is_empty());
-        assert!(self.backend.new_sessions.is_empty());
     }
 
     fn assert_draft(&mut self, expected: &str) {
@@ -96,12 +108,58 @@ impl Driver {
         });
     }
 
-    fn assert_conversation(&mut self, present: bool) {
-        self.ui(|window, _| {
-            for index in 0..2_usize {
-                assert_eq!(window.try_find(("message", index)).is_some(), present);
-            }
+    fn assert_active_pane(&mut self, active: usize) -> Vec<Bounds<Pixels>> {
+        let mut panes = Vec::new();
+        let mut border = [0; 4];
+        let mut scale = 1.0;
+        self.ui(|window, cx| {
+            panes = window
+                .elements()
+                .into_iter()
+                .filter(|element| element.path().last() == Some(&"tab-panel".into()))
+                .map(|element| element.bounds())
+                .collect();
+            let color = Rgba::from(cx.theme().border);
+            border =
+                [color.r, color.g, color.b, color.a].map(|channel| (channel * 255.0).round() as u8);
+            scale = window.scale_factor();
         });
+        assert!(active < panes.len());
+        let image = self.cx.capture_screenshot(self.window).unwrap();
+        for (index, bounds) in panes.iter().enumerate() {
+            let x = (f32::from(bounds.center().x) * scale).floor() as u32;
+            let y = (f32::from(bounds.center().y) * scale).floor() as u32;
+            // Sample inside each edge, where a 2px outline (but not a 1px line)
+            // is opaque, including when the split lands between device pixels.
+            let left = ((f32::from(bounds.left()) + 1.0) * scale).floor() as u32;
+            let right = ((f32::from(bounds.right()) - 1.0) * scale).ceil() as u32 - 1;
+            let top = ((f32::from(bounds.top()) + 1.0) * scale).floor() as u32;
+            let bottom = ((f32::from(bounds.bottom()) - 1.0) * scale).ceil() as u32 - 1;
+            for (x, y) in [(left, y), (right, y), (x, top), (x, bottom)] {
+                assert_eq!(
+                    image.get_pixel(x, y).0 == border,
+                    index == active,
+                    "pane {index} border at ({x}, {y}); active pane is {active}"
+                );
+            }
+        }
+        panes
+    }
+
+    fn wait_for_chat(&mut self, number: usize) {
+        for _ in 0..200 {
+            let mut ready = false;
+            self.ui(|window, _| {
+                ready = !window
+                    .find_all_by_label(&format!("Chat {number}"))
+                    .is_empty();
+            });
+            if ready {
+                return;
+            }
+            self.cx.advance_clock(Duration::from_millis(10));
+        }
+        panic!("chat {number} did not open");
     }
 }
 
@@ -172,39 +230,37 @@ fn outside_click_closes_palette_without_sending_or_clearing_draft() {
 }
 
 #[test]
-fn new_session_clears_chat_and_draft_only_after_success() {
+fn new_in_vertical_split_opens_an_independent_chat() {
     let mut app = Driver::open();
-    reply_with_messages(
-        &app.backend.events,
-        vec![
-            Message::User("Hello".into()),
-            Message::Assistant("Hello from the mock agent.".into()),
-        ],
-    );
-    app.click_input();
-    app.type_text("An unsent draft");
+    app.press("i");
+    app.type_text("Original chat draft");
     app.press("escape");
+
+    app.press("s");
+    app.press("v");
+    let panes = app.assert_active_pane(1);
     app.press(":");
-    app.ui(|window, cx| {
-        let mut popup = window.within("command-popup");
-        let field = popup.find_by_label("Command");
-        popup.click(field.path().last().unwrap().clone(), cx);
-    });
     app.type_text("new");
     app.press("enter");
-    assert!(matches!(
-        app.backend.new_sessions.try_recv(),
-        Ok(NewSessionRequest)
-    ));
-    app.assert_conversation(true);
-    app.assert_draft("An unsent draft");
+    app.wait_for_chat(2);
+    app.press("i");
+    app.type_text("New chat draft");
 
-    app.backend
-        .events
-        .try_send(AgentEvent::NewSessionFinished)
-        .unwrap();
-    app.assert_conversation(false);
-    app.assert_draft("");
+    // The new chat in the right pane can be edited without changing the left.
+    app.ui(|window, _| {
+        let drafts: Vec<_> = window
+            .find_all_by_label("Message to pi")
+            .iter()
+            .map(|input| input.value().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(drafts, ["Original chat draft", "New chat draft"]);
+    });
+    assert_eq!(app.assert_active_pane(1), panes);
+
+    app.press("escape");
+    app.press("s");
+    app.press("h");
+    assert_eq!(app.assert_active_pane(0), panes);
 }
 
 fn mention_workspace(name: &str) -> PathBuf {
@@ -272,7 +328,10 @@ fn enter_completes_directories_then_files() {
     app.type_text("m");
     assert_eq!(
         app.mention_options(),
-        Some(vec!["src/main.rs".to_string(), "src/mermaid.rs".to_string()])
+        Some(vec![
+            "src/main.rs".to_string(),
+            "src/mermaid.rs".to_string()
+        ])
     );
     app.press("down");
     app.press("enter");

@@ -9,18 +9,15 @@ use std::{
 
 use anyhow::{Context as _, anyhow, bail};
 use async_channel::{Receiver, RecvError};
-use futures_lite::future::{block_on, or, pending, race};
+use futures_lite::future::{block_on, or};
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{
-    self, Agent, AgentBackend, AgentError, AgentEvent, NewSessionRequest, PromptRequest,
-};
+use crate::agent::{self, Agent, AgentBackend, AgentError, AgentEvent, PromptRequest};
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum PiOutgoingRecord {
     Prompt { id: String, message: String },
-    NewSession { id: String },
     ExtensionUiResponse { id: String, cancelled: bool },
 }
 
@@ -54,7 +51,6 @@ enum PiIncomingRecord {
 #[serde(tag = "command", rename_all = "snake_case")]
 enum PiResponse {
     Prompt(CommandResponse<PromptResponseData>),
-    NewSession(CommandResponse<NewSessionResponseData>),
     #[serde(other)]
     Other,
 }
@@ -109,11 +105,6 @@ enum PromptDisposition {
     Handled,
     Started,
     Queued,
-}
-
-#[derive(Debug, Deserialize)]
-struct NewSessionResponseData {
-    cancelled: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -207,14 +198,10 @@ enum ActiveRequest {
         settled: bool,
         failure: Option<AgentError>,
     },
-    NewSession {
-        id: String,
-    },
 }
 
 enum Incoming {
     Prompt(Result<PromptRequest, RecvError>),
-    NewSession(Result<NewSessionRequest, RecvError>),
     Record(Result<Result<PiIncomingRecord, AgentError>, RecvError>),
     ResultsClosed,
 }
@@ -281,28 +268,29 @@ pub fn connect(cwd: &Path) -> Result<Agent, AgentError> {
     let (agent, backend) = agent::channel();
     thread::Builder::new()
         .name("pi-rpc".into())
-        .spawn(move || pi.run(backend))?;
+        .spawn(move || {
+            pi.run(backend);
+            // Each session owns its process; closing one must not leave it running.
+            let _ = child.kill();
+            let _ = child.wait();
+        })?;
     Ok(agent)
 }
 
 impl PiCodingAgent {
     fn run(mut self, backend: AgentBackend) {
         let result = block_on(self.process_requests(&backend));
-        // Close both request endpoints even when the RPC loop fails.
-        drop(backend);
         if let Err(error) = result {
-            eprintln!("rockstar: {error:#}");
-            process::exit(1);
+            // A failed session must not terminate the other open chats.
+            let _ = backend.events.try_send(AgentEvent::Error(error));
         }
     }
 
     async fn process_requests(&mut self, backend: &AgentBackend) -> Result<(), AgentError> {
         let mut queued = VecDeque::new();
         let mut active: Option<ActiveRequest> = None;
-        let mut prompts_open = true;
-        let mut sessions_open = true;
         loop {
-            if (!prompts_open && !sessions_open) || backend.events.is_closed() {
+            if backend.events.is_closed() {
                 return Ok(());
             }
             if active.is_none()
@@ -318,20 +306,7 @@ impl PiCodingAgent {
                 },
                 or(
                     async { Incoming::Record(self.records.recv().await) },
-                    race(
-                        async {
-                            if !prompts_open {
-                                pending::<()>().await;
-                            }
-                            Incoming::Prompt(backend.prompts.recv().await)
-                        },
-                        async {
-                            if !sessions_open {
-                                pending::<()>().await;
-                            }
-                            Incoming::NewSession(backend.new_sessions.recv().await)
-                        },
-                    ),
+                    async { Incoming::Prompt(backend.prompts.recv().await) },
                 ),
             )
             .await;
@@ -340,18 +315,7 @@ impl PiCodingAgent {
                     queued.push_back(self.prepare_prompt(request));
                     continue;
                 }
-                Incoming::NewSession(Ok(request)) => {
-                    queued.push_back(self.prepare_new_session(request));
-                    continue;
-                }
-                Incoming::Prompt(Err(_)) => {
-                    prompts_open = false;
-                    continue;
-                }
-                Incoming::NewSession(Err(_)) => {
-                    sessions_open = false;
-                    continue;
-                }
+                Incoming::Prompt(Err(_)) => return Ok(()),
                 Incoming::Record(result) => result.context("pi disconnected")??,
                 Incoming::ResultsClosed => return Ok(()),
             };
@@ -391,14 +355,6 @@ impl PiCodingAgent {
                 settled: false,
                 failure: None,
             },
-        )
-    }
-
-    fn prepare_new_session(&mut self, _: NewSessionRequest) -> (PiOutgoingRecord, ActiveRequest) {
-        let id = self.next_id();
-        (
-            PiOutgoingRecord::NewSession { id: id.clone() },
-            ActiveRequest::NewSession { id },
         )
     }
 
@@ -493,24 +449,6 @@ impl ActiveRequest {
                         .take()
                         .map_or(AgentEvent::PromptFinished, AgentEvent::Error)
                 })
-            }
-            Self::NewSession { id } => {
-                let PiIncomingRecord::Response(PiResponse::NewSession(response)) = record else {
-                    return None;
-                };
-                if response.id.as_deref() != Some(id.as_str()) {
-                    return None;
-                }
-                let event = match &response.result {
-                    Ok(NewSessionResponseData { cancelled: false }) => {
-                        AgentEvent::NewSessionFinished
-                    }
-                    Ok(NewSessionResponseData { cancelled: true }) => {
-                        AgentEvent::Error(anyhow!("New session cancelled."))
-                    }
-                    Err(error) => AgentEvent::Error(anyhow!("{error}")),
-                };
-                Some(event)
             }
         }
     }

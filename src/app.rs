@@ -1,45 +1,25 @@
 use std::path::PathBuf;
 
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Focusable as _, Font, FontFallbacks, Refineable as _,
-    StyleRefinement, Styled as _, WindowOptions,
-    base::Root,
-    component::{
-        ActiveTheme as _,
-        dock::{DockLayout, DockSkin, panel_handle},
-    },
+    AnyWindowHandle, App, AppContext as _, Font, FontFallbacks, Refineable as _, StyleRefinement,
+    Styled as _, WindowOptions, base::Root, component::ActiveTheme as _,
 };
 
-use crate::{agent::Agent, chat::ChatView, command_palette};
+use crate::{
+    agent::Agent,
+    command_palette,
+    workspace::{AgentConnector, Workspace},
+};
 
 pub(crate) fn open_dock_window(
     options: WindowOptions,
-    mut agent: Agent,
-    workspace: PathBuf,
+    agent: Agent,
+    root: PathBuf,
+    connect: AgentConnector,
     cx: &mut App,
 ) -> gpui_kit::Result<AnyWindowHandle> {
-    let new_sessions = agent.new_session_sender();
-    let (handle, dock) = gpui_kit::open_window(options, cx, |window, cx| {
-        let chat = cx.new(|cx| {
-            ChatView::new(
-                agent.prompt_sender(),
-                agent
-                    .take_results()
-                    .expect("agent results belong to the chat"),
-                workspace,
-                window,
-                cx,
-            )
-        });
-        let (dock, _) = DockSkin::dock_area("workspace", None, window, cx);
-        dock.update(cx, |dock, cx| {
-            dock.set_center(
-                DockLayout::tabs().panel_view(panel_handle(chat), cx),
-                window,
-                cx,
-            );
-        });
-        dock
+    let (handle, workspace) = gpui_kit::open_window(options, cx, |window, cx| {
+        cx.new(|cx| Workspace::new(agent, root, connect, window, cx))
     })?;
     handle.update(cx, |_, window, cx| {
         Root::update(window, cx, |root, _, cx| {
@@ -57,7 +37,7 @@ pub(crate) fn open_dock_window(
             );
             cx.notify();
         });
-        command_palette::bind_mode(new_sessions, dock.focus_handle(cx), window, cx);
+        command_palette::bind_mode(&workspace, window, cx);
     })?;
     Ok(handle)
 }

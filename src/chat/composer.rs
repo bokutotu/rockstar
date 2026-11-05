@@ -1,6 +1,5 @@
 use std::{path::PathBuf, sync::Arc};
 
-use async_channel::Sender;
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EntityId, Focusable as _, InteractiveElement as _,
     IntoElement, MouseButton, ParentElement as _, Role, StatefulInteractiveElement as _,
@@ -14,6 +13,8 @@ use gpui_kit::{
     div,
     prelude::FluentBuilder as _,
 };
+
+use super::session::ChatSession;
 
 use crate::{
     agent::{DISCONNECTED_MESSAGE, PromptRequest},
@@ -52,33 +53,39 @@ struct FileIndex {
 
 pub(super) struct ComposerView {
     input: Entity<TextareaState>,
-    prompts: Sender<PromptRequest>,
+    session: Entity<ChatSession>,
     files: FileIndex,
     mention: Option<FileMention>,
 }
 
 impl ComposerView {
     pub(super) fn new(
-        prompts: Sender<PromptRequest>,
+        session: Entity<ChatSession>,
         root: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let hint = input_hint(*cx.global::<Mode>());
         let input = cx.new(|cx| TextareaState::new(window, cx).rows(3).placeholder(hint));
-        if *cx.global::<Mode>() == Mode::Insert {
-            input.focus_handle(cx).focus(window, cx);
-        }
+        let draft = session.read(cx).draft.clone();
+        input.update(cx, |input, cx| input.set_value(draft, window, cx));
+        cx.observe_in(&session, window, |this, session, window, cx| {
+            let draft = session.read(cx).draft.clone();
+            if this.input.read(cx).value() != draft {
+                this.input.update(cx, |input, cx| {
+                    let selection = input.selected_range();
+                    input.set_value(draft, window, cx);
+                    input.set_selected_range(selection, cx);
+                });
+            }
+        })
+        .detach();
         cx.observe_global_in::<Mode>(window, |this, window, cx| {
             let mode = *cx.global::<Mode>();
             let hint = input_hint(mode);
             this.input
                 .update(cx, |input, cx| input.set_placeholder(hint, window, cx));
-            // Insert mode always types into the message input.
-            if mode == Mode::Insert {
-                this.input.focus_handle(cx).focus(window, cx);
-            } else {
-                // Escape leaves Insert mode and dismisses the mention popup.
+            if mode != Mode::Insert {
                 this.mention = None;
             }
             cx.notify();
@@ -90,18 +97,27 @@ impl ComposerView {
             }
         })
         .detach();
-        cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| match event {
-            InputEvent::Change => this.update_mention(cx),
-            InputEvent::Blur => {
-                this.mention = None;
-                cx.notify();
-            }
-            _ => {}
-        })
+        cx.subscribe_in(
+            &input,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change if this.input.focus_handle(cx).is_focused(window) => {
+                    let draft = this.input.read(cx).value();
+                    this.session
+                        .update(cx, |session, cx| session.set_draft(draft, cx));
+                    this.update_mention(cx);
+                }
+                InputEvent::Blur => {
+                    this.mention = None;
+                    cx.notify();
+                }
+                _ => {}
+            },
+        )
         .detach();
         Self {
             input,
-            prompts,
+            session,
             files: FileIndex {
                 root,
                 paths: Arc::default(),
@@ -111,7 +127,13 @@ impl ComposerView {
         }
     }
 
+    pub(super) fn focus(&self, window: &mut Window, cx: &mut App) {
+        self.input.focus_handle(cx).focus(window, cx);
+    }
+
     pub(super) fn clear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |session, cx| session.set_draft("".into(), cx));
         self.input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.mention = None;
@@ -179,7 +201,12 @@ impl ComposerView {
     }
 
     /// Replaces the `@query` before the cursor with the chosen path.
-    fn accept_mention(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn accept_mention(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(mention) = self.mention.take() else {
             return false;
         };
@@ -219,7 +246,12 @@ impl ComposerView {
         if text.trim().is_empty() {
             return;
         }
-        match self.prompts.try_send(PromptRequest { text }) {
+        let result = self
+            .session
+            .read(cx)
+            .prompts
+            .try_send(PromptRequest { text });
+        match result {
             Ok(()) => self.clear(window, cx),
             Err(_) => window.push_notification(
                 Notification::error(DISCONNECTED_MESSAGE).autohide(false),

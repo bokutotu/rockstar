@@ -7,13 +7,14 @@ mod math;
 mod mermaid;
 mod mode;
 mod pi;
+mod workspace;
 
 #[cfg(test)]
 mod e2e_tests;
 #[cfg(test)]
 mod test_support;
 
-use std::{env, process::ExitCode};
+use std::{env, process::ExitCode, sync::Arc};
 
 use gpui_kit::{
     App, TitlebarOptions, WindowBounds, WindowOptions,
@@ -27,6 +28,7 @@ const USAGE: &str = "Usage: rockstar\n\nChat with pi in the current directory.";
 
 fn init_key_handling(cx: &mut App) {
     mode::init(cx);
+    workspace::init(cx);
     cx.intercept_keystrokes(|event, _, cx| {
         // Intercept before keybindings in every window, regardless of the focused view.
         if mode::handle_key(&event.keystroke, cx) {
@@ -82,7 +84,7 @@ fn main() -> ExitCode {
                 app_id: Some("rockstar".into()),
                 ..Default::default()
             };
-            open_dock_window(options, agent, current_dir, cx)
+            open_dock_window(options, agent, current_dir, Arc::new(pi::connect), cx)
                 .expect("failed to open the app window");
             cx.activate(true);
         });

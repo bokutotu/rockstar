@@ -15,6 +15,7 @@ use crate::{
     agent::{self, Agent, AgentBackend, AgentEvent, Message},
     app::open_dock_window,
     init_key_handling,
+    workspace::AgentConnector,
 };
 
 pub static RENDER_LOCK: Mutex<()> = Mutex::new(());
@@ -69,6 +70,20 @@ pub(crate) fn open_app_window_in(
     workspace: PathBuf,
     cx: &mut App,
 ) -> gpui_kit::Result<AnyWindowHandle> {
+    open_app_window_with_connector(
+        agent,
+        workspace,
+        Arc::new(|_| anyhow::bail!("unexpected agent connection")),
+        cx,
+    )
+}
+
+pub(crate) fn open_app_window_with_connector(
+    agent: Agent,
+    workspace: PathBuf,
+    connect: AgentConnector,
+    cx: &mut App,
+) -> gpui_kit::Result<AnyWindowHandle> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(960.0), px(720.0)), cx)),
         window_min_size: Some(size(px(360.0), px(240.0))),
@@ -79,5 +94,5 @@ pub(crate) fn open_app_window_in(
         app_id: Some("rockstar".into()),
         ..Default::default()
     };
-    open_dock_window(options, agent, workspace, cx)
+    open_dock_window(options, agent, workspace, connect, cx)
 }
