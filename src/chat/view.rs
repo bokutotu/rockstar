@@ -1,12 +1,9 @@
-use std::{cell::Cell, collections::HashMap, path::Path, rc::Rc};
+use std::{collections::HashMap, path::Path};
 
 use gpui_kit::{
-    App, AppContext as _, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Render, Role,
-    StatefulInteractiveElement as _, Styled as _, Window,
-    base::TestSupportExt as _,
-    component::dock::{BasePanel, Panel, PanelEvent},
-    div,
+    App, AppContext as _, Context, Entity, EntityId, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, Role,
+    StatefulInteractiveElement as _, Styled as _, Window, base::TestSupportExt as _, div,
 };
 
 use super::{
@@ -14,8 +11,6 @@ use super::{
     conversation::ConversationView,
     session::ChatSession,
 };
-
-pub(crate) struct PaneActivated;
 
 struct SessionViews {
     conversation: Entity<ConversationView>,
@@ -27,10 +22,7 @@ struct SessionViews {
 pub(crate) struct ChatPane {
     focus: FocusHandle,
     pub(crate) session: Entity<ChatSession>,
-    /// The outer dock frame, including the title bar when visible.
-    pub(crate) bounds: Rc<Cell<Bounds<Pixels>>>,
     views: HashMap<EntityId, SessionViews>,
-    pub(crate) show_title: bool,
 }
 
 impl ChatPane {
@@ -43,9 +35,7 @@ impl ChatPane {
         let mut pane = Self {
             focus: cx.focus_handle(),
             session: session.clone(),
-            bounds: Rc::default(),
             views: HashMap::new(),
-            show_title: false,
         };
         pane.show_session(session, root, window, cx);
         pane
@@ -66,7 +56,6 @@ impl ChatPane {
                     .new(|cx| ComposerView::new(session.clone(), root.to_path_buf(), window, cx)),
             });
         self.session = session;
-        cx.emit(PanelEvent::LayoutChanged);
         cx.notify();
     }
 
@@ -76,30 +65,6 @@ impl ChatPane {
             .update(cx, |composer, cx| composer.focus(window, cx));
     }
 }
-
-impl BasePanel for ChatPane {
-    fn panel_name(&self) -> &'static str {
-        "Chat"
-    }
-    fn closable(&self, _: &App) -> bool {
-        false
-    }
-}
-
-impl Panel for ChatPane {
-    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        format!("Chat {}", self.session.read(cx).number)
-    }
-    fn title_bar(&self, _: &App) -> bool {
-        self.show_title
-    }
-    fn inner_padding(&self, _: &App) -> bool {
-        false
-    }
-}
-
-impl EventEmitter<PanelEvent> for ChatPane {}
-impl EventEmitter<PaneActivated> for ChatPane {}
 
 impl Focusable for ChatPane {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -122,7 +87,6 @@ impl Render for ChatPane {
                     if !this.focus.contains_focused(window, cx) {
                         this.focus.focus(window, cx);
                     }
-                    cx.emit(PaneActivated);
                 }),
             )
             .size_full()

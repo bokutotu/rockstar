@@ -16,6 +16,20 @@ use crate::{input_shortcuts, mode::Mode, workspace::Workspace};
 
 pub(crate) fn bind_mode(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
     workspace.update(cx, |workspace, cx| workspace.focus_active(window, cx));
+    let target_window = window.window_handle();
+    let weak = workspace.downgrade();
+    cx.intercept_keystrokes(move |event, window, cx| {
+        if window.window_handle() == target_window
+            && weak
+                .update(cx, |workspace, cx| {
+                    workspace.key(&event.keystroke, window, cx)
+                })
+                .unwrap_or(false)
+        {
+            cx.stop_propagation();
+        }
+    })
+    .detach();
     let workspace = workspace.downgrade();
     window
         .observe_global::<Mode>(cx, move |window, cx| {
@@ -25,13 +39,20 @@ pub(crate) fn bind_mode(workspace: &Entity<Workspace>, window: &mut Window, cx: 
                         open(workspace.clone(), window, cx);
                     }
                 }
-                Mode::Normal | Mode::Insert => {
+                Mode::FileFinder => {
+                    if !window.has_active_dialog(cx) {
+                        let _ =
+                            workspace.update(cx, |workspace, cx| workspace.open_finder(window, cx));
+                    }
+                }
+                Mode::Normal | Mode::Insert | Mode::Visual | Mode::VisualLine => {
                     if window.has_active_dialog(cx) {
                         window.close_dialog(cx);
                     }
                     let _ =
                         workspace.update(cx, |workspace, cx| workspace.focus_active(window, cx));
                 }
+                Mode::Search | Mode::LspPopup | Mode::Confirm => {}
             }
             let _ = workspace.update(cx, |_, cx| cx.notify());
         })
@@ -76,13 +97,34 @@ impl CommandPaletteView {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let result = if command.trim().eq_ignore_ascii_case("new") {
-            workspace.update(cx, |workspace, cx| workspace.new_chat(window, cx));
-            Ok(())
-        } else if command.trim().eq_ignore_ascii_case("close") {
-            workspace.update(cx, |workspace, cx| workspace.close_active_pane(window, cx))
-        } else {
-            return;
+        let result = match command.trim().to_ascii_lowercase().as_str() {
+            "chat" => {
+                workspace.update(cx, |workspace, cx| workspace.show_chat(false, window, cx));
+                Ok(())
+            }
+            "new" => {
+                workspace.update(cx, |workspace, cx| workspace.show_chat(true, window, cx));
+                Ok(())
+            }
+            "close" | "q" => {
+                workspace.update(cx, |workspace, cx| workspace.close_active_pane(window, cx))
+            }
+            "w" | "write" => {
+                workspace.update(cx, |workspace, cx| workspace.save_active(window, cx))
+            }
+            "quit" | "qa" => {
+                if workspace.update(cx, |workspace, cx| workspace.request_close(window, cx)) {
+                    window.remove_window();
+                }
+                return;
+            }
+            _ => {
+                window.push_notification(
+                    Notification::error(format!("Unknown command: {}", command.trim())),
+                    cx,
+                );
+                return;
+            }
         };
         match result {
             Ok(()) => self.dismiss(cx),

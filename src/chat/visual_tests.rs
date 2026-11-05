@@ -123,6 +123,31 @@ fn capture(
         .update(|cx| open_app_window(agent, cx))
         .expect("open the production app view with a mock agent");
     cx.update_window(window, |_, window, cx| {
+        window.activate_window();
+        window.render_frame(cx);
+        window.press(":", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        window.input("chat", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        let ready = cx
+            .update_window(window, |_, window, cx| {
+                window.render_frame(cx);
+                window.try_find_by_label("Message to pi").is_some()
+            })
+            .unwrap();
+        if ready {
+            break;
+        }
+        cx.advance_clock(Duration::from_millis(10));
+    }
+    cx.update_window(window, |_, window, cx| {
         window.resize(size(px(960.0), px(1100.0)));
         window.bounds_changed(cx);
         window.activate_window();

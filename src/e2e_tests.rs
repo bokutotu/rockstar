@@ -18,6 +18,7 @@ use crate::{
 };
 
 mod close;
+mod files;
 mod input_shortcuts;
 
 struct Driver {
@@ -35,10 +36,26 @@ impl Driver {
     }
 
     fn open_in(workspace: PathBuf) -> Self {
+        let mut app = Self::open_plain_in(workspace);
+        app.command("chat");
+        app.wait_for_chat(1);
+        app
+    }
+
+    fn open_plain_in(workspace: PathBuf) -> Self {
+        Self::open_using(workspace, None)
+    }
+
+    fn open_using(workspace: PathBuf, connector: Option<crate::workspace::AgentConnector>) -> Self {
+        Self::open_config(workspace, connector, None)
+    }
+
+    fn open_config(workspace: PathBuf, connector: Option<crate::workspace::AgentConnector>, lsp: Option<crate::lsp::TestConfig>) -> Self {
         let render_guard = RENDER_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let mut cx = headless_app();
+        if let Some(config) = lsp { cx.update(|cx| cx.set_global(config)); }
         let (agent, backend) = mock_agent();
         let (new_backends, receiver) = async_channel::unbounded();
         let connect = Arc::new(move |_: &std::path::Path| {
@@ -46,8 +63,13 @@ impl Driver {
             new_backends.try_send(backend).unwrap();
             Ok(agent)
         });
-        let window =
-            cx.update(|cx| open_app_window_with_connector(agent, workspace, connect, cx).unwrap());
+        let window = cx.update(|cx| {
+            if let Some(connect) = connector {
+                crate::test_support::open_plain_window(workspace, connect, cx).unwrap()
+            } else {
+                open_app_window_with_connector(agent, workspace, connect, cx).unwrap()
+            }
+        });
         cx.update_window(window, |_, window, _| window.activate_window())
             .unwrap();
         Self {
@@ -68,6 +90,12 @@ impl Driver {
             })
             .unwrap();
         self.cx.run_until_parked();
+    }
+
+    fn command(&mut self, command: &str) {
+        self.press(":");
+        self.type_text(command);
+        self.press("enter");
     }
 
     fn press(&mut self, key: &str) {

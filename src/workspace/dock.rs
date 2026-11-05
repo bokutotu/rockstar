@@ -1,4 +1,4 @@
-//! Keep the standard dock appearance while measuring the entire chat frame,
+//! Keep the standard dock appearance while measuring the entire pane frame,
 //! including its title bar, for the workspace's active-pane outline.
 use std::{rc::Rc, sync::Arc};
 
@@ -11,7 +11,7 @@ use gpui_kit::{
     },
 };
 
-use crate::chat::ChatPane;
+use crate::pane::Pane;
 
 pub(super) fn new(window: &mut Window, cx: &mut App) -> Entity<DockArea> {
     cx.new(|cx| {
@@ -70,18 +70,18 @@ impl DockAreaRenderer for WorkspaceDockSkin {
     }
 
     fn tab_group_renderer(&self) -> Rc<dyn TabGroupRenderer> {
-        Rc::new(ChatFrameSkin(self.0.tab_group_renderer()))
+        Rc::new(PaneFrameSkin(self.0.tab_group_renderer()))
     }
 }
 
-struct ChatFrameSkin(Rc<dyn TabGroupRenderer>);
+struct PaneFrameSkin(Rc<dyn TabGroupRenderer>);
 
-impl TabGroupRenderer for ChatFrameSkin {
+impl TabGroupRenderer for PaneFrameSkin {
     fn frame(&self, group: &TabGroupContext, window: &mut Window, cx: &mut App) -> Stateful<Div> {
         let frame = self.0.frame(group, window, cx);
         let pane = group
             .active_panel()
-            .and_then(|panel| panel.view().downcast::<ChatPane>().ok());
+            .and_then(|panel| panel.view().downcast::<Pane>().ok());
         if let Some(pane) = pane {
             let bounds = pane.read(cx).bounds.clone();
             frame

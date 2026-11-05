@@ -295,7 +295,7 @@ fn edited_drafts_are_shared_between_panes_and_submit_once() {
     app.type_text("one two");
     app.press("ctrl-w");
     app.assert_draft("one ");
-    for key in ["escape", "s", "v", "i"] {
+    for key in ["escape", "s", "v", "ctrl-n", "i"] {
         app.press(key);
     }
     app.ui(|window, _| {

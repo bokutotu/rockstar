@@ -3,7 +3,7 @@ name = "rockstar"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
-description = "A minimal GPUI chat client for pi with Markdown rendering"
+description = "A tiled GPUI workspace for pi chat and source editing"
 publish = false
 
 [dependencies]
@@ -14,6 +14,8 @@ gpui-kit = { version = "0.8.1", features = ["tree-sitter-languages"] }
 ignore = "0.4"
 latex-rust = "3.0.1"
 libc = "0.2"
+lsp-types = "0.97"
+url = "2"
 merman = "0.9.3"
 roxmltree = "0.21"
 serde = { version = "1", features = ["derive"] }
@@ -28,6 +30,8 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [patch.crates-io]
 # Keep X11 IME coordinates updating during composition; see vendor/README.md.
 gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+# Native inlay / block annotations without modifying source text.
+gpui-base = { path = "vendor/gpui-base" }
 
 [profile.dev]
 debug = 1

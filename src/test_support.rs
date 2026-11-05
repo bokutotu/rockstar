@@ -84,6 +84,22 @@ pub(crate) fn open_app_window_with_connector(
     connect: AgentConnector,
     cx: &mut App,
 ) -> gpui_kit::Result<AnyWindowHandle> {
+    let first = Mutex::new(Some(agent));
+    let connector = Arc::new(move |root: &std::path::Path| {
+        if let Some(agent) = first.lock().unwrap().take() {
+            Ok(agent)
+        } else {
+            connect(root)
+        }
+    });
+    open_plain_window(workspace, connector, cx)
+}
+
+pub(crate) fn open_plain_window(
+    workspace: PathBuf,
+    connect: AgentConnector,
+    cx: &mut App,
+) -> gpui_kit::Result<AnyWindowHandle> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(960.0), px(720.0)), cx)),
         window_min_size: Some(size(px(360.0), px(240.0))),
@@ -94,5 +110,5 @@ pub(crate) fn open_app_window_with_connector(
         app_id: Some("rockstar".into()),
         ..Default::default()
     };
-    open_dock_window(options, agent, workspace, connect, cx)
+    open_dock_window(options, workspace, connect, cx)
 }

@@ -6,20 +6,18 @@ use gpui_kit::{
 };
 
 use crate::{
-    agent::Agent,
     command_palette,
     workspace::{AgentConnector, Workspace},
 };
 
 pub(crate) fn open_dock_window(
     options: WindowOptions,
-    agent: Agent,
     root: PathBuf,
     connect: AgentConnector,
     cx: &mut App,
 ) -> gpui_kit::Result<AnyWindowHandle> {
     let (handle, workspace) = gpui_kit::open_window(options, cx, |window, cx| {
-        cx.new(|cx| Workspace::new(agent, root, connect, window, cx))
+        cx.new(|cx| Workspace::new(root, connect, window, cx))
     })?;
     handle.update(cx, |_, window, cx| {
         Root::update(window, cx, |root, _, cx| {
@@ -38,6 +36,12 @@ pub(crate) fn open_dock_window(
             cx.notify();
         });
         command_palette::bind_mode(&workspace, window, cx);
+        let workspace = workspace.downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| workspace.request_close(window, cx))
+                .unwrap_or(true)
+        });
     })?;
     Ok(handle)
 }

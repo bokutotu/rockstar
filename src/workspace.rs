@@ -1,105 +1,74 @@
-use std::{
-    fmt,
-    path::{Path, PathBuf},
-    sync::Arc,
+use crate::{
+    agent::{Agent, AgentError},
+    chat::ChatSession,
+    file_browser::{self, FileTree, OpenFile},
+    file_buffer::FileBuffer,
+    mode::{Mode, text_key},
+    pane::{Pane, PaneActivated, PaneContent},
 };
-
 use gpui_kit::{
     App, AppContext as _, Bounds, Context, Entity, EntityId, Focusable as _,
-    InteractiveElement as _, IntoElement, KeyBinding, ParentElement as _, Pixels, Render,
-    Styled as _, Window, actions,
-    base::Placement,
+    InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, Pixels, Render, Role,
+    StatefulInteractiveElement as _, Styled as _, Window,
+    base::{Placement, TestSupportExt as _},
     canvas,
     component::{
         ActiveTheme as _, WindowExt as _,
+        button::Button,
+        dialog::DialogEntrance,
         dock::{
             DockArea, DockLayout, DockPlacement, InsertTarget, PanelEvent, PanelId, panel_handle,
         },
         notification::Notification,
     },
-    div, outline, px,
+    div, outline,
+    prelude::FluentBuilder as _,
+    px,
 };
-
-use crate::{
-    agent::{Agent, AgentError},
-    chat::{ChatPane, ChatSession, PaneActivated},
-    mode::Mode,
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
 };
-
 mod dock;
-
 pub(crate) type AgentConnector = Arc<dyn Fn(&Path) -> Result<Agent, AgentError> + Send + Sync>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClosePaneError {
-    LastPane,
-}
-
-impl fmt::Display for ClosePaneError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::LastPane => f.write_str("Cannot close the last pane."),
-        }
-    }
-}
-
-impl std::error::Error for ClosePaneError {}
-
-actions!(
-    workspace,
-    [
-        SplitDown,
-        SplitRight,
-        FocusLeft,
-        FocusDown,
-        FocusUp,
-        FocusRight,
-        NextChat,
-        PreviousChat
-    ]
-);
-
-pub(crate) fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("s s", SplitDown, Some("WorkspaceNormal")),
-        KeyBinding::new("s v", SplitRight, Some("WorkspaceNormal")),
-        KeyBinding::new("s h", FocusLeft, Some("WorkspaceNormal")),
-        KeyBinding::new("s j", FocusDown, Some("WorkspaceNormal")),
-        KeyBinding::new("s k", FocusUp, Some("WorkspaceNormal")),
-        KeyBinding::new("s l", FocusRight, Some("WorkspaceNormal")),
-        KeyBinding::new("ctrl-n", NextChat, Some("WorkspaceNormal")),
-        KeyBinding::new("ctrl-p", PreviousChat, Some("WorkspaceNormal")),
-    ]);
-}
 
 pub(crate) struct Workspace {
     root: PathBuf,
+    lsp: Entity<crate::lsp::LspWorkspace>,
     sessions: Vec<Entity<ChatSession>>,
-    panes: Vec<Entity<ChatPane>>,
+    buffers: Vec<Entity<FileBuffer>>,
+    panes: Vec<Entity<Pane>>,
     active: usize,
     dock: Entity<DockArea>,
     connect: AgentConnector,
+    tree: Option<Entity<FileTree>>,
+    tree_visible: bool,
+    pending: String,
 }
 
 impl Workspace {
     pub(crate) fn new(
-        agent: Agent,
         root: PathBuf,
         connect: AgentConnector,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let dock = dock::new(window, cx);
-        let session = cx.new(|cx| ChatSession::new(agent, 1, window, cx));
+        let lsp = cx.new(|cx| crate::lsp::LspWorkspace::new(root.clone(), window, cx));
         let mut workspace = Self {
             root,
-            sessions: vec![session.clone()],
+            lsp,
+            sessions: Vec::new(),
+            buffers: Vec::new(),
             panes: Vec::new(),
             active: 0,
             dock,
             connect,
+            tree: None,
+            tree_visible: false,
+            pending: String::new(),
         };
-        let pane = workspace.add_pane(session, window, cx);
+        let pane = workspace.add_pane(window, cx);
         workspace.dock.update(cx, |dock, cx| {
             dock.set_center(
                 DockLayout::tabs().panel_view(panel_handle(pane), cx),
@@ -110,21 +79,38 @@ impl Workspace {
         workspace
     }
 
-    fn add_pane(
-        &mut self,
-        session: Entity<ChatSession>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<ChatPane> {
-        let pane = cx.new(|cx| ChatPane::new(session, &self.root, window, cx));
+    fn add_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Pane> {
+        let pane = cx.new(Pane::new);
         let id = pane.entity_id();
         cx.on_focus_in(&pane.focus_handle(cx), window, move |this, _, cx| {
-            this.activate_pane(id, cx);
+            this.activate_pane(id, cx)
         })
         .detach();
         cx.subscribe(&pane, |this, pane, _: &PaneActivated, cx| {
-            this.activate_pane(pane.entity_id(), cx);
+            this.activate_pane(pane.entity_id(), cx)
         })
+        .detach();
+        cx.subscribe_in(
+            &pane,
+            window,
+            |this, pane, event: &crate::file_view::Navigate, window, cx| {
+                if this.panes.get(this.active) != Some(pane) {
+                    return;
+                }
+                match crate::lsp::language::path(&event.uri) {
+                    Ok(path) => this.open_file_at(
+                        pane.entity_id(),
+                        path,
+                        Some((event.position, event.encoding)),
+                        window,
+                        cx,
+                    ),
+                    Err(error) => {
+                        window.push_notification(Notification::error(format!("LSP: {error:#}")), cx)
+                    }
+                }
+            },
+        )
         .detach();
         self.panes.push(pane.clone());
         pane
@@ -132,29 +118,33 @@ impl Workspace {
 
     fn activate_pane(&mut self, id: EntityId, cx: &mut Context<Self>) {
         if let Some(index) = self.panes.iter().position(|pane| pane.entity_id() == id) {
-            self.active = index;
+            if self.active != index {
+                self.active = index;
+                self.pending.clear();
+                if !cx.global::<Mode>().is_overlay() {
+                    let mode = match &self.panes[index].read(cx).content {
+                        PaneContent::File(view) => view.read(cx).mode(),
+                        _ => Mode::Normal,
+                    };
+                    cx.set_global(mode);
+                }
+            }
             cx.notify();
         }
     }
 
     pub(crate) fn focus_active(&self, window: &mut Window, cx: &mut App) {
-        let pane = &self.panes[self.active];
-        if *cx.global::<Mode>() == Mode::Insert {
-            pane.update(cx, |pane, cx| pane.focus_input(window, cx));
-        } else {
-            pane.focus_handle(cx).focus(window, cx);
-        }
+        self.panes[self.active].update(cx, |pane, cx| pane.focus_content(window, cx));
     }
 
     pub(crate) fn close_active_pane(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Result<(), ClosePaneError> {
+    ) -> anyhow::Result<()> {
         if self.panes.len() == 1 {
-            return Err(ClosePaneError::LastPane);
+            anyhow::bail!("Cannot close the last pane.");
         }
-
         let pane = self.panes.remove(self.active);
         self.active = self.active.min(self.panes.len() - 1);
         self.dock
@@ -184,8 +174,7 @@ impl Workspace {
         let Some(node) = node else {
             return;
         };
-        let session = source.read(cx).session.clone();
-        let pane = self.add_pane(session, window, cx);
+        let pane = self.add_pane(window, cx);
         self.dock.update(cx, |dock, cx| {
             dock.add_panel_view(
                 panel_handle(pane.clone()),
@@ -207,6 +196,7 @@ impl Workspace {
         });
         self.active = self.panes.len() - 1;
         self.show_titles(cx);
+        cx.set_global(Mode::Normal);
         self.focus_active(window, cx);
         cx.notify();
     }
@@ -252,48 +242,66 @@ impl Workspace {
             .map(|(index, _, _)| index);
         if let Some(index) = next {
             self.active = index;
+            cx.set_global(Mode::Normal);
             self.focus_active(window, cx);
             cx.notify();
         }
     }
 
-    fn cycle_chat(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let pane = &self.panes[self.active];
-        let current = &pane.read(cx).session;
-        let index = self
-            .sessions
-            .iter()
-            .position(|session| session == current)
-            .expect("pane session belongs to workspace");
-        let count = self.sessions.len();
-        let next = if forward {
-            (index + 1) % count
-        } else {
-            (index + count - 1) % count
-        };
-        let session = self.sessions[next].clone();
-        pane.update(cx, |pane, cx| {
-            pane.show_session(session, &self.root, window, cx)
-        });
+    fn cycle(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.panes[self.active].clone();
+        if let Some(view) = pane.read(cx).file() {
+            let buffer = &view.read(cx).buffer;
+            let current = self
+                .buffers
+                .iter()
+                .position(|entry| entry == buffer)
+                .unwrap_or(0);
+            let next = cycle_index(current, self.buffers.len(), forward);
+            let buffer = self.buffers[next].clone();
+            pane.update(cx, |pane, cx| {
+                pane.request += 1;
+                pane.show_file(buffer, window, cx);
+            });
+        } else if !self.sessions.is_empty() {
+            let session = pane.read(cx).session(cx);
+            let current = self
+                .sessions
+                .iter()
+                .position(|entry| Some(entry) == session.as_ref());
+            let next = current.map_or(0, |current| {
+                cycle_index(current, self.sessions.len(), forward)
+            });
+            let session = self.sessions[next].clone();
+            pane.update(cx, |pane, cx| {
+                pane.request += 1;
+                pane.show_chat(session, &self.root, window, cx);
+            });
+        }
         self.focus_active(window, cx);
         cx.notify();
     }
 
-    pub(crate) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Keep the command's destination even if the user focuses another pane
-        // while pi is starting. A failed connection does not change any session.
-        let pane_id = self.panes[self.active].entity_id();
+    pub(crate) fn show_chat(&mut self, fresh: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !fresh && self.panes[self.active].read(cx).session(cx).is_some() {
+            return;
+        }
+        let pane = self.panes[self.active].clone();
+        let pane_id = pane.entity_id();
+        let request = pane.update(cx, |pane, _| {
+            pane.request += 1;
+            pane.request
+        });
         let root = self.root.clone();
         let connect = self.connect.clone();
         let connecting = cx.background_spawn(async move { connect(&root) });
         cx.spawn_in(window, async move |this, cx| {
             let result = connecting.await;
             let _ = this.update_in(cx, |this, window, cx| {
-                // A closed destination must not retain a view or create a hidden session.
                 let Some(pane) = this
                     .panes
                     .iter()
-                    .find(|pane| pane.entity_id() == pane_id)
+                    .find(|pane| pane.entity_id() == pane_id && pane.read(cx).request == request)
                     .cloned()
                 else {
                     return;
@@ -304,12 +312,12 @@ impl Workspace {
                         let session = cx.new(|cx| ChatSession::new(agent, number, window, cx));
                         this.sessions.push(session.clone());
                         pane.update(cx, |pane, cx| {
-                            pane.show_session(session, &this.root, window, cx)
+                            pane.show_chat(session, &this.root, window, cx)
                         });
-                        this.show_titles(cx);
-                        if this.panes[this.active] == pane
-                            && *cx.global::<Mode>() != Mode::CommandPalette
-                        {
+                        if this.sessions.len() > 1 {
+                            this.show_titles(cx);
+                        }
+                        if this.panes[this.active] == pane && !cx.global::<Mode>().is_overlay() {
                             this.focus_active(window, cx);
                         }
                         cx.notify();
@@ -323,52 +331,351 @@ impl Workspace {
         })
         .detach();
     }
+
+    pub(crate) fn open_file(
+        &mut self,
+        pane_id: EntityId,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_file_at(pane_id, path, None, window, cx);
+    }
+
+    fn open_file_at(
+        &mut self,
+        pane_id: EntityId,
+        path: PathBuf,
+        location: Option<(lsp_types::Position, crate::lsp::language::Encoding)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self
+            .panes
+            .iter()
+            .find(|pane| pane.entity_id() == pane_id)
+            .cloned()
+        else {
+            return;
+        };
+        let request = pane.update(cx, |pane, _| {
+            pane.request += 1;
+            pane.request
+        });
+        // Resolve aliases before looking up unsaved documents. Never reload an existing buffer.
+        let canonical = match path.canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                window.push_notification(
+                    Notification::error(format!("Cannot open {}: {error}", path.display()))
+                        .autohide(false),
+                    cx,
+                );
+                return;
+            }
+        };
+        if let Some(buffer) = self
+            .buffers
+            .iter()
+            .find(|buffer| buffer.read(cx).path == canonical)
+            .cloned()
+        {
+            pane.update(cx, |pane, cx| {
+                pane.show_file(buffer, window, cx);
+                if let Some((position, encoding)) = location
+                    && let Some(file) = pane.file()
+                {
+                    file.update(cx, |file, cx| file.jump_to(position, encoding, window, cx));
+                }
+            });
+            if self.panes[self.active] == pane {
+                self.focus_active(window, cx);
+            }
+            cx.notify();
+            return;
+        }
+        let loading = cx.background_spawn(async move { FileBuffer::load(&canonical) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = loading.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let Some(pane) = this
+                    .panes
+                    .iter()
+                    .find(|pane| pane.entity_id() == pane_id && pane.read(cx).request == request)
+                    .cloned()
+                else {
+                    return;
+                };
+                match result {
+                    Ok(document) => {
+                        let buffer = this
+                            .buffers
+                            .iter()
+                            .find(|buffer| buffer.read(cx).path == document.path)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                let buffer = cx.new(|_| document);
+                                match this.lsp.update(cx, |lsp, cx| lsp.bind(&buffer, cx)) {
+                                    Ok(binding) => {
+                                        buffer.update(cx, |buffer, _| buffer.lsp = binding)
+                                    }
+                                    Err(error) => window.push_notification(
+                                        Notification::error(format!("{error:#}")),
+                                        cx,
+                                    ),
+                                }
+                                this.buffers.push(buffer.clone());
+                                buffer
+                            });
+                        pane.update(cx, |pane, cx| {
+                            pane.show_file(buffer, window, cx);
+                            if let Some((position, encoding)) = location
+                                && let Some(file) = pane.file()
+                            {
+                                file.update(cx, |file, cx| {
+                                    file.jump_to(position, encoding, window, cx)
+                                });
+                            }
+                        });
+                        if this.panes[this.active] == pane && !cx.global::<Mode>().is_overlay() {
+                            this.focus_active(window, cx);
+                        }
+                        cx.notify();
+                    }
+                    Err(error) => window.push_notification(
+                        Notification::error(format!("{error:#}")).autohide(false),
+                        cx,
+                    ),
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn save_active(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let Some(file) = self.panes[self.active].read(cx).file() else {
+            anyhow::bail!("This pane has no file to save.");
+        };
+        file.update(cx, |file, cx| file.save(window, cx));
+        Ok(())
+    }
+
+    pub(crate) fn open_finder(&self, window: &mut Window, cx: &mut Context<Self>) {
+        file_browser::open_finder(
+            cx.entity().downgrade(),
+            self.panes[self.active].entity_id(),
+            self.root.clone(),
+            window,
+            cx,
+        );
+    }
+
+    fn toggle_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tree_visible = !self.tree_visible;
+        if self.tree_visible {
+            if self.tree.is_none() {
+                let tree = cx.new(|cx| FileTree::new(self.root.clone(), cx));
+                cx.subscribe_in(&tree, window, |this, _, event: &OpenFile, window, cx| {
+                    let pane = this.panes[this.active].entity_id();
+                    this.open_file(pane, event.0.clone(), window, cx);
+                })
+                .detach();
+                self.tree = Some(tree);
+            } else if let Some(tree) = &self.tree {
+                tree.update(cx, |tree, cx| tree.refresh(cx));
+            }
+            self.tree
+                .as_ref()
+                .unwrap()
+                .focus_handle(cx)
+                .focus(window, cx);
+        } else {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn key(
+        &mut self,
+        key: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mode = *cx.global::<Mode>();
+        if mode == Mode::Confirm {
+            return false;
+        }
+        if matches!(mode, Mode::CommandPalette | Mode::FileFinder) {
+            if key.key == "escape" {
+                cx.set_global(Mode::Normal);
+                return true;
+            }
+            return false;
+        }
+        let file = self.panes[self.active].read(cx).file();
+        if matches!(mode, Mode::Search | Mode::LspPopup) {
+            return file.is_some_and(|file| file.update(cx, |file, cx| file.key(key, window, cx)));
+        }
+        if mode == Mode::Normal && key.modifiers.control && key.key == "b" {
+            self.pending.clear();
+            self.toggle_tree(window, cx);
+            return true;
+        }
+        if self.tree_visible
+            && let Some(tree) = &self.tree
+            && tree.focus_handle(cx).contains_focused(window, cx)
+        {
+            if key.key == "escape" {
+                self.focus_active(window, cx);
+                return true;
+            }
+            return tree.update(cx, |tree, cx| tree.key(key, cx));
+        }
+        if mode == Mode::Normal && key.modifiers.control && matches!(key.key.as_str(), "n" | "p") {
+            self.pending.clear();
+            self.cycle(key.key == "n", window, cx);
+            return true;
+        }
+        let k = text_key(key);
+        if mode == Mode::Normal
+            && !key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.platform
+        {
+            if !self.pending.is_empty() {
+                self.pending.push_str(k);
+                let pending = std::mem::take(&mut self.pending);
+                match pending.as_str() {
+                    "ss" => self.split(Placement::Bottom, window, cx),
+                    "sv" => self.split(Placement::Right, window, cx),
+                    "sh" => self.move_focus(Placement::Left, window, cx),
+                    "sj" => self.move_focus(Placement::Bottom, window, cx),
+                    "sk" => self.move_focus(Placement::Top, window, cx),
+                    "sl" => self.move_focus(Placement::Right, window, cx),
+                    "\\f" => self.pending = pending,
+                    "\\ff" => cx.set_global(Mode::FileFinder),
+                    _ => {}
+                }
+                return true;
+            }
+            if matches!(k, "s" | "\\") && file.as_ref().is_none_or(|file| !file.read(cx).pending())
+            {
+                self.pending.push_str(k);
+                return true;
+            }
+            if k == ":" {
+                cx.set_global(Mode::CommandPalette);
+                return true;
+            }
+        }
+        if let Some(file) = file {
+            return file.update(cx, |file, cx| file.key(key, window, cx));
+        }
+        if key.key == "escape" {
+            self.pending.clear();
+            cx.set_global(Mode::Normal);
+            return true;
+        }
+        if mode == Mode::Normal
+            && k == "i"
+            && !key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.platform
+        {
+            if self.panes[self.active].read(cx).session(cx).is_some() {
+                cx.set_global(Mode::Insert);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Used both by the native window close gesture and :quit.
+    pub(crate) fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.buffers.iter().any(|buffer| buffer.read(cx).saving) {
+            window.push_notification(
+                Notification::info("Saving files. Please wait before closing."),
+                cx,
+            );
+            return false;
+        }
+        let dirty = self
+            .buffers
+            .iter()
+            .filter(|buffer| buffer.read(cx).dirty())
+            .map(|buffer| buffer.read(cx).path.display().to_string())
+            .collect::<Vec<_>>();
+        if dirty.is_empty() {
+            return true;
+        }
+        if *cx.global::<Mode>() == Mode::Confirm {
+            return false;
+        }
+        window.close_dialog(cx);
+        cx.set_global(Mode::Confirm);
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .centered()
+                .w(px(520.))
+                .p_4()
+                .entrance(DialogEntrance::None)
+                .title("Unsaved files")
+                .on_ok(|_, _, _| false)
+                .on_close(|_, _, cx| cx.set_global(Mode::Normal))
+                .child(
+                    div()
+                        .id("unsaved-files")
+                        .test_support()
+                        .role(Role::Group)
+                        .aria_label("Unsaved files")
+                        .child("Save these files before closing, or discard their changes:")
+                        .children(dirty.iter().map(|path| div().child(path.clone())))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .mt_3()
+                                .child(Button::new("cancel-close").label("Keep editing").on_click(
+                                    |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        cx.set_global(Mode::Normal);
+                                    },
+                                ))
+                                .child(
+                                    Button::new("discard-close")
+                                        .label("Discard and close")
+                                        .on_click(|_, window, _| window.remove_window()),
+                                ),
+                        ),
+                )
+        });
+        false
+    }
 }
 
+fn cycle_index(current: usize, len: usize, forward: bool) -> usize {
+    if forward {
+        (current + 1) % len
+    } else {
+        (current + len - 1) % len
+    }
+}
 fn paint_active_border(bounds: Bounds<Pixels>, window: &mut Window, cx: &App) {
-    window
-        .paint_quad(outline(bounds, cx.theme().border, Default::default()).border_widths(px(2.0)));
+    window.paint_quad(outline(bounds, cx.theme().border, Default::default()).border_widths(px(2.)));
 }
-
 impl Render for Workspace {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_bounds = self.panes[self.active].read(cx).bounds.clone();
         div()
             .size_full()
             .relative()
-            .key_context(if *cx.global::<Mode>() == Mode::Normal {
-                "WorkspaceNormal"
-            } else {
-                "Workspace"
-            })
-            .on_action(cx.listener(|this, _: &SplitDown, window, cx| {
-                this.split(Placement::Bottom, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
-                this.split(Placement::Right, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &FocusLeft, window, cx| {
-                this.move_focus(Placement::Left, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &FocusDown, window, cx| {
-                this.move_focus(Placement::Bottom, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &FocusUp, window, cx| {
-                this.move_focus(Placement::Top, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &FocusRight, window, cx| {
-                this.move_focus(Placement::Right, window, cx)
-            }))
-            .on_action(
-                cx.listener(|this, _: &NextChat, window, cx| this.cycle_chat(true, window, cx)),
-            )
-            .on_action(
-                cx.listener(|this, _: &PreviousChat, window, cx| {
-                    this.cycle_chat(false, window, cx)
-                }),
-            )
-            .child(self.dock.clone())
-            // Paint after the dock, without changing layout or intercepting input.
+            .flex()
+            .when(self.tree_visible, |this| this.children(self.tree.clone()))
+            .child(div().flex_1().min_w_0().h_full().child(self.dock.clone()))
             .child(
                 canvas(
                     |_, _, _| {},

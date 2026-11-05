@@ -2,11 +2,16 @@ mod agent;
 mod app;
 mod chat;
 mod command_palette;
+mod file_browser;
+mod file_buffer;
 mod file_search;
+mod file_view;
 mod input_shortcuts;
+mod lsp;
 mod math;
 mod mermaid;
 mod mode;
+mod pane;
 mod pi;
 mod workspace;
 
@@ -25,19 +30,12 @@ use gpui_kit::{
 
 use app::open_dock_window;
 
-const USAGE: &str = "Usage: rockstar\n\nChat with pi in the current directory.";
+const USAGE: &str = "Usage: rockstar\n\nOpen a workspace in the current directory. Use :chat for pi or \\ff to open files.";
 
 fn init_key_handling(cx: &mut App) {
     mode::init(cx);
-    workspace::init(cx);
+    file_browser::init(cx);
     input_shortcuts::init(cx);
-    cx.intercept_keystrokes(|event, _, cx| {
-        // Intercept before keybindings in every window, regardless of the focused view.
-        if mode::handle_key(&event.keystroke, cx) {
-            cx.stop_propagation();
-        }
-    })
-    .detach();
 }
 
 fn main() -> ExitCode {
@@ -55,7 +53,6 @@ fn main() -> ExitCode {
     }
 
     let current_dir = env::current_dir().unwrap();
-    let agent = pi::connect(&current_dir).unwrap();
 
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
@@ -86,7 +83,7 @@ fn main() -> ExitCode {
                 app_id: Some("rockstar".into()),
                 ..Default::default()
             };
-            open_dock_window(options, agent, current_dir, Arc::new(pi::connect), cx)
+            open_dock_window(options, current_dir, Arc::new(pi::connect), cx)
                 .expect("failed to open the app window");
             cx.activate(true);
         });

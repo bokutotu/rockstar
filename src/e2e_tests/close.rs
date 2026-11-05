@@ -7,12 +7,6 @@ use crate::{
 };
 
 impl Driver {
-    fn command(&mut self, command: &str) {
-        self.press(":");
-        self.type_text(command);
-        self.press("enter");
-    }
-
     fn split_pane(&mut self, direction: &str) {
         self.press("s");
         self.press(direction);
@@ -156,6 +150,7 @@ fn close_shared_session_keeps_draft_history_and_incoming_events() {
     app.type_text("Shared draft");
     app.press("escape");
     app.split_pane("v");
+    app.press("ctrl-n"); // Explicitly show the existing session in the new plain pane.
     app.ui(|window, _| {
         assert_eq!(window.find_all(("message", 0_usize)).len(), 2);
         assert_eq!(window.find_all(("message", 1_usize)).len(), 2);
@@ -207,7 +202,8 @@ fn close_first_or_middle_pane_keeps_clicks_navigation_and_later_splits_working()
         app.assert_active_pane(1);
 
         app.split_pane("s");
-        app.assert_chats(&[remaining[0], remaining[1], remaining[1]]);
+        app.assert_chats(&remaining);
+        app.ui(|window, _| assert_eq!(window.find("plain").label(), Some("Plain")));
         app.assert_active_pane(2);
         app.command("close");
         app.assert_chats(&remaining);
@@ -246,7 +242,8 @@ fn close_before_new_finishes_discards_the_connection_even_if_the_pane_index_is_r
     }
     assert!(app.new_backends.is_empty());
 
-    app.assert_chats(&[1, 1]);
+    app.assert_chats(&[1]);
+    app.ui(|window, _| assert_eq!(window.find("plain").label(), Some("Plain")));
     app.assert_popup(false);
     let discarded = app.new_backends.try_recv().unwrap();
     assert!(discarded.prompts.is_closed());

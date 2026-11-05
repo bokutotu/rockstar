@@ -27,3 +27,33 @@ cargo test -p gpui-pre-linux ime_spot
 
 Remove this patch when upgrading to a release that allows post-layout IME
 position updates during composition, and rerun the X11 integration test.
+
+## gpui-base 0.8.1
+
+Source: the crates.io `gpui-base` 0.8.1 release (Apache-2.0). The original
+manifest, license, sources, tests and benches are retained. Cargo's registry
+cache is not modified; the root manifest selects this copy with `[patch.crates-io]`.
+
+The native editor is still used for editing, completion, hover, diagnostics and
+syntax highlighting. These local extensions provide the missing display layer:
+
+- `EditorAnnotation` / `set_annotations`: inline labels and clickable rows above
+  source lines, without inserting text into the rope or undo history.
+- Display-map block rows and inline-fragment shaping: cursor, selection, hit
+  testing, scrolling and IME coordinates include the annotations. Fileview uses
+  unwrapped source lines; annotation-aware soft wrapping is not implemented.
+- `AnnotationClick` returns an opaque host action ID. Rockstar resolves lens
+  labels during analysis and executes the command only on a click.
+- `set_semantic_tokens` accepts host-fetched tokens; Rockstar converts negotiated
+  LSP coordinates to the editor's Unicode-scalar columns first.
+- Completion acceptance checks the document revision and cursor, validates
+  ranges, and applies the primary/additional edits against one source snapshot.
+- `is_composing` lets the host avoid displaying analysis for committed text over
+  temporary IME preedit. Annotations invalidated by preedit are restored after
+  cancellation or refreshed after commit.
+
+Application integration and protocol adapters are in `src/lsp/` and
+`src/file_view/lsp.rs`. Tests and the reviewed screenshot are described in
+`tests/README.md`. Re-run both the production UI suite and
+`python3 tests/ime_x11.py --lsp` when updating this dependency. Remove the patch
+once equivalent APIs and coordinate handling are available upstream.

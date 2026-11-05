@@ -45,7 +45,7 @@ def wait_for(probe, description, timeout=10):
     raise AssertionError(f"Timed out waiting for {description}")
 
 
-def check(binary, scale, preedit):
+def check(binary, scale, preedit, lsp=False):
     with tempfile.TemporaryDirectory(prefix="rockstar-ime-") as directory:
         home = Path(directory)
         config = home / ".config/fcitx5"
@@ -66,14 +66,29 @@ def check(binary, scale, preedit):
         )
         stub.chmod(0o755)
         prompts = home / "prompts.jsonl"
+        workspace = home / "workspace"
+        workspace.mkdir()
+        source = workspace / "unicode.rs"
+        source.write_text("// ")
+        if lsp:
+            # Same production LSP process transport, deterministic annotations.
+            mock = Path(__file__).resolve().with_name("mock_lsp.py")
+            server = home / "bin/rust-analyzer"
+            server.write_text(f"#!/usr/bin/env python3\nimport runpy\nrunpy.run_path({str(mock)!r}, run_name='__main__')\n")
+            server.chmod(0o755)
+            (workspace / "mock-options.json").write_text(json.dumps({
+                "annotations": True, "unsupported": ["completionProvider"],
+            }))
+            for name in ("plain.txt", "annotated.rs"):
+                (workspace / name).write_text("let answer = 42;")
         processes = []
         logs = []
         env = dict(os.environ)
 
-        def start(args, name):
+        def start(args, name, cwd=None):
             log = (home / f"{name}.log").open("w+")
             logs.append(log)
-            process = subprocess.Popen(args, env=env, stdout=log, stderr=log)
+            process = subprocess.Popen(args, env=env, cwd=cwd, stdout=log, stderr=log)
             processes.append(process)
             return process
 
@@ -113,7 +128,12 @@ def check(binary, scale, preedit):
             time.sleep(0.1)
 
         def type_text(text):
-            xdo("type", "--clearmodifiers", "--delay", "15", "--", text)
+            # Xdotool emits Linefeed (Ctrl-J) for embedded newlines; the editor's
+            # newline gesture is Return. Exercise that actual keyboard operation.
+            for index, line in enumerate(text.split("\n")):
+                if index:
+                    key("Return")
+                xdo("type", "--clearmodifiers", "--delay", "15", "--", line)
 
         def compose():
             run("fcitx5-remote", "-o")
@@ -122,7 +142,8 @@ def check(binary, scale, preedit):
             return popup()
 
         def commit():
-            key("Return")
+            # Explicitly choose hiragana; dictionary learning can reorder kanji candidates.
+            key("F6", "Return")
             wait_for(lambda: not candidate(), "composition to finish")
 
         def replace_draft(text):
@@ -177,7 +198,7 @@ def check(binary, scale, preedit):
                 ).returncode == 0,
                 "Fcitx5",
             )
-            app = start([str(binary)], "rockstar")
+            app = start([str(binary)], "rockstar", cwd=workspace)
             windows = wait_for(
                 lambda: xdo("search", "--onlyvisible", "--pid", app.pid, required=False).split(),
                 "Rockstar",
@@ -186,6 +207,11 @@ def check(binary, scale, preedit):
             xdo("windowmove", window, 100, 100)
             xdo("windowsize", window, 960 * scale, 720 * scale)
             xdo("windowfocus", "--sync", window)
+            time.sleep(0.5)
+            run("fcitx5-remote", "-c")
+            key("colon")
+            type_text("chat")
+            key("Return")
             time.sleep(0.5)
             key("i")
             xdo("mousemove", "--window", window, 50 * scale, 670 * scale, "click", 1)
@@ -216,10 +242,12 @@ def check(binary, scale, preedit):
             replace_draft("x" * 80)
             wide = compose()
             xdo("windowsize", window, 360 * scale, 540 * scale)
-            wrapped = popup()
-            print('DEBUG wrap', geometry(window), wide, wrapped, flush=True)
-            run('/nix/store/h74lg8wfwndnf5glr171kmcshlffi7l2-imagemagick-7.1.2-29/bin/import', '-window', 'root', '/tmp/rockstar-ime-work/wrap.png')
-            assert wrapped["Y"] > wide["Y"] + 5 * scale, (wide, wrapped)
+            # Window resize, repaint, XIM, and Fcitx updates are asynchronous.
+            # Wait for the required wrapped-row position, not a fixed sleep.
+            wrapped = wait_for(
+                lambda: bounds if (bounds := candidate()) and bounds["Y"] > wide["Y"] + 5 * scale else None,
+                "the candidate window below the wrapped input row",
+            )
             visible_anchor(wrapped, window)
             commit()
 
@@ -239,15 +267,61 @@ def check(binary, scale, preedit):
             replace_draft("send")
             run("fcitx5-remote", "-o")
             type_text("nihongo")
-            key("space", "Return")
+            key("space", "F6", "Return")
             key("ctrl+Return")
             records = wait_for(
                 lambda: prompts.read_text().splitlines() if prompts.exists() else None,
                 "the explicitly submitted prompt",
             )
             assert len(records) == 1, records
-            assert json.loads(records[0])["message"] == "send日本語", records
-            print(f"PASS: scale={scale}, on-the-spot={preedit}", flush=True)
+            assert json.loads(records[0])["message"] == "sendにほんご", records
+
+            # Exercise the file editor through the same native keyboard/IME stack.
+            run("fcitx5-remote", "-c")
+            key("Escape")
+            xdo("windowsize", window, 960 * scale, 720 * scale)
+            key("backslash", "f", "f")
+            type_text("unicode.rs")
+            time.sleep(0.5)
+            key("Return")
+            time.sleep(0.5)
+            key("A")
+            first_source = compose()
+            app_bounds = geometry(window)
+            assert app_bounds["Y"] < first_source["Y"] < app_bounds["Y"] + 200 * scale, first_source
+            commit()
+            key("Return")
+            second_source = compose()
+            assert second_source["Y"] > first_source["Y"] + 5 * scale, (first_source, second_source)
+            commit()
+            run("fcitx5-remote", "-c")
+            key("Escape", "space", "w")
+            wait_for(lambda: source.read_text() == "// にほんご\nにほんご", "the UTF-8 file saved from the editor")
+            assert len(prompts.read_text().splitlines()) == 1
+            if lsp:
+                anchors = []
+                for name in ("plain.txt", "annotated.rs"):
+                    run("fcitx5-remote", "-c")
+                    key("Escape", "backslash", "f", "f")
+                    type_text(name)
+                    time.sleep(0.3)
+                    key("Return")
+                    time.sleep(0.6)  # analysis + annotation layout
+                    key("A")
+                    anchors.append(compose())
+                    commit()
+                    run("fcitx5-remote", "-c")
+                    key("Escape", "space", "w")
+                    wait_for(lambda: (workspace / name).read_text() == "let answer = 42;にほんご", "annotated source saved without virtual text")
+                plain, annotated = anchors
+                if preedit == "off":
+                    assert annotated["X"] > plain["X"] + 15 * scale, (plain, annotated)
+                    assert annotated["Y"] > plain["Y"] + 10 * scale, (plain, annotated)
+                else:
+                    # Preedit changes invalidate annotations. XIM must track their removal.
+                    near(annotated["X"], plain["X"], "preedit removes the inline hint")
+                    near(annotated["Y"], plain["Y"], "preedit removes the lens row")
+            print(f"PASS: chat + fileview, scale={scale}, on-the-spot={preedit}, lsp={lsp}", flush=True)
         except Exception:
             for log in logs:
                 log.flush()
@@ -281,6 +355,7 @@ def main():
     parser.add_argument("--binary", type=Path, default=Path("target/debug/rockstar"))
     parser.add_argument("--scale", type=int, choices=(1, 2), nargs="+", default=(1, 2))
     parser.add_argument("--preedit", choices=("off", "on"), nargs="+", default=("off", "on"))
+    parser.add_argument("--lsp", action="store_true", help="also verify inlay/lens IME coordinates through a stdio LSP peer")
     args = parser.parse_args()
     for tool in ("Xvfb", "dbus-run-session", "xdotool", "fcitx5", "fcitx5-remote"):
         if not shutil.which(tool):
@@ -294,7 +369,7 @@ def main():
         )
     for scale in args.scale:
         for preedit in args.preedit:
-            check(binary, scale, preedit)
+            check(binary, scale, preedit, args.lsp)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 {
-  description = "A minimal GPUI chat client for pi with Markdown rendering";
+  description = "A tiled GPUI workspace for pi chat and source editing";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -74,6 +74,7 @@
               cargoLock.lockFile = ./Cargo.lock;
 
               nativeBuildInputs = nativeBuildInputs ++ [ pkgs.makeWrapper ];
+              nativeCheckInputs = [ pkgs.gitMinimal pkgs.python3 ];
               buildInputs = libraries;
               preCheck = ''
                 unset DISPLAY WAYLAND_DISPLAY
@@ -84,12 +85,17 @@
               postFixup = ''
                 wrapProgram "$out/bin/rockstar" \
                   --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath libraries}" \
-                  --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.xdg-utils ]}" \
+                  --prefix PATH : "${
+                    pkgs.lib.makeBinPath [
+                      pkgs.xdg-utils
+                      pkgs.gitMinimal
+                    ]
+                  }" \
                   --set FONTCONFIG_FILE "${fontconfigFile}"
               '';
 
               meta = {
-                description = "A minimal GPUI chat client for pi";
+                description = "A tiled workspace for pi chat and source editing";
                 mainProgram = "rockstar";
                 platforms = systems;
               };
@@ -102,7 +108,7 @@
         default = {
           type = "app";
           program = "${self.packages.${system}.default}/bin/rockstar";
-          meta.description = "Chat with pi in the current directory";
+          meta.description = "Open a chat and source workspace in the current directory";
         };
       });
 
@@ -126,9 +132,12 @@
                 rust-analyzer
                 rustc
                 rustfmt
+                nixd
                 nixfmt
+                gitMinimal
                 xdg-utils
                 xdotool
+                python3
               ];
               inherit nativeBuildInputs;
               buildInputs = libraries;

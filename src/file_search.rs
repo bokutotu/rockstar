@@ -3,7 +3,7 @@
 //! pi's RPC mode has no file listing command, so Rockstar walks the workspace
 //! itself, the same way pi's TUI does with `fd`: hidden files are included and
 //! `.gitignore` rules are respected.
-use std::path::Path;
+use std::{path::Path, process::Command};
 
 use ignore::WalkBuilder;
 
@@ -41,6 +41,58 @@ pub(crate) fn scan(root: &Path) -> Vec<String> {
     }
     paths.sort();
     paths
+}
+
+/// Telescope-style file list: tracked files (even if now ignored) plus untracked,
+/// non-ignored files. Outside Git, use the same ignore-aware walker as mentions.
+pub(crate) fn project_files(root: &Path) -> anyhow::Result<Vec<String>> {
+    if let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ])
+        .output()
+        && output.status.success()
+    {
+        let mut files = output
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .filter(|p| root.join(p).is_file())
+            .collect::<Vec<_>>();
+        files.sort();
+        files.dedup();
+        return Ok(files);
+    }
+    let mut paths = Vec::new();
+    for entry in WalkBuilder::new(root)
+        .hidden(false)
+        .require_git(false)
+        .filter_entry(|entry| entry.file_name() != ".git")
+        .build()
+    {
+        let entry = entry?;
+        if entry.depth() > 0 && entry.path().is_file() {
+            paths.push(
+                entry
+                    .path()
+                    .strip_prefix(root)?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        if paths.len() >= MAX_ENTRIES {
+            break;
+        }
+    }
+    paths.sort();
+    Ok(paths)
 }
 
 /// Finds the `@` mention being typed at `cursor` (a byte offset into `text`).
@@ -157,7 +209,10 @@ mod tests {
         assert_eq!(mention_at("a\n@x", 4), Some((2, "x")));
         assert_eq!(mention_at("user@example", 12), None);
         assert_eq!(mention_at("@src done", 9), None);
-        assert_eq!(mention_at("日本 @ファ", "日本 @ファ".len()), Some((7, "ファ")));
+        assert_eq!(
+            mention_at("日本 @ファ", "日本 @ファ".len()),
+            Some((7, "ファ"))
+        );
     }
 
     #[test]
