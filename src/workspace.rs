@@ -9,7 +9,7 @@ use crate::{
 use gpui_kit::{
     App, AppContext as _, Bounds, Context, Entity, EntityId, Focusable as _,
     InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, Pixels, Render, Role,
-    StatefulInteractiveElement as _, Styled as _, Window,
+    ScrollHandle, StatefulInteractiveElement as _, Styled as _, Window,
     base::{Placement, TestSupportExt as _},
     canvas,
     component::{
@@ -30,13 +30,17 @@ use std::{
     sync::Arc,
 };
 mod dock;
+mod items;
+mod terminal;
+use items::OpenItem;
+
 pub(crate) type AgentConnector = Arc<dyn Fn(&Path) -> Result<Agent, AgentError> + Send + Sync>;
 
 pub(crate) struct Workspace {
     root: PathBuf,
     lsp: Entity<crate::lsp::LspWorkspace>,
-    sessions: Vec<Entity<ChatSession>>,
-    buffers: Vec<Entity<FileBuffer>>,
+    items: Vec<OpenItem>,
+    item_scroll: ScrollHandle,
     panes: Vec<Entity<Pane>>,
     active: usize,
     dock: Entity<DockArea>,
@@ -58,8 +62,8 @@ impl Workspace {
         let mut workspace = Self {
             root,
             lsp,
-            sessions: Vec::new(),
-            buffers: Vec::new(),
+            items: Vec::new(),
+            item_scroll: ScrollHandle::new(),
             panes: Vec::new(),
             active: 0,
             dock,
@@ -128,12 +132,14 @@ impl Workspace {
                     };
                     cx.set_global(mode);
                 }
+                self.reveal_active_item(cx);
             }
             cx.notify();
         }
     }
 
     pub(crate) fn focus_active(&self, window: &mut Window, cx: &mut App) {
+        self.reveal_active_item(cx);
         self.panes[self.active].update(cx, |pane, cx| pane.focus_content(window, cx));
     }
 
@@ -248,40 +254,6 @@ impl Workspace {
         }
     }
 
-    fn cycle(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let pane = self.panes[self.active].clone();
-        if let Some(view) = pane.read(cx).file() {
-            let buffer = &view.read(cx).buffer;
-            let current = self
-                .buffers
-                .iter()
-                .position(|entry| entry == buffer)
-                .unwrap_or(0);
-            let next = cycle_index(current, self.buffers.len(), forward);
-            let buffer = self.buffers[next].clone();
-            pane.update(cx, |pane, cx| {
-                pane.request += 1;
-                pane.show_file(buffer, window, cx);
-            });
-        } else if !self.sessions.is_empty() {
-            let session = pane.read(cx).session(cx);
-            let current = self
-                .sessions
-                .iter()
-                .position(|entry| Some(entry) == session.as_ref());
-            let next = current.map_or(0, |current| {
-                cycle_index(current, self.sessions.len(), forward)
-            });
-            let session = self.sessions[next].clone();
-            pane.update(cx, |pane, cx| {
-                pane.request += 1;
-                pane.show_chat(session, &self.root, window, cx);
-            });
-        }
-        self.focus_active(window, cx);
-        cx.notify();
-    }
-
     pub(crate) fn show_chat(&mut self, fresh: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !fresh && self.panes[self.active].read(cx).session(cx).is_some() {
             return;
@@ -308,19 +280,18 @@ impl Workspace {
                 };
                 match result {
                     Ok(agent) => {
-                        let number = this.sessions.len() + 1;
+                        let number = this
+                            .items
+                            .iter()
+                            .filter(|item| matches!(item, OpenItem::Chat(_)))
+                            .count()
+                            + 1;
                         let session = cx.new(|cx| ChatSession::new(agent, number, window, cx));
-                        this.sessions.push(session.clone());
-                        pane.update(cx, |pane, cx| {
-                            pane.show_chat(session, &this.root, window, cx)
-                        });
-                        if this.sessions.len() > 1 {
+                        let id = this.register_item(OpenItem::Chat(session), cx);
+                        this.show_item(pane.entity_id(), id, window, cx);
+                        if number > 1 {
                             this.show_titles(cx);
                         }
-                        if this.panes[this.active] == pane && !cx.global::<Mode>().is_overlay() {
-                            this.focus_active(window, cx);
-                        }
-                        cx.notify();
                     }
                     Err(error) => window.push_notification(
                         Notification::error(error.to_string()).autohide(false),
@@ -374,24 +345,15 @@ impl Workspace {
                 return;
             }
         };
-        if let Some(buffer) = self
-            .buffers
-            .iter()
-            .find(|buffer| buffer.read(cx).path == canonical)
-            .cloned()
-        {
+        if let Some(buffer) = self.find_buffer(&canonical, cx) {
+            self.show_item(pane_id, buffer.entity_id(), window, cx);
             pane.update(cx, |pane, cx| {
-                pane.show_file(buffer, window, cx);
                 if let Some((position, encoding)) = location
                     && let Some(file) = pane.file()
                 {
                     file.update(cx, |file, cx| file.jump_to(position, encoding, window, cx));
                 }
             });
-            if self.panes[self.active] == pane {
-                self.focus_active(window, cx);
-            }
-            cx.notify();
             return;
         }
         let loading = cx.background_spawn(async move { FileBuffer::load(&canonical) });
@@ -408,27 +370,20 @@ impl Workspace {
                 };
                 match result {
                     Ok(document) => {
-                        let buffer = this
-                            .buffers
-                            .iter()
-                            .find(|buffer| buffer.read(cx).path == document.path)
-                            .cloned()
-                            .unwrap_or_else(|| {
-                                let buffer = cx.new(|_| document);
-                                match this.lsp.update(cx, |lsp, cx| lsp.bind(&buffer, cx)) {
-                                    Ok(binding) => {
-                                        buffer.update(cx, |buffer, _| buffer.lsp = binding)
-                                    }
-                                    Err(error) => window.push_notification(
-                                        Notification::error(format!("{error:#}")),
-                                        cx,
-                                    ),
-                                }
-                                this.buffers.push(buffer.clone());
-                                buffer
-                            });
+                        let buffer = this.find_buffer(&document.path, cx).unwrap_or_else(|| {
+                            let buffer = cx.new(|_| document);
+                            match this.lsp.update(cx, |lsp, cx| lsp.bind(&buffer, cx)) {
+                                Ok(binding) => buffer.update(cx, |buffer, _| buffer.lsp = binding),
+                                Err(error) => window.push_notification(
+                                    Notification::error(format!("{error:#}")),
+                                    cx,
+                                ),
+                            }
+                            this.register_item(OpenItem::File(buffer.clone()), cx);
+                            buffer
+                        });
+                        this.show_item(pane_id, buffer.entity_id(), window, cx);
                         pane.update(cx, |pane, cx| {
-                            pane.show_file(buffer, window, cx);
                             if let Some((position, encoding)) = location
                                 && let Some(file) = pane.file()
                             {
@@ -437,10 +392,6 @@ impl Workspace {
                                 });
                             }
                         });
-                        if this.panes[this.active] == pane && !cx.global::<Mode>().is_overlay() {
-                            this.focus_active(window, cx);
-                        }
-                        cx.notify();
                     }
                     Err(error) => window.push_notification(
                         Notification::error(format!("{error:#}")).autohide(false),
@@ -516,6 +467,13 @@ impl Workspace {
             }
             return false;
         }
+        let terminal = self.panes[self.active].read(cx).terminal();
+        if mode == Mode::Insert
+            && let Some(terminal) = &terminal
+            && terminal.focus_handle(cx).contains_focused(window, cx)
+        {
+            return terminal.update(cx, |terminal, cx| terminal.key(key, window, cx));
+        }
         let file = self.panes[self.active].read(cx).file();
         if matches!(mode, Mode::Search | Mode::LspPopup) {
             return file.is_some_and(|file| file.update(cx, |file, cx| file.key(key, window, cx)));
@@ -575,6 +533,11 @@ impl Workspace {
         if let Some(file) = file {
             return file.update(cx, |file, cx| file.key(key, window, cx));
         }
+        if let Some(terminal) = &terminal
+            && terminal.update(cx, |terminal, cx| terminal.key(key, window, cx))
+        {
+            return true;
+        }
         if key.key == "escape" {
             self.pending.clear();
             cx.set_global(Mode::Normal);
@@ -586,7 +549,7 @@ impl Workspace {
             && !key.modifiers.alt
             && !key.modifiers.platform
         {
-            if self.panes[self.active].read(cx).session(cx).is_some() {
+            if self.panes[self.active].read(cx).session(cx).is_some() || terminal.is_some() {
                 cx.set_global(Mode::Insert);
             }
             return true;
@@ -596,7 +559,7 @@ impl Workspace {
 
     /// Used both by the native window close gesture and :quit.
     pub(crate) fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.buffers.iter().any(|buffer| buffer.read(cx).saving) {
+        if self.buffers().any(|buffer| buffer.read(cx).saving) {
             window.push_notification(
                 Notification::info("Saving files. Please wait before closing."),
                 cx,
@@ -604,8 +567,7 @@ impl Workspace {
             return false;
         }
         let dirty = self
-            .buffers
-            .iter()
+            .buffers()
             .filter(|buffer| buffer.read(cx).dirty())
             .map(|buffer| buffer.read(cx).path.display().to_string())
             .collect::<Vec<_>>();
@@ -674,8 +636,17 @@ impl Render for Workspace {
             .size_full()
             .relative()
             .flex()
-            .when(self.tree_visible, |this| this.children(self.tree.clone()))
-            .child(div().flex_1().min_w_0().h_full().child(self.dock.clone()))
+            .flex_col()
+            .child(self.render_item_bar(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .when(self.tree_visible, |this| this.children(self.tree.clone()))
+                    .child(div().flex_1().min_w_0().h_full().child(self.dock.clone())),
+            )
             .child(
                 canvas(
                     |_, _, _| {},

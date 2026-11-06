@@ -20,6 +20,7 @@ use crate::{
 mod close;
 mod files;
 mod input_shortcuts;
+mod terminal;
 
 struct Driver {
     cx: HeadlessAppContext,

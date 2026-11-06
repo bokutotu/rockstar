@@ -2,6 +2,8 @@ use super::*;
 use crate::lsp::{CommandSpec, TestConfig, language::ServerKind};
 use serde_json::Value;
 
+mod documentation;
+
 fn config() -> TestConfig {
     TestConfig {
         enabled: true,
@@ -224,10 +226,11 @@ fn annotated() -> (Project, Driver) {
 #[test]
 fn annotation_hit_testing_navigation_copy_and_save_use_source_coordinates() {
     let (project, mut app) = annotated();
-    // These points are in the rendered lens row / after `42`, as checked by lsp.png.
+    // Offsets within the editor's lens row / after `42`, as checked by lsp.png.
+    // Keep these relative to the editor, independent of workspace chrome.
     app.ui(|window, cx| {
         let source = window.find_by_label("Source code");
-        let offset = gpui_kit::point(gpui_kit::px(80.), gpui_kit::px(47.)) - source.bounds().origin;
+        let offset = gpui_kit::point(gpui_kit::px(32.), gpui_kit::px(17.));
         window.click_at(source.path().last().unwrap().clone(), offset, cx);
     });
     app.wait_source(&project.0.join("definition.rs"));
@@ -239,8 +242,7 @@ fn annotation_hit_testing_navigation_copy_and_save_use_source_coordinates() {
     app.keys(&["g", "g", "i"]);
     app.ui(|window, cx| {
         let source = window.find_by_label("Source code");
-        let offset =
-            gpui_kit::point(gpui_kit::px(219.), gpui_kit::px(80.)) - source.bounds().origin;
+        let offset = gpui_kit::point(gpui_kit::px(171.), gpui_kit::px(50.));
         window.click_at(source.path().last().unwrap().clone(), offset, cx);
     });
     app.type_text("0");
@@ -286,6 +288,8 @@ fn full_sync_and_keyboard_hover_use_the_advertised_protocol() {
     ready(&mut app);
     app.press("K");
     requested(&mut app, &project, "textDocument/hover");
+    wait(&mut app, |w| w.try_find("documentation-panel").is_some());
+    app.press("escape");
     app.press("A");
     app.type_text(" // modified");
     app.keys(&["escape", "escape"]);

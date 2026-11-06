@@ -1,3 +1,4 @@
+use super::documentation::{DocumentationPanel, hover_markdown};
 use super::*;
 use crate::lsp::{
     DocumentSnapshot, ServerState,
@@ -28,7 +29,8 @@ pub(crate) struct Navigate {
 impl EventEmitter<Navigate> for FileView {}
 
 pub(super) struct LspViewState {
-    focus: FocusHandle,
+    pub(super) focus: FocusHandle,
+    pub(super) documentation: Option<DocumentationPanel>,
     highlights: TextDecorationCollection,
     cursor_stamp: Option<(i32, usize)>,
     composing: bool,
@@ -47,6 +49,7 @@ impl LspViewState {
         });
         Self {
             focus: cx.focus_handle(),
+            documentation: None,
             highlights,
             cursor_stamp: None,
             composing: false,
@@ -182,6 +185,11 @@ fn node_mut<'a>(nodes: &'a mut [CallNode], path: &[usize]) -> Option<&'a mut Cal
 
 impl FileView {
     pub(super) fn focus_lsp_popup(&self, window: &mut Window, cx: &mut App) -> bool {
+        if let Some(panel) = &self.lsp_ui.documentation {
+            cx.set_global(Mode::LspPopup);
+            panel.content.focus_handle(cx).focus(window, cx);
+            return true;
+        }
         if self.lsp_ui.popup.is_none() {
             return false;
         }
@@ -189,10 +197,28 @@ impl FileView {
         self.lsp_ui.focus.focus(window, cx);
         true
     }
+    fn cancel_lsp_request(&mut self) {
+        self.lsp_ui.generation += 1;
+        self.lsp_ui.task = None;
+    }
     pub(super) fn init_lsp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(doc) = self.buffer.read(cx).lsp.clone() else {
             return;
         };
+        // Losing the source focus cancels pending requests even if the user
+        // returns to the same position before a delayed reply arrives.
+        cx.on_blur(&self.input.focus_handle(cx), window, |this, _, _| {
+            if this.lsp_ui.popup.is_none() && this.lsp_ui.documentation.is_none() {
+                this.cancel_lsp_request();
+            }
+        })
+        .detach();
+        cx.on_focus_out(&self.lsp_ui.focus, window, |this, _, window, cx| {
+            if this.lsp_ui.documentation.is_some() {
+                this.close_documentation(window, cx);
+            }
+        })
+        .detach();
         let provider = providers::Provider::new(&doc, &self.input);
         let view = cx.entity().downgrade();
         let connection = doc.read(cx).session.clone();
@@ -372,6 +398,22 @@ impl FileView {
         };
         let pos = self.vim.cursor;
         let stamp = (snap.version, pos);
+        if self
+            .lsp_ui
+            .documentation
+            .as_ref()
+            .is_some_and(|panel| panel.version != snap.version || panel.position != pos)
+        {
+            self.close_documentation(window, cx);
+        }
+        if self
+            .lsp_ui
+            .cursor_stamp
+            .is_some_and(|previous| previous != stamp)
+            && self.lsp_ui.popup.is_none()
+        {
+            self.cancel_lsp_request();
+        }
         if self.lsp_ui.cursor_stamp == Some(stamp) {
             return;
         }
@@ -507,6 +549,7 @@ impl FileView {
                 if this.lsp_ui.generation != generation
                     || !doc.read(cx).is_current(&snap, cx)
                     || this.vim.cursor != pos
+                    || (method == "textDocument/hover" && this.vim.mode != Mode::Normal)
                     || (!this.input.focus_handle(cx).is_focused(window)
                         && !this.lsp_ui.focus.is_focused(window))
                 {
@@ -538,20 +581,20 @@ impl FileView {
                         ),
                         Err(e) => Self::lsp_error(e, window, cx),
                     },
-                    "textDocument/hover" => {
-                        if let Ok(Some(mut hover)) = serde_json::from_value::<Option<Hover>>(value)
-                        {
-                            let range = hover
-                                .range
-                                .and_then(|r| encoding.range(&snap.text, r).ok())
-                                .unwrap_or(pos..next(&snap.text, pos));
-                            hover.range = hover
-                                .range
-                                .and_then(|r| encoding.editor_range(&snap.text, r).ok());
-                            this.input
-                                .update(cx, |input, cx| input.present_hover(range, hover, cx));
+                    "textDocument/hover" => match serde_json::from_value::<Option<Hover>>(value) {
+                        Ok(hover) => {
+                            match hover.and_then(|hover| hover_markdown(&hover.contents)) {
+                                Some(markdown) => {
+                                    this.show_documentation(markdown, snap.version, pos, window, cx)
+                                }
+                                None => window.push_notification(
+                                    Notification::info("No documentation at this position"),
+                                    cx,
+                                ),
+                            }
                         }
-                    }
+                        Err(error) => Self::lsp_error(error, window, cx),
+                    },
                     _ => match serde_json::from_value::<Option<Vec<CallHierarchyItem>>>(value) {
                         Ok(items) => {
                             if let Some(p) = &mut this.lsp_ui.popup {
@@ -613,19 +656,29 @@ impl FileView {
         }
     }
     fn show_popup(&mut self, popup: Popup, window: &mut Window, cx: &mut Context<Self>) {
+        if self.lsp_ui.documentation.is_some() {
+            self.close_documentation(window, cx);
+        }
         self.lsp_ui.popup = Some(popup);
         cx.set_global(Mode::LspPopup);
         self.lsp_ui.focus.focus(window, cx);
         cx.notify();
     }
-    fn close_lsp_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let focused = self.lsp_ui.focus.is_focused(window);
+    pub(super) fn close_lsp_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let documentation = self.lsp_ui.documentation.take();
+        let focused = self.lsp_ui.focus.contains_focused(window, cx)
+            || documentation
+                .as_ref()
+                .is_some_and(|panel| panel.content.focus_handle(cx).is_focused(window));
         self.lsp_ui.popup = None;
-        self.lsp_ui.generation += 1;
+        self.cancel_lsp_request();
         self.lsp_ui.call_tasks.clear();
-        self.lsp_ui.task = None;
-        if focused {
+        if focused || (documentation.is_some() && *cx.global::<Mode>() == Mode::LspPopup) {
             cx.set_global(self.vim.mode);
+        }
+        // Focus may already belong to a different pane. Closing stale content
+        // there must not steal it back.
+        if focused {
             self.input.focus_handle(cx).focus(window, cx);
         }
         cx.notify();
@@ -873,6 +926,12 @@ impl FileView {
                     };
                     input.route_overlay_action(action, window, cx);
                 });
+            }
+            "escape" => {
+                self.cancel_lsp_request();
+                self.input
+                    .update(cx, |input, cx| input.clear_hover_state(cx));
+                return false;
             }
             _ => return false,
         }

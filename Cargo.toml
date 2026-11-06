@@ -7,6 +7,7 @@ description = "A tiled GPUI workspace for pi chat and source editing"
 publish = false
 
 [dependencies]
+alacritty_terminal = { version = "0.26", default-features = false }
 anyhow = "1"
 async-channel = "2"
 futures-lite = "2"
@@ -17,6 +18,7 @@ libc = "0.2"
 lsp-types = "0.97"
 url = "2"
 merman = "0.9.3"
+portable-pty = "0.9"
 roxmltree = "0.21"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

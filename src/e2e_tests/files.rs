@@ -1,5 +1,6 @@
 //! Public UI scenarios: real dock, real editors, real files and Git; only pi is mocked.
 use super::*;
+mod items;
 mod lifecycle;
 mod lsp;
 mod visual;
@@ -294,7 +295,8 @@ fn buffers_survive_switching_to_chat_and_closing_their_pane() {
     app.command("close");
     app.open_file("a.rs", &project.0.join("a.rs"));
     app.assert_sources(&["a edited\n"]);
-    app.keys(&["s", "v", "ctrl-n"]);
+    // Plain starts at a.rs; cycling backward wraps to the retained chat.
+    app.keys(&["s", "v", "ctrl-n", "ctrl-p"]);
     app.ui(|window, _| {
         assert_eq!(
             window.find_by_label("Message to pi").value(),

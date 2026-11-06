@@ -102,6 +102,13 @@ impl CommandPaletteView {
                 workspace.update(cx, |workspace, cx| workspace.show_chat(false, window, cx));
                 Ok(())
             }
+            "term" => {
+                // Dismiss before opening: an existing terminal can enter Insert
+                // immediately without the palette resetting it to Normal.
+                self.dismiss(cx);
+                workspace.update(cx, |workspace, cx| workspace.show_terminal(window, cx));
+                return;
+            }
             "new" => {
                 workspace.update(cx, |workspace, cx| workspace.show_chat(true, window, cx));
                 Ok(())

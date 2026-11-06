@@ -20,6 +20,7 @@ use crate::{
     file_buffer::{self, FileBuffer},
     mode::{Mode, text_key},
 };
+mod documentation;
 mod lsp;
 mod vim;
 use lsp::LspViewState;
@@ -464,6 +465,9 @@ impl FileView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.lsp_ui.documentation.is_some() {
+            return self.documentation_key(key, window, cx);
+        }
         if self.lsp_key(key, window, cx) {
             return true;
         }
@@ -788,6 +792,7 @@ impl Focusable for FileView {
 impl Render for FileView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let lsp_popup = self.render_lsp_popup(cx);
+        let documentation = self.render_documentation(cx);
         let lsp_status = self.lsp_status(cx);
         let buffer = self.buffer.read(cx);
         let status = format!(
@@ -818,15 +823,21 @@ impl Render for FileView {
             .flex_col()
             .overflow_hidden()
             .capture_action(cx.listener(|this, _: &Undo, window, cx| {
-                this.undo(false, window, cx);
+                if this.lsp_ui.documentation.is_none() {
+                    this.undo(false, window, cx);
+                }
                 cx.stop_propagation();
             }))
             .capture_action(cx.listener(|this, _: &Redo, window, cx| {
-                this.undo(true, window, cx);
+                if this.lsp_ui.documentation.is_none() {
+                    this.undo(true, window, cx);
+                }
                 cx.stop_propagation();
             }))
             .child(
                 div()
+                    .id("source-area")
+                    .test_support()
                     .flex_1()
                     .min_h_0()
                     .w_full()
@@ -928,7 +939,8 @@ impl Render for FileView {
                         )
                         .absolute()
                         .size_full(),
-                    ),
+                    )
+                    .children(documentation),
             )
             .when(self.search_open, |this| {
                 this.child(

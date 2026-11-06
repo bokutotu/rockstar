@@ -4,6 +4,7 @@ use crate::{
     file_buffer::FileBuffer,
     file_view::FileView,
     mode::Mode,
+    terminal::{TerminalSession, TerminalView},
 };
 use gpui_kit::{
     App, AppContext as _, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
@@ -22,6 +23,7 @@ pub(crate) enum PaneContent {
     Plain,
     Chat(Entity<ChatPane>),
     File(Entity<FileView>),
+    Terminal(Entity<TerminalView>),
 }
 
 pub(crate) struct PaneActivated;
@@ -31,6 +33,7 @@ pub(crate) struct Pane {
     focus: FocusHandle,
     chat: Option<Entity<ChatPane>>,
     files: HashMap<EntityId, Entity<FileView>>,
+    terminals: HashMap<EntityId, Entity<TerminalView>>,
     pub(crate) bounds: Rc<Cell<Bounds<Pixels>>>,
     pub(crate) show_title: bool,
     /// Reject late async loads/connections after the destination has changed.
@@ -44,6 +47,7 @@ impl Pane {
             focus: cx.focus_handle(),
             chat: None,
             files: HashMap::new(),
+            terminals: HashMap::new(),
             bounds: Rc::default(),
             show_title: false,
             request: 0,
@@ -99,6 +103,46 @@ impl Pane {
         cx.notify();
     }
 
+    pub(crate) fn show_terminal(
+        &mut self,
+        session: Entity<TerminalSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = self.terminals.entry(session.entity_id()).or_insert_with(|| {
+            let mut label = session.read(cx).label();
+            cx.observe(&session, move |_, session, cx| {
+                let next = session.read(cx).label();
+                if next != label {
+                    label = next;
+                    cx.emit(PanelEvent::LayoutChanged);
+                    cx.notify();
+                }
+            }).detach();
+            cx.new(|cx| TerminalView::new(session, window, cx))
+        }).clone();
+        self.content = PaneContent::Terminal(view);
+        cx.emit(PanelEvent::LayoutChanged);
+        cx.notify();
+    }
+
+    pub(crate) fn terminal(&self) -> Option<Entity<TerminalView>> {
+        match &self.content {
+            PaneContent::Terminal(view) => Some(view.clone()),
+            _ => None,
+        }
+    }
+
+    /// Identity of the retained content, independent of this pane's view entities.
+    pub(crate) fn item_id(&self, cx: &App) -> Option<EntityId> {
+        match &self.content {
+            PaneContent::Plain => None,
+            PaneContent::Chat(chat) => Some(chat.read(cx).session.entity_id()),
+            PaneContent::File(view) => Some(view.read(cx).buffer.entity_id()),
+            PaneContent::Terminal(view) => Some(view.read(cx).session.entity_id()),
+        }
+    }
+
     pub(crate) fn session(&self, cx: &App) -> Option<Entity<ChatSession>> {
         match &self.content {
             PaneContent::Chat(chat) => Some(chat.read(cx).session.clone()),
@@ -129,6 +173,7 @@ impl Pane {
                 }
             }
             PaneContent::File(view) => view.update(cx, |view, cx| view.focus(window, cx)),
+            PaneContent::Terminal(view) => view.update(cx, |view, cx| view.focus(window, cx)),
         }
     }
 }
@@ -146,6 +191,7 @@ impl Panel for Pane {
         match &self.content {
             PaneContent::Plain => "Plain".to_string(),
             PaneContent::Chat(chat) => format!("Chat {}", chat.read(cx).session.read(cx).number),
+            PaneContent::Terminal(view) => view.read(cx).session.read(cx).label(),
             PaneContent::File(view) => {
                 let buffer = view.read(cx).buffer.read(cx);
                 format!(
@@ -193,12 +239,14 @@ impl Render for Pane {
                 .text_color(cx.theme().muted_foreground)
                 .child("Rockstar")
                 .child(":chat  Start a chat")
+                .child(":term  Open a terminal")
                 .child("\\ff    Find a file")
                 .child("Ctrl-b  File tree")
                 .child("ss / sv  Split pane")
                 .into_any_element(),
             PaneContent::Chat(chat) => chat.clone().into_any_element(),
             PaneContent::File(view) => view.clone().into_any_element(),
+            PaneContent::Terminal(view) => view.clone().into_any_element(),
         };
         div()
             .id("pane")

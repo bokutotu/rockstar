@@ -102,7 +102,10 @@ def handle(message):
         if opts.get("multiple_definitions"):
             result.append(location("second.rs"))
     elif method == "textDocument/hover":
-        result = {"contents": {"kind": "markdown", "value": "**LSP hover**\n\nA documented symbol."}}
+        if opts.get("hover_error"):
+            send({"id": message["id"], "error": {"code": -32603, "message": "mock hover failure"}})
+            return
+        result = opts.get("hover_result", {"contents": {"kind": "markdown", "value": "**LSP hover**\n\nA documented symbol."}})
     elif method == "textDocument/completion":
         end = offset(text, params["position"])
         match = re.search(r"[\w]+$", text[:end])
@@ -138,7 +141,10 @@ def handle(message):
     elif method == "test/reverse":
         result = params["value"]
     if "id" in message:
-        delay = opts.get("delay_definition", 0) if method == "textDocument/definition" else params.get("delay", 0)
+        delay = {
+            "textDocument/definition": opts.get("delay_definition", 0),
+            "textDocument/hover": opts.get("delay_hover", 0),
+        }.get(method, params.get("delay", 0))
         if delay:
             def later():
                 time.sleep(delay)

@@ -12,6 +12,10 @@ nix develop --command cargo clippy --all-targets -- -D warnings
 ファイルと Git リポジトリは一時ディレクトリに実際に作成し、pi 接続をモックに置き換えます。
 通常の UI テストでは LSP を無効化し、言語サーバーの有無や応答時間に依存しないようにしています。
 
+`src/e2e_tests/files/items.rs` では、最上部の一覧と Ctrl-n/p による chat・file の混在切り替え、
+タイルを閉じたあとの再選択、下書き・カーソル・スクロール位置の保持、非表示中の応答受信を確認します。
+一覧の横スクロール、未保存マーク、ファイルの重複防止、切り替え後に完了した接続・読み込みの破棄も対象です。
+
 `src/e2e_tests/files/visual.rs` はソースの色分け、相対行番号、ツリーを画像で検証します。
 通常のテストでは参照画像を書き換えません。意図した表示変更のときだけ次を実行し、画像をレビューしてください。
 
@@ -21,13 +25,30 @@ nix develop --command cargo test update_fileview_snapshot -- --ignored
 
 差分発生時の実画像は `target/visual-diffs/fileview/actual.png` に出力します。
 
+## Terminal
+
+`src/terminal/tests.rs` では実際の PTY と `/bin/sh` を使い、対話シェル、`cd` の保持、リサイズ、Ctrl-C／Ctrl-D、終了処理を検証します。
+`src/e2e_tests/terminal.rs` は本番 UI を通して `:term`、Esc／`i`、ペイン分割、chat との切り替え、共有セッション、日本語の入力・貼り付け、起動失敗と遅れて完了した起動の破棄を確認します。
+テスト用シェルには固定のプロンプトを設定し、ユーザーの起動設定は読みません。親プロセスの環境変数は書き換えません。
+
+```sh
+cargo test terminal -- --test-threads=1
+```
+
+色・全角文字・装飾の参照画像は `tests/visual/terminal.png` です。差分は `target/visual-diffs/terminal/actual.png` に出力します。
+意図した表示変更のときだけ、次のコマンドで参照画像を更新し、レビューしてください。
+
+```sh
+cargo test update_terminal_snapshot -- --ignored --test-threads=1
+```
+
 ## LSP
 
 `src/e2e_tests/files/lsp.rs` は `tests/mock_lsp.py` を子プロセスとして起動します。
 置き換えるのはサーバーだけで、stdio 通信、バッファ同期、GPUI の補完・描画・キー処理は本番コードを使います。
 Python 3 が必要です（この devShell と Nix のテスト環境に含まれます）。
 
-- F11 の両方向・展開・移動、F12 の単一／複数候補、K のホバー要求
+- F11 の両方向・展開・移動、F12 の単一／複数候補、K の説明パネル
 - ネイティブ補完と追加編集、Undo、複数タイルで一度だけ同期されること
 - full／incremental 同期、Unicode の位置変換、保存成功時の通知
 - 古い応答の破棄、未導入サーバー、未対応機能
@@ -39,6 +60,20 @@ Python 3 が必要です（この devShell と Nix のテスト環境に含ま�
 
 ```sh
 nix develop --command cargo test update_lsp_snapshot -- --ignored
+```
+
+`src/e2e_tests/files/lsp/documentation.rs` は `K` の開閉・スクロール・マウス選択・コピー・フォーカス復帰、
+古い応答の破棄、空の応答・エラーを確認します。Markdown・平文・旧形式の言語付きコードも対象です。
+通常のマウスホバーを維持し、説明パネル越しには反応しないことも確認します。
+大小の画面でコードブロックと説明文の重なりを確認した参照画像は
+`tests/visual/documentation.png` と `tests/visual/documentation-small.png` です。
+差分は `target/visual-diffs/documentation*/actual.png` に出力します。
+chat の描画は `src/chat/visual_tests.rs` の既存の画像テストでも確認します。
+
+```sh
+nix develop --command cargo test documentation -- --test-threads=1
+# 意図した表示変更のときだけ実行し、両方の画像をレビューする
+nix develop --command cargo test update_documentation_snapshots -- --ignored
 ```
 
 実サーバーのテストは通常の実行から除外しています。対象プロジェクト用の devShell に入り、次を実行してください。

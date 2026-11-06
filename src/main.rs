@@ -8,11 +8,13 @@ mod file_search;
 mod file_view;
 mod input_shortcuts;
 mod lsp;
+mod markdown;
 mod math;
 mod mermaid;
 mod mode;
 mod pane;
 mod pi;
+mod terminal;
 mod workspace;
 
 #[cfg(test)]
@@ -30,7 +32,7 @@ use gpui_kit::{
 
 use app::open_dock_window;
 
-const USAGE: &str = "Usage: rockstar\n\nOpen a workspace in the current directory. Use :chat for pi or \\ff to open files.";
+const USAGE: &str = "Usage: rockstar\n\nOpen a workspace in the current directory. Use :chat for pi, :term for a terminal, or \\ff to open files.";
 
 fn init_key_handling(cx: &mut App) {
     mode::init(cx);
