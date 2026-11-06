@@ -4,7 +4,7 @@ use gpui_kit::{
     component::{WindowExt as _, notification::Notification},
 };
 
-use crate::agent::{Agent, AgentEvent, Message, PromptRequest};
+use crate::agent::{AgentEvent, Message, OpenedChat, PromptRequest};
 
 /// A conversation and draft shared by every pane displaying this session.
 /// The single receiver lives here, not in a view: splitting must not distribute
@@ -19,7 +19,7 @@ pub(crate) struct ChatSession {
 }
 
 pub(super) enum ConversationChange {
-    Reset,
+    Reset(Vec<Message>),
     Append(Message),
     AppendText(usize, String),
     Replace(usize, Message),
@@ -30,11 +30,15 @@ impl EventEmitter<ConversationChange> for ChatSession {}
 
 impl ChatSession {
     pub(crate) fn new(
-        mut agent: Agent,
+        opened: OpenedChat,
         number: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let OpenedChat {
+            mut agent,
+            messages,
+        } = opened;
         let events = agent.take_results().expect("session owns agent events");
         let task = cx.spawn_in(window, async move |this, cx| {
             while let Ok(event) = events.recv().await {
@@ -48,7 +52,7 @@ impl ChatSession {
         });
         Self {
             number,
-            messages: Vec::new(),
+            messages,
             draft: "".into(),
             prompts: agent.prompt_sender(),
             assistant: None,
@@ -57,10 +61,15 @@ impl ChatSession {
     }
 
     /// Keep this session's identity while replacing its conversation and connection.
-    pub(crate) fn reset(&mut self, agent: Agent, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn replace(
+        &mut self,
+        opened: OpenedChat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Dropping the old receiver task prevents late replies from entering the new chat.
-        *self = Self::new(agent, self.number, window, cx);
-        cx.emit(ConversationChange::Reset);
+        *self = Self::new(opened, self.number, window, cx);
+        cx.emit(ConversationChange::Reset(self.messages.clone()));
         cx.notify();
     }
 

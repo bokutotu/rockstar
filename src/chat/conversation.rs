@@ -33,9 +33,13 @@ impl ConversationView {
             .collect();
         cx.subscribe(session, |this, _, change, cx| {
             match change {
-                ConversationChange::Reset => {
+                ConversationChange::Reset(messages) => {
                     for message in &this.messages { message.shutdown(cx); }
-                    this.messages.clear();
+                    this.messages = messages.iter().cloned().map(|message| {
+                        let message = ChatMessage::new(message, &this.base, cx);
+                        message.set_visible(this.visible, cx);
+                        message
+                    }).collect();
                     this.scroll = ScrollHandle::new();
                 }
                 ConversationChange::Append(message) => {
@@ -58,9 +62,11 @@ impl ConversationView {
             cx.notify();
         })
         .detach();
+        let scroll = ScrollHandle::new();
+        scroll.scroll_to_bottom();
         Self {
             messages,
-            scroll: ScrollHandle::new(),
+            scroll,
             base: base.into(),
             visible: true,
         }

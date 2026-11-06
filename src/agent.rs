@@ -1,9 +1,30 @@
+use std::path::PathBuf;
+
 use async_channel::{Receiver, Sender};
+use chrono::{DateTime, Utc};
 
 pub type AgentError = anyhow::Error;
 
 pub const DISCONNECTED_MESSAGE: &str =
-    "pi is no longer connected. Use :new to start a new chat.";
+    "pi is no longer connected. Use :resume to reopen a saved chat or :new to start a new one.";
+
+/// A saved conversation offered by the resume picker. The path is its identity.
+pub(crate) struct SavedSession {
+    pub path: PathBuf,
+    pub title: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub(crate) enum ChatStart {
+    New,
+    Resume(PathBuf),
+}
+
+/// A connection whose initial history has been loaded successfully.
+pub(crate) struct OpenedChat {
+    pub agent: Agent,
+    pub messages: Vec<Message>,
+}
 
 #[derive(Clone, Debug)]
 pub enum Message {

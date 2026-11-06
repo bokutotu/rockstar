@@ -84,7 +84,7 @@ impl ComposerView {
         })
         .detach();
         cx.subscribe_in(&session, window, |this, _, change, window, cx| {
-            if matches!(change, ConversationChange::Reset) {
+            if matches!(change, ConversationChange::Reset(_)) {
                 this.clear(window, cx);
             }
         })

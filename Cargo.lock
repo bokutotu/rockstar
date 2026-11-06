@@ -5966,6 +5966,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "async-channel",
+ "chrono",
  "data-url",
  "futures-lite",
  "gpui-kit",

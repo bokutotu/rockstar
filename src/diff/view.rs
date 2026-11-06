@@ -6,19 +6,24 @@ use super::{
 };
 use crate::mode::{Mode, text_key};
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
+    App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
     IntoElement, Keystroke, MouseButton, ParentElement as _, Pixels, Render, Role, ScrollStrategy,
     StatefulInteractiveElement as _, Styled as _, StyledText, UniformListScrollHandle, Window,
+    base::ElementExt as _,
     component::ActiveTheme as _, div, point, prelude::FluentBuilder as _, px, relative, rgb,
     uniform_list,
 };
-use std::{ops::Range, sync::Arc};
+use std::{cell::Cell, ops::Range, rc::Rc, sync::Arc};
 
 const LINE_HEIGHT: f32 = 20.;
 
 pub(crate) struct DiffView {
     pub(crate) session: Entity<DiffSession>,
     focus: FocusHandle,
+    tree_focus: FocusHandle,
+    pub(crate) body_focus: FocusHandle,
+    pub(crate) tree_bounds: Rc<Cell<Bounds<Pixels>>>,
+    pub(crate) body_bounds: Rc<Cell<Bounds<Pixels>>>,
     tree: DiffTree,
     // The displayed file is independent of tree navigation/folder selection.
     selected_entry: Option<DiffEntry>,
@@ -54,6 +59,10 @@ impl DiffView {
         let mut this = Self {
             session,
             focus: cx.focus_handle(),
+            tree_focus: cx.focus_handle(),
+            body_focus: cx.focus_handle(),
+            tree_bounds: Rc::default(),
+            body_bounds: Rc::default(),
             tree,
             selected_entry,
             revision,
@@ -70,11 +79,28 @@ impl DiffView {
     }
 
     pub(crate) fn focus(&self, window: &mut Window, cx: &mut App) {
+        // Reapplying Normal mode must not move focus from the body back to the tree.
+        if self.body_focus.contains_focused(window, cx) {
+            self.focus_body(window, cx);
+        } else {
+            self.focus_tree(window, cx);
+        }
+    }
+
+    pub(crate) fn focus_tree(&self, window: &mut Window, cx: &mut App) {
+        self.focus_region(&self.tree_focus, window, cx);
+    }
+
+    pub(crate) fn focus_body(&self, window: &mut Window, cx: &mut App) {
+        self.focus_region(&self.body_focus, window, cx);
+    }
+
+    fn focus_region(&self, focus: &FocusHandle, window: &mut Window, cx: &mut App) {
         if !cx.global::<Mode>().is_overlay() {
             if *cx.global::<Mode>() != Mode::Normal {
                 cx.set_global(Mode::Normal);
             }
-            self.focus.focus(window, cx);
+            focus.focus(window, cx);
         }
     }
 
@@ -193,7 +219,15 @@ impl DiffView {
         cx.notify();
     }
 
-    pub(crate) fn key(&mut self, key: &Keystroke, cx: &mut Context<Self>) -> bool {
+    fn scroll_vertical(&mut self, delta: Pixels, cx: &mut Context<Self>) {
+        let handle = &self.body_scroll.0.borrow().base_handle;
+        let mut offset = handle.offset();
+        offset.y = (offset.y + delta).clamp(-handle.max_offset().y, px(0.));
+        handle.set_offset(offset);
+        cx.notify();
+    }
+
+    pub(crate) fn key(&mut self, key: &Keystroke, window: &Window, cx: &mut Context<Self>) -> bool {
         if *cx.global::<Mode>() != Mode::Normal
             || key.modifiers.control
             || key.modifiers.alt
@@ -201,21 +235,20 @@ impl DiffView {
         {
             return false;
         }
+        let body_focused = self.body_focus.contains_focused(window, cx);
         match text_key(key) {
+            "j" | "down" if body_focused => self.scroll_vertical(-px(LINE_HEIGHT), cx),
+            "k" | "up" if body_focused => self.scroll_vertical(px(LINE_HEIGHT), cx),
             "j" | "down" => self.tree_action(TreeAction::Down, cx),
             "k" | "up" => self.tree_action(TreeAction::Up, cx),
-            "enter" => self.tree_action(TreeAction::Open, cx),
+            "enter" if !body_focused => self.tree_action(TreeAction::Open, cx),
+            "h" | "left" if !body_focused => self.tree_action(TreeAction::Collapse, cx),
+            "l" | "right" if !body_focused => self.tree_action(TreeAction::Expand, cx),
             "r" => self.session.update(cx, |session, cx| session.refresh(cx)),
-            "h" | "left" => self.tree_action(TreeAction::Collapse, cx),
-            "l" | "right" => self.tree_action(TreeAction::Expand, cx),
             "pageup" | "pagedown" => {
-                let handle = &self.body_scroll.0.borrow().base_handle;
-                let mut offset = handle.offset();
-                let page = handle.bounds().size.height.max(px(LINE_HEIGHT)) * 0.9;
-                offset.y += if key.key == "pageup" { page } else { -page };
-                offset.y = offset.y.clamp(-handle.max_offset().y, px(0.));
-                handle.set_offset(offset);
-                cx.notify();
+                let height = self.body_scroll.0.borrow().base_handle.bounds().size.height;
+                let page = height.max(px(LINE_HEIGHT)) * 0.9;
+                self.scroll_vertical(if key.key == "pageup" { page } else { -page }, cx);
             }
             _ => return false,
         }
@@ -223,10 +256,20 @@ impl DiffView {
     }
 
     fn render_files(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let bounds = self.tree_bounds.clone();
         div()
             .id("diff-file-tree")
             .role(Role::Tree)
             .aria_label("Changed files")
+            .track_focus(&self.tree_focus)
+            .on_prepaint(move |rect, _, _| bounds.set(rect))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.focus_tree(window, cx);
+                    cx.notify();
+                }),
+            )
             .w(px(260.))
             .max_w(relative(0.35))
             .h_full()
@@ -288,7 +331,7 @@ impl DiffView {
                                         if cx.global::<Mode>().is_overlay() {
                                             return;
                                         }
-                                        this.focus(window, cx);
+                                        this.focus_tree(window, cx);
                                         this.tree.select(index);
                                         this.tree_action(TreeAction::Open, cx);
                                     }))
@@ -495,6 +538,7 @@ impl Focusable for DiffView {
 
 impl Render for DiffView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let body_bounds = self.body_bounds.clone();
         let state = self.session.read(cx);
         let label = state.label();
         let pending = state.pending.or(self.loading.then_some("Loading file…"));
@@ -526,11 +570,18 @@ impl Render for DiffView {
             .when_some(error, |view, error| view.child(div().p_2().text_color(rgb(0xcf3636)).child(error)))
             .child(div().flex_1().min_h_0().w_full().flex()
                 .child(self.render_files(cx))
-                .child(div().flex_1().min_w_0().h_full().flex().flex_col()
+                .child(div().id("diff-body").role(Role::Group).aria_label("Diff content")
+                    .track_focus(&self.body_focus)
+                    .on_prepaint(move |rect, _, _| body_bounds.set(rect))
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                        this.focus_body(window, cx);
+                        cx.notify();
+                    }))
+                    .flex_1().min_w_0().h_full().flex().flex_col()
                     .child(div().px_2().py_1().flex_shrink_0().truncate().child(path))
                     .child(div().flex_1().min_h_0().child(self.render_document(cx)))))
             .child(div().px_2().py_1().flex_shrink_0().border_t_1().border_color(cx.theme().border)
                 .text_xs().text_color(cx.theme().muted_foreground).truncate()
-                .child("j/k select · Enter open · h/l tree · PgUp/PgDn scroll · Shift+wheel horizontal · r refresh · :stage / :unstage"))
+                .child("sh/sl focus · j/k select in tree, scroll in diff · Enter open · h/l tree · PgUp/PgDn page · Shift+wheel horizontal · r refresh · :stage / :unstage"))
     }
 }

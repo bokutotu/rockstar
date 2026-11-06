@@ -1,5 +1,5 @@
 use crate::{
-    agent::{Agent, AgentError},
+    agent::{AgentError, ChatStart, OpenedChat},
     chat::ChatSession,
     diff::{DiffRequest, IndexAction, LocalFilter},
     file_browser::{self, FileTree, OpenFile},
@@ -31,15 +31,19 @@ use std::{
     sync::Arc,
 };
 mod dock;
+mod focus;
 mod items;
 mod terminal;
 mod window;
 mod picker;
+mod resume;
 pub(crate) use window::WorkspaceWindow;
+use focus::FocusTarget;
 use items::OpenItem;
 pub(crate) use items::WipeMode;
 
-pub(crate) type AgentConnector = Arc<dyn Fn(&Path) -> Result<Agent, AgentError> + Send + Sync>;
+pub(crate) type AgentConnector =
+    Arc<dyn Fn(&Path, ChatStart) -> Result<OpenedChat, AgentError> + Send + Sync>;
 
 /// One independent editing context inside a directory-scoped workspace.
 pub(crate) struct Tab {
@@ -146,9 +150,9 @@ impl Tab {
             return;
         }
         if let Some(index) = self.panes.iter().position(|pane| pane.entity_id() == id) {
+            self.pending.clear();
             if self.active != index {
                 self.active = index;
-                self.pending.clear();
                 if !cx.global::<Mode>().is_overlay() {
                     let mode = match &self.panes[index].read(cx).content {
                         PaneContent::File(view) => view.read(cx).mode(),
@@ -235,69 +239,32 @@ impl Tab {
         cx.notify();
     }
 
-    fn move_focus(&mut self, direction: Placement, window: &mut Window, cx: &mut Context<Self>) {
-        let from = self.panes[self.active].read(cx).bounds.get();
-        let next = self
-            .panes
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index != self.active)
-            .filter_map(|(index, pane)| {
-                let to = pane.read(cx).bounds.get();
-                let (gap, overlap, distance) = match direction {
-                    Placement::Left => (
-                        from.left() - to.right(),
-                        from.bottom().min(to.bottom()) - from.top().max(to.top()),
-                        (from.center().y - to.center().y).abs(),
-                    ),
-                    Placement::Right => (
-                        to.left() - from.right(),
-                        from.bottom().min(to.bottom()) - from.top().max(to.top()),
-                        (from.center().y - to.center().y).abs(),
-                    ),
-                    Placement::Top => (
-                        from.top() - to.bottom(),
-                        from.right().min(to.right()) - from.left().max(to.left()),
-                        (from.center().x - to.center().x).abs(),
-                    ),
-                    Placement::Bottom => (
-                        to.top() - from.bottom(),
-                        from.right().min(to.right()) - from.left().max(to.left()),
-                        (from.center().x - to.center().x).abs(),
-                    ),
-                };
-                (f32::from(gap) >= -0.5 && f32::from(overlap) > 0.0).then_some((
-                    index,
-                    f32::from(gap),
-                    f32::from(distance),
-                ))
-            })
-            .min_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.2.total_cmp(&b.2)))
-            .map(|(index, _, _)| index);
-        if let Some(index) = next {
-            self.active = index;
-            cx.set_global(Mode::Normal);
-            self.focus_active(window, cx);
-            cx.notify();
-        }
-    }
-
     pub(crate) fn show_chat(&mut self, fresh: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let session = self.panes[self.active].read(cx).session(cx);
-        if !fresh && session.is_some() {
+        if !fresh && self.panes[self.active].read(cx).session(cx).is_some() {
             return;
         }
-        // A pending reset must not keep a wiped session and its connection alive.
-        let session = session.map(|session| session.downgrade());
-        let pane = self.panes[self.active].clone();
-        let pane_id = pane.entity_id();
+        self.start_chat(self.panes[self.active].entity_id(), ChatStart::New, window, cx);
+    }
+
+    fn start_chat(
+        &mut self,
+        pane_id: EntityId,
+        start: ChatStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.panes.iter().find(|pane| pane.entity_id() == pane_id).cloned() else {
+            return;
+        };
+        // A pending replacement must not keep a wiped session and its connection alive.
+        let session = pane.read(cx).session(cx).map(|session| session.downgrade());
         let request = pane.update(cx, |pane, _| {
             pane.request += 1;
             pane.request
         });
         let root = self.root.clone();
         let connect = self.connect.clone();
-        let connecting = cx.background_spawn(async move { connect(&root) });
+        let connecting = cx.background_spawn(async move { connect(&root, start) });
         cx.spawn_in(window, async move |this, cx| {
             let result = connecting.await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -310,12 +277,12 @@ impl Tab {
                     return;
                 };
                 match (result, session) {
-                    (Ok(agent), Some(session)) => {
+                    (Ok(opened), Some(session)) => {
                         if let Some(session) = session.upgrade() {
-                            session.update(cx, |session, cx| session.reset(agent, window, cx));
+                            session.update(cx, |session, cx| session.replace(opened, window, cx));
                         }
                     }
-                    (Ok(agent), None) => {
+                    (Ok(opened), None) => {
                         let number = this
                             .items
                             .iter()
@@ -326,7 +293,7 @@ impl Tab {
                             .max()
                             .unwrap_or(0)
                             + 1;
-                        let session = cx.new(|cx| ChatSession::new(agent, number, window, cx));
+                        let session = cx.new(|cx| ChatSession::new(opened, number, window, cx));
                         let id = this.register_item(OpenItem::Chat(session), cx);
                         this.show_item(pane.entity_id(), id, window, cx);
                         if number > 1 {
@@ -334,7 +301,7 @@ impl Tab {
                         }
                     }
                     (Err(error), _) => window.push_notification(
-                        Notification::error(error.to_string()).autohide(false),
+                        Notification::error(format!("{error:#}")).autohide(false),
                         cx,
                     ),
                 }
@@ -499,6 +466,11 @@ impl Tab {
                     this.open_file(pane, event.0.clone(), window, cx);
                 })
                 .detach();
+                cx.on_focus_in(&tree.focus_handle(cx), window, |this, _, cx| {
+                    this.pending.clear();
+                    cx.notify();
+                })
+                .detach();
                 self.tree = Some(tree);
             } else if let Some(tree) = &self.tree {
                 tree.update(cx, |tree, cx| tree.refresh(cx));
@@ -506,8 +478,7 @@ impl Tab {
             self.tree
                 .as_ref()
                 .unwrap()
-                .focus_handle(cx)
-                .focus(window, cx);
+                .update(cx, |tree, cx| tree.focus(window, cx));
         } else {
             self.focus_active(window, cx);
         }
@@ -547,23 +518,30 @@ impl Tab {
             self.toggle_tree(window, cx);
             return true;
         }
-        if self.tree_visible
-            && let Some(tree) = &self.tree
-            && tree.focus_handle(cx).contains_focused(window, cx)
-            && !(mode == Mode::Normal && (self.pending.starts_with('\\') || text_key(key) == "\\"))
-        {
+        let k = text_key(key);
+        let tree_focused = self.focused_target(window, cx) == Some(FocusTarget::FileTree);
+        if tree_focused && let Some(tree) = &self.tree {
             if key.key == "escape" {
+                self.pending.clear();
                 self.focus_active(window, cx);
+                cx.notify();
                 return true;
             }
-            return tree.update(cx, |tree, cx| tree.key(key, cx));
+            // Workspace sequences take priority over the tree's single-key actions.
+            let workspace_sequence = mode == Mode::Normal
+                && !key.modifiers.control
+                && !key.modifiers.alt
+                && !key.modifiers.platform
+                && (!self.pending.is_empty() || matches!(k, "s" | "\\"));
+            if !workspace_sequence {
+                return tree.update(cx, |tree, cx| tree.key(key, cx));
+            }
         }
         if mode == Mode::Normal && key.modifiers.control && matches!(key.key.as_str(), "n" | "p") {
             self.pending.clear();
             self.cycle(key.key == "n", window, cx);
             return true;
         }
-        let k = text_key(key);
         if mode == Mode::Normal
             && !key.modifiers.control
             && !key.modifiers.alt
@@ -599,7 +577,8 @@ impl Tab {
                 }
                 return true;
             }
-            if matches!(k, "s" | "\\") && file.as_ref().is_none_or(|file| !file.read(cx).pending())
+            if matches!(k, "s" | "\\")
+                && (tree_focused || file.as_ref().is_none_or(|file| !file.read(cx).pending()))
             {
                 self.pending.push_str(k);
                 return true;
@@ -613,7 +592,7 @@ impl Tab {
             return file.update(cx, |file, cx| file.key(key, window, cx));
         }
         if let Some(diff) = self.panes[self.active].read(cx).diff()
-            && diff.update(cx, |diff, cx| diff.key(key, cx))
+            && diff.update(cx, |diff, cx| diff.key(key, window, cx))
         {
             return true;
         }
@@ -715,7 +694,7 @@ fn paint_active_border(bounds: Bounds<Pixels>, window: &mut Window, cx: &App) {
 }
 impl Render for Tab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_bounds = self.panes[self.active].read(cx).bounds.clone();
+        let tab = cx.entity().downgrade();
         div()
             .size_full()
             .relative()
@@ -734,7 +713,12 @@ impl Render for Tab {
             .child(
                 canvas(
                     |_, _, _| {},
-                    move |_, _, window, cx| paint_active_border(active_bounds.get(), window, cx),
+                    move |_, _, window, cx| {
+                        if let Some(tab) = tab.upgrade() {
+                            let bounds = tab.read(cx).focused_bounds(window, cx);
+                            paint_active_border(bounds, window, cx);
+                        }
+                    },
                 )
                 .absolute()
                 .top_0()

@@ -3,8 +3,10 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     os::unix::process::CommandExt,
     path::Path,
-    process::{self, ChildStdin, Command, Stdio},
+    process::{self, Child, ChildStdin, Command, Stdio},
+    sync::mpsc,
     thread,
+    time::Duration,
 };
 
 use anyhow::{Context as _, anyhow, bail};
@@ -12,12 +14,20 @@ use async_channel::{Receiver, RecvError};
 use futures_lite::future::{block_on, or};
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{self, Agent, AgentBackend, AgentError, AgentEvent, PromptRequest};
+use crate::agent::{
+    self, AgentBackend, AgentError, AgentEvent, ChatStart, Message, OpenedChat, PromptRequest,
+};
+
+mod sessions;
+use sessions::SessionEntries;
+pub(crate) use sessions::list_sessions;
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum PiOutgoingRecord {
     Prompt { id: String, message: String },
+    GetState { id: String },
+    GetEntries { id: String },
     ExtensionUiResponse { id: String, cancelled: bool },
 }
 
@@ -51,8 +61,27 @@ enum PiIncomingRecord {
 #[serde(tag = "command", rename_all = "snake_case")]
 enum PiResponse {
     Prompt(CommandResponse<PromptResponseData>),
+    GetState(CommandResponse<SessionState>),
+    GetEntries(CommandResponse<SessionEntries>),
     #[serde(other)]
     Other,
+}
+
+impl PiResponse {
+    fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Prompt(response) => response.id.as_deref(),
+            Self::GetState(response) => response.id.as_deref(),
+            Self::GetEntries(response) => response.id.as_deref(),
+            Self::Other => None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionState {
+    session_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,9 +215,18 @@ enum ExtensionUiRequest {
 }
 
 struct PiCodingAgent {
+    child: Child,
     input: ChildStdin,
     records: Receiver<Result<PiIncomingRecord, AgentError>>,
     next_request_id: u64,
+}
+
+impl Drop for PiCodingAgent {
+    fn drop(&mut self) {
+        // Also clean up failed startup/handshakes, not just established chats.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 enum ActiveRequest {
@@ -206,7 +244,7 @@ enum Incoming {
     ResultsClosed,
 }
 
-pub fn connect(cwd: &Path) -> Result<Agent, AgentError> {
+pub(crate) fn connect(cwd: &Path, start: ChatStart) -> Result<OpenedChat, AgentError> {
     let parent_pid = process::id() as libc::pid_t;
     let mut command = Command::new("pi");
     command
@@ -215,6 +253,18 @@ pub fn connect(cwd: &Path) -> Result<Agent, AgentError> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+    let expected_session = match start {
+        ChatStart::New => None,
+        ChatStart::Resume(path) => {
+            let path = cwd
+                .join(path)
+                .canonicalize()
+                .context("The selected session is no longer available")?;
+            let id = sessions::validate_session(&path, cwd)?;
+            command.arg("--session").arg(path);
+            Some(id)
+        }
+    };
     // SAFETY: The child-side hook only makes syscalls and constructs OS-code
     // errors; it does not allocate or acquire locks after fork.
     unsafe {
@@ -242,7 +292,8 @@ pub fn connect(cwd: &Path) -> Result<Agent, AgentError> {
     let input = child.stdin.take().expect("piped pi stdin");
     let output = child.stdout.take().expect("piped pi stdout");
     let (record_sender, records) = async_channel::unbounded();
-    let pi = PiCodingAgent {
+    let mut pi = PiCodingAgent {
+        child,
         input,
         records,
         next_request_id: 0,
@@ -266,18 +317,88 @@ pub fn connect(cwd: &Path) -> Result<Agent, AgentError> {
         })?;
 
     let (agent, backend) = agent::channel();
+    let (ready, initialized) = mpsc::channel();
     thread::Builder::new()
         .name("pi-rpc".into())
         .spawn(move || {
-            pi.run(backend);
-            // Each session owns its process; closing one must not leave it running.
-            let _ = child.kill();
-            let _ = child.wait();
+            let history = match expected_session {
+                Some(id) => block_on(pi.load_history(&id, &backend)),
+                None => Ok(Vec::new()),
+            };
+            match history {
+                Ok(messages) => {
+                    if ready.send(Ok(messages)).is_ok() {
+                        pi.run(backend);
+                    }
+                }
+                Err(error) => {
+                    let _ = ready.send(Err(error));
+                }
+            }
         })?;
-    Ok(agent)
+    // Dropping `agent` on timeout cancels the handshake and its child process.
+    let messages = initialized
+        .recv_timeout(Duration::from_secs(30))
+        .context("Timed out or disconnected while opening the pi session")??;
+    Ok(OpenedChat { agent, messages })
 }
 
 impl PiCodingAgent {
+    async fn load_history(
+        &mut self,
+        expected_id: &str,
+        backend: &AgentBackend,
+    ) -> Result<Vec<Message>, AgentError> {
+        let id = self.next_id();
+        self.write_record(&PiOutgoingRecord::GetState { id: id.clone() })?;
+        let PiResponse::GetState(response) = self.read_response(&id, backend).await? else {
+            bail!("Unexpected pi response while opening the session");
+        };
+        let state = response.result.map_err(|error| anyhow!(error))?;
+        if state.session_id != expected_id {
+            bail!("pi opened a different session; the original chat has been kept");
+        }
+        let id = self.next_id();
+        self.write_record(&PiOutgoingRecord::GetEntries { id: id.clone() })?;
+        let PiResponse::GetEntries(response) = self.read_response(&id, backend).await? else {
+            bail!("Unexpected pi response while loading session history");
+        };
+        response
+            .result
+            .map_err(|error| anyhow!(error))?
+            .into_messages()
+    }
+
+    async fn read_response(
+        &mut self,
+        id: &str,
+        backend: &AgentBackend,
+    ) -> Result<PiResponse, AgentError> {
+        loop {
+            let record = or(
+                async {
+                    self.records
+                        .recv()
+                        .await
+                        .context("pi disconnected during startup")?
+                },
+                async {
+                    backend.events.closed().await;
+                    Err(anyhow!("Opening the chat was cancelled"))
+                },
+            )
+            .await?;
+            self.handle_extension(&record)?;
+            // The history snapshot includes finalized startup messages. Do not
+            // replay their events as well, or the restored chat would duplicate them.
+            if let PiIncomingRecord::Response(response) = record
+                && response.request_id() == Some(id)
+            {
+                return Ok(response);
+            }
+        }
+    }
+
     fn run(mut self, backend: AgentBackend) {
         let result = block_on(self.process_requests(&backend));
         if let Err(error) = result {
@@ -465,16 +586,38 @@ fn decode_event(record: &PiIncomingRecord) -> Option<AgentEvent> {
         PiIncomingRecord::MessageEnd {
             message: PiMessage::User { content },
         } => {
-            let text = match content {
-                MessageContent::Text(text) => text.clone(),
-                MessageContent::Blocks(blocks) => message_text(blocks),
-            };
+            let text = content.text();
             (!text.is_empty()).then_some(AgentEvent::UserMessage(text))
         }
         PiIncomingRecord::MessageEnd {
             message: PiMessage::Assistant { content, .. },
         } => Some(AgentEvent::AssistantFinished(message_text(content))),
         _ => None,
+    }
+}
+
+impl MessageContent {
+    fn text(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Blocks(blocks) => message_text(blocks),
+        }
+    }
+}
+
+impl PiMessage {
+    fn display_message(&self) -> Option<Message> {
+        match self {
+            Self::User { content } => {
+                let text = content.text();
+                (!text.is_empty()).then_some(Message::User(text))
+            }
+            Self::Assistant { content, .. } => {
+                let text = message_text(content);
+                (!text.is_empty()).then_some(Message::Assistant(text))
+            }
+            Self::Other => None,
+        }
     }
 }
 

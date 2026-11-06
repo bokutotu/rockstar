@@ -10,6 +10,7 @@ publish = false
 alacritty_terminal = { version = "0.26", default-features = false }
 anyhow = "1"
 async-channel = "2"
+chrono = "0.4"
 futures-lite = "2"
 gpui-kit = { version = "0.8.1", features = ["tree-sitter-languages"] }
 ignore = "0.4"

@@ -54,7 +54,7 @@ pub(crate) fn bind_mode(workspace: &Entity<WorkspaceWindow>, window: &mut Window
                         window.close_dialog(cx);
                     }
                     let _ =
-                        workspace.update(cx, |workspace, cx| workspace.focus_active(window, cx));
+                        workspace.update(cx, |workspace, cx| workspace.focus_for_mode(window, cx));
                 }
                 Mode::Search | Mode::LspPopup | Mode::Confirm | Mode::Switcher => {}
             }
@@ -150,6 +150,12 @@ impl CommandPaletteView {
             "chat" => {
                 tab.update(cx, |workspace, cx| workspace.show_chat(false, window, cx));
                 Ok(())
+            }
+            "resume" => {
+                // Replace the palette dialog before opening the session picker.
+                window.close_dialog(cx);
+                tab.update(cx, |tab, cx| tab.open_resume(window, cx));
+                return;
             }
             "term" => {
                 // Dismiss before opening: an existing terminal can enter Insert

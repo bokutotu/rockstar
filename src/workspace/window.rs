@@ -91,6 +91,11 @@ impl WorkspaceWindow {
             .update(cx, |tab, cx| tab.focus_active(window, cx));
     }
 
+    pub(crate) fn focus_for_mode(&self, window: &mut Window, cx: &mut App) {
+        self.active_tab()
+            .update(cx, |tab, cx| tab.focus_for_mode(window, cx));
+    }
+
     pub(crate) fn key(
         &mut self,
         key: &Keystroke,

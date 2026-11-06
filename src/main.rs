@@ -31,7 +31,7 @@ use gpui_kit::{
 
 use app::open_dock_window;
 
-const USAGE: &str = "Usage: rockstar\n\nOpen a workspace in the current directory. Use :wsnew <directory> for another workspace, :tabnew for a tab, :chat for pi, :term for a terminal, or \\ff to open files.";
+const USAGE: &str = "Usage: rockstar\n\nOpen a workspace in the current directory. Use :wsnew <directory> for another workspace, :tabnew for a tab, :chat for pi, :resume for saved chats, :term for a terminal, or \\ff to open files.";
 
 fn init_key_handling(cx: &mut App) {
     mode::init(cx);

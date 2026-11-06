@@ -4,10 +4,11 @@ use crate::{
     workspace::Tab,
 };
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, KeyBinding, Keystroke, ParentElement as _, Render, Role,
-    ScrollStrategy, StatefulInteractiveElement as _, Styled as _, Task, UniformListScrollHandle,
-    WeakEntity, Window,
+    App, AppContext as _, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, KeyBinding, Keystroke, MouseButton, ParentElement as _,
+    Pixels, Render, Role, ScrollStrategy, StatefulInteractiveElement as _, Styled as _, Task,
+    UniformListScrollHandle, WeakEntity, Window,
+    base::ElementExt as _,
     component::{
         ActiveTheme as _, WindowExt as _,
         dialog::DialogEntrance,
@@ -18,7 +19,7 @@ use gpui_kit::{
     prelude::FluentBuilder as _,
     px, uniform_list,
 };
-use std::{collections::HashSet, path::PathBuf};
+use std::{cell::Cell, collections::HashSet, path::PathBuf, rc::Rc};
 
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
@@ -213,6 +214,7 @@ pub(crate) struct FileTree {
     expanded: HashSet<String>,
     selected: usize,
     focus: FocusHandle,
+    pub(crate) bounds: Rc<Cell<Bounds<Pixels>>>,
     scroll: UniformListScrollHandle,
     loading: bool,
     scan: Option<Task<()>>,
@@ -232,12 +234,22 @@ impl FileTree {
             expanded: HashSet::new(),
             selected: 0,
             focus: cx.focus_handle(),
+            bounds: Rc::default(),
             scroll: UniformListScrollHandle::default(),
             loading: true,
             scan: None,
         };
         tree.refresh(cx);
         tree
+    }
+    pub(crate) fn focus(&self, window: &mut Window, cx: &mut App) {
+        if cx.global::<Mode>().is_overlay() {
+            return;
+        }
+        if *cx.global::<Mode>() != Mode::Normal {
+            cx.set_global(Mode::Normal);
+        }
+        self.focus.focus(window, cx);
     }
     pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
         let root = self.root.clone();
@@ -339,11 +351,20 @@ impl FileTree {
 }
 impl Render for FileTree {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let bounds = self.bounds.clone();
         div()
             .id("file-tree")
             .role(Role::Group)
             .aria_label("File tree")
             .track_focus(&self.focus)
+            .on_prepaint(move |rect, _, _| bounds.set(rect))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.focus(window, cx);
+                    cx.notify();
+                }),
+            )
             .w(px(260.))
             .h_full()
             .flex_shrink_0()
@@ -394,7 +415,10 @@ impl Render for FileTree {
                                             .text_color(cx.theme().accent_foreground)
                                     })
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.focus.focus(window, cx);
+                                        if cx.global::<Mode>().is_overlay() {
+                                            return;
+                                        }
+                                        this.focus(window, cx);
                                         this.open(index, cx);
                                     }))
                                     .child(format!("{icon}{label}"))
