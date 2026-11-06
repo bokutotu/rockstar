@@ -17,6 +17,7 @@ mod mermaid;
 mod mode;
 mod pane;
 mod pi;
+mod syntax;
 mod terminal;
 mod workspace;
 

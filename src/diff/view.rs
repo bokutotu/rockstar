@@ -1,87 +1,26 @@
-use super::{DiffSession, git, model::*};
+use super::{
+    DiffSession, git,
+    model::*,
+    presentation::{HighlightedSource, PreparedDocument},
+    tree::{DiffTree, TreeAction},
+};
 use crate::mode::{Mode, text_key};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
     IntoElement, Keystroke, MouseButton, ParentElement as _, Pixels, Render, Role, ScrollStrategy,
-    StatefulInteractiveElement as _, Styled as _, UniformListScrollHandle, Window,
+    StatefulInteractiveElement as _, Styled as _, StyledText, UniformListScrollHandle, Window,
     component::ActiveTheme as _, div, point, prelude::FluentBuilder as _, px, relative, rgb,
     uniform_list,
 };
-use similar::DiffableStr as _;
 use std::{ops::Range, sync::Arc};
 
 const LINE_HEIGHT: f32 = 20.;
 
-struct Row {
-    before: Option<usize>,
-    after: Option<usize>,
-    changed: bool,
-}
-
-/// Derived presentation data, constructed off the UI thread with the document.
-struct PreparedDocument {
-    document: DiffDocument,
-    before: Vec<String>,
-    after: Vec<String>,
-    rows: Vec<Row>,
-    max_columns: usize,
-}
-
-impl PreparedDocument {
-    fn new(document: DiffDocument) -> Self {
-        let lines = |text: Option<&str>| -> Vec<String> {
-            text.unwrap_or("")
-                .tokenize_lines()
-                .into_iter()
-                .map(|line| {
-                    line.trim_end_matches('\n')
-                        .trim_end_matches('\r')
-                        .replace('\t', "    ")
-                })
-                .collect()
-        };
-        let before = lines(document.before.text());
-        let after = lines(document.after.text());
-        let mut rows = Vec::new();
-        let mut append = |old: Range<usize>, new: Range<usize>, changed| {
-            for offset in 0..old.len().max(new.len()) {
-                rows.push(Row {
-                    before: (offset < old.len()).then_some(old.start + offset),
-                    after: (offset < new.len()).then_some(new.start + offset),
-                    changed,
-                });
-            }
-        };
-        if document.before.text().is_some() && document.after.text().is_some() {
-            let (mut old, mut new) = (0, 0);
-            for hunk in &document.hunks {
-                append(old..hunk.old_lines.start, new..hunk.new_lines.start, false);
-                append(hunk.old_lines.clone(), hunk.new_lines.clone(), true);
-                old = hunk.old_lines.end;
-                new = hunk.new_lines.end;
-            }
-            append(old..before.len(), new..after.len(), false);
-        }
-        let max_columns = before
-            .iter()
-            .chain(&after)
-            .map(|line| line.chars().count())
-            .max()
-            .unwrap_or(0);
-        Self {
-            document,
-            before,
-            after,
-            rows,
-            max_columns,
-        }
-    }
-}
-
 pub(crate) struct DiffView {
     pub(crate) session: Entity<DiffSession>,
     focus: FocusHandle,
-    selected: usize,
+    tree: DiffTree,
+    // The displayed file is independent of tree navigation/folder selection.
     selected_entry: Option<DiffEntry>,
     revision: u64,
     request: u64,
@@ -108,12 +47,15 @@ impl DiffView {
                 .update(cx, |session, cx| session.set_visible(id, false, cx));
         })
         .detach();
-        let revision = session.read(cx).revision;
+        let state = session.read(cx);
+        let revision = state.revision;
+        let tree = DiffTree::new(&state.snapshot.entries);
+        let selected_entry = tree.selected_entry().cloned();
         let mut this = Self {
             session,
             focus: cx.focus_handle(),
-            selected: 0,
-            selected_entry: None,
+            tree,
+            selected_entry,
             revision,
             request: 0,
             loading: false,
@@ -146,19 +88,27 @@ impl DiffView {
         let state = self.session.read(cx);
         self.revision = state.revision;
         let entries = &state.snapshot.entries;
+        self.tree.refresh(entries);
         let retained = self
             .selected_entry
             .as_ref()
-            .and_then(|selected| entries.iter().position(|entry| entry.same_file(selected)));
-        self.selected = retained.unwrap_or(self.selected.min(entries.len().saturating_sub(1)));
-        self.load_selected(retained.is_none(), cx);
+            .and_then(|selected| entries.iter().find(|entry| entry.same_file(selected)))
+            .cloned();
+        let reset_scroll = retained.is_none();
+        self.selected_entry = retained.or_else(|| {
+            self.tree
+                .selected_entry()
+                .or_else(|| self.tree.first_entry())
+                .cloned()
+        });
+        self.scroll_to_selection();
+        self.load_selected(reset_scroll, cx);
     }
 
     fn load_selected(&mut self, reset_scroll: bool, cx: &mut Context<Self>) {
         self.request += 1;
         self.error = None;
         let snapshot = self.session.read(cx).snapshot.clone();
-        self.selected_entry = snapshot.entries.get(self.selected).cloned();
         if reset_scroll {
             self.document = None;
             self.horizontal = px(0.);
@@ -174,14 +124,12 @@ impl DiffView {
             cx.notify();
             return;
         };
-        self.files_scroll
-            .scroll_to_item(self.selected, ScrollStrategy::Nearest);
         self.loading = true;
         let request = self.request;
         let revision = self.revision;
         let loading = cx.background_spawn(async move {
             git::load_document(&snapshot, &entry)
-                .map(PreparedDocument::new)
+                .map(|document| PreparedDocument::new(&entry, document))
                 .map(Arc::new)
         });
         cx.spawn(async move |this, cx| {
@@ -205,12 +153,22 @@ impl DiffView {
         cx.notify();
     }
 
-    fn select(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index == self.selected {
-            return;
+    fn scroll_to_selection(&self) {
+        if self.tree.len() > 0 {
+            self.files_scroll
+                .scroll_to_item(self.tree.selected, ScrollStrategy::Nearest);
         }
-        self.selected = index;
-        self.load_selected(true, cx);
+    }
+
+    fn tree_action(&mut self, action: TreeAction, cx: &mut Context<Self>) {
+        if let Some(entry) = self.tree.apply(action)
+            && self.selected_entry.as_ref() != Some(&entry)
+        {
+            self.selected_entry = Some(entry);
+            self.load_selected(true, cx);
+        }
+        self.scroll_to_selection();
+        cx.notify();
     }
 
     pub(crate) fn update_index(
@@ -244,20 +202,12 @@ impl DiffView {
             return false;
         }
         match text_key(key) {
-            "j" | "down" => {
-                let last = self
-                    .session
-                    .read(cx)
-                    .snapshot
-                    .entries
-                    .len()
-                    .saturating_sub(1);
-                self.select((self.selected + 1).min(last), cx);
-            }
-            "k" | "up" => self.select(self.selected.saturating_sub(1), cx),
+            "j" | "down" => self.tree_action(TreeAction::Down, cx),
+            "k" | "up" => self.tree_action(TreeAction::Up, cx),
+            "enter" => self.tree_action(TreeAction::Open, cx),
             "r" => self.session.update(cx, |session, cx| session.refresh(cx)),
-            "h" | "left" => self.scroll_horizontal(px(-80.), cx),
-            "l" | "right" => self.scroll_horizontal(px(80.), cx),
+            "h" | "left" => self.tree_action(TreeAction::Collapse, cx),
+            "l" | "right" => self.tree_action(TreeAction::Expand, cx),
             "pageup" | "pagedown" => {
                 let handle = &self.body_scroll.0.borrow().base_handle;
                 let mut offset = handle.offset();
@@ -273,69 +223,82 @@ impl DiffView {
     }
 
     fn render_files(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let count = self.session.read(cx).snapshot.entries.len();
         div()
-            .w(px(230.))
+            .id("diff-file-tree")
+            .role(Role::Tree)
+            .aria_label("Changed files")
+            .w(px(260.))
             .max_w(relative(0.35))
             .h_full()
             .flex_shrink_0()
+            .flex()
+            .flex_col()
             .border_r_1()
             .border_color(cx.theme().border)
+            .child(div().px_2().py_2().child("Changes"))
             .child(
                 uniform_list(
                     "diff-files",
-                    count,
+                    self.tree.len(),
                     cx.processor(|this, range: Range<usize>, _, cx| {
-                        let snapshot = this.session.read(cx).snapshot.clone();
                         range
                             .map(|index| {
-                                let entry = &snapshot.entries[index];
+                                let item = this.tree.item(index);
+                                let expanded = this.tree.is_expanded(item);
+                                let icon = if item.is_folder() {
+                                    if expanded { "▾ " } else { "▸ " }
+                                } else {
+                                    "  "
+                                };
                                 div()
                                     .id(("diff-file", index))
-                                    .role(Role::ListBoxOption)
-                                    .aria_label(format!(
-                                        "{} {} {}",
-                                        entry.section.label(),
-                                        entry.kind.label(),
-                                        entry.label()
-                                    ))
-                                    .aria_selected(index == this.selected)
-                                    .h(px(44.))
+                                    .role(Role::TreeItem)
+                                    .aria_label(item.description())
+                                    .aria_selected(index == this.tree.selected)
+                                    .when(item.is_folder(), |row| row.aria_expanded(expanded))
+                                    .h(px(24.))
                                     .w_full()
-                                    .px_2()
-                                    .py_1()
+                                    .pl(px(8. + item.depth() as f32 * 14.))
+                                    .pr_2()
                                     .flex()
-                                    .flex_col()
+                                    .items_center()
+                                    .gap_2()
                                     .overflow_hidden()
                                     .cursor_pointer()
-                                    .when(index == this.selected, |row| {
+                                    .when(index == this.tree.selected, |row| {
                                         row.bg(cx.theme().accent)
                                             .text_color(cx.theme().accent_foreground)
                                     })
                                     .child(
                                         div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(format!(
-                                                "{} · {}",
-                                                entry.section.label(),
-                                                entry.kind.label()
-                                            )),
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .child(format!("{icon}{}", item.label())),
                                     )
-                                    .child(div().text_sm().truncate().child(entry.label()))
+                                    .when_some(item.entry(), |row, entry| {
+                                        row.child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_xs()
+                                                .child(entry.kind.label()),
+                                        )
+                                    })
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         if cx.global::<Mode>().is_overlay() {
                                             return;
                                         }
                                         this.focus(window, cx);
-                                        this.select(index, cx);
+                                        this.tree.select(index);
+                                        this.tree_action(TreeAction::Open, cx);
                                     }))
                             })
                             .collect::<Vec<_>>()
                     }),
                 )
                 .track_scroll(&self.files_scroll)
-                .size_full(),
+                .flex_1()
+                .min_h_0(),
             )
     }
 
@@ -419,64 +382,72 @@ impl DiffView {
                         range
                             .filter_map(|index| {
                                 let row = prepared.rows.get(index)?;
-                                let side = |line: Option<usize>, lines: &[String], added: bool| {
-                                    let background = if !row.changed {
-                                        cx.theme().background
-                                    } else if line.is_none() {
-                                        cx.theme().muted
-                                    } else if added {
-                                        rgb(0x238636).opacity(0.14).into()
-                                    } else {
-                                        rgb(0xcf3636).opacity(0.14).into()
+                                let side =
+                                    |line: Option<usize>,
+                                     source: &HighlightedSource,
+                                     added: bool| {
+                                        let background = if !row.changed {
+                                            cx.theme().background
+                                        } else if line.is_none() {
+                                            cx.theme().muted
+                                        } else if added {
+                                            rgb(0x238636).opacity(0.14).into()
+                                        } else {
+                                            rgb(0xcf3636).opacity(0.14).into()
+                                        };
+                                        div()
+                                            .w_1_2()
+                                            .h_full()
+                                            .min_w_0()
+                                            .flex()
+                                            .overflow_hidden()
+                                            .bg(background)
+                                            .border_r_1()
+                                            .border_color(cx.theme().border)
+                                            .child(
+                                                div()
+                                                    .w(px(52.))
+                                                    .h_full()
+                                                    .flex_shrink_0()
+                                                    .pr_2()
+                                                    .text_right()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(line.map_or_else(String::new, |n| {
+                                                        format!(
+                                                            "{}{}",
+                                                            if row.changed {
+                                                                if added { "+" } else { "−" }
+                                                            } else {
+                                                                " "
+                                                            },
+                                                            n + 1
+                                                        )
+                                                    })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .h_full()
+                                                    .overflow_hidden()
+                                                    .child(
+                                                        div()
+                                                            .relative()
+                                                            .left(-this.horizontal)
+                                                            .whitespace_nowrap()
+                                                            .child(line.map_or_else(
+                                                                || StyledText::new(""),
+                                                                |i| {
+                                                                    source.styled_line(
+                                                                        i,
+                                                                        &*cx.theme()
+                                                                            .highlight_theme,
+                                                                    )
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
                                     };
-                                    div()
-                                        .w_1_2()
-                                        .h_full()
-                                        .min_w_0()
-                                        .flex()
-                                        .overflow_hidden()
-                                        .bg(background)
-                                        .border_r_1()
-                                        .border_color(cx.theme().border)
-                                        .child(
-                                            div()
-                                                .w(px(52.))
-                                                .h_full()
-                                                .flex_shrink_0()
-                                                .pr_2()
-                                                .text_right()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(line.map_or_else(String::new, |n| {
-                                                    format!(
-                                                        "{}{}",
-                                                        if row.changed {
-                                                            if added { "+" } else { "−" }
-                                                        } else {
-                                                            " "
-                                                        },
-                                                        n + 1
-                                                    )
-                                                })),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .h_full()
-                                                .overflow_hidden()
-                                                .child(
-                                                    div()
-                                                        .relative()
-                                                        .left(-this.horizontal)
-                                                        .whitespace_nowrap()
-                                                        .child(
-                                                            line.and_then(|i| lines.get(i))
-                                                                .cloned()
-                                                                .unwrap_or_default(),
-                                                        ),
-                                                ),
-                                        )
-                                };
                                 Some(
                                     div()
                                         .h(px(LINE_HEIGHT))
@@ -559,7 +530,7 @@ impl Render for DiffView {
                     .child(div().px_2().py_1().flex_shrink_0().truncate().child(path))
                     .child(div().flex_1().min_h_0().child(self.render_document(cx)))))
             .child(div().px_2().py_1().flex_shrink_0().border_t_1().border_color(cx.theme().border)
-                .text_xs().text_color(cx.theme().muted_foreground)
-                .child("j/k files · PgUp/PgDn scroll · h/l horizontal · r refresh · :stage / :unstage"))
+                .text_xs().text_color(cx.theme().muted_foreground).truncate()
+                .child("j/k select · Enter open · h/l tree · PgUp/PgDn scroll · Shift+wheel horizontal · r refresh · :stage / :unstage"))
     }
 }

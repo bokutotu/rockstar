@@ -1,6 +1,8 @@
 //! Retained read-only diff items; view state stays local to each pane.
 mod git;
 mod model;
+mod presentation;
+mod tree;
 mod view;
 
 pub(crate) use model::DiffSnapshot;
