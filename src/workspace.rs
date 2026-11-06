@@ -18,13 +18,13 @@ use gpui_kit::{
         button::Button,
         dialog::DialogEntrance,
         dock::{
-            DockArea, DockLayout, DockPlacement, InsertTarget, PanelEvent, PanelId, panel_handle,
+            DockArea, DockLayout, DockPlacement, InsertTarget, PanelId, panel_handle,
         },
         notification::Notification,
     },
     div, outline,
     prelude::FluentBuilder as _,
-    px,
+    px, relative,
 };
 use std::{
     path::{Path, PathBuf},
@@ -197,16 +197,6 @@ impl Tab {
         Ok(())
     }
 
-    fn show_titles(&self, cx: &mut App) {
-        for pane in &self.panes {
-            pane.update(cx, |pane, cx| {
-                pane.show_title = true;
-                cx.emit(PanelEvent::LayoutChanged);
-                cx.notify();
-            });
-        }
-    }
-
     fn split(&mut self, placement: Placement, window: &mut Window, cx: &mut Context<Self>) {
         let source = &self.panes[self.active];
         let node = self
@@ -238,7 +228,6 @@ impl Tab {
             );
         });
         self.active = self.panes.len() - 1;
-        self.show_titles(cx);
         cx.set_global(Mode::Normal);
         self.focus_active(window, cx);
         cx.notify();
@@ -301,9 +290,6 @@ impl Tab {
                         let session = cx.new(|cx| ChatSession::new(opened, number, window, cx));
                         let id = this.register_item(OpenItem::Chat(session), cx);
                         this.show_item(pane.entity_id(), id, window, cx);
-                        if number > 1 {
-                            this.show_titles(cx);
-                        }
                     }
                     (Err(error), _) => window.push_notification(
                         Notification::error(format!("{error:#}")).autohide(false),

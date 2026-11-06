@@ -218,20 +218,22 @@ impl Tab {
             .role(Role::TabList)
             .aria_label("Open chats, files, media, terminals, and diffs")
             .w_full()
-            .h(px(32.))
             .flex_shrink_0()
             .flex()
-            .items_center()
+            .items_stretch()
+            .text_sm()
+            .line_height(relative(1.))
+            .whitespace_nowrap()
             .overflow_x_scroll()
             .track_scroll(&self.item_scroll)
             .bg(theme.muted)
-            .border_b_1()
-            .border_color(theme.border)
             .when(self.items.is_empty(), |bar| {
                 bar.child(
                     div()
+                        .flex_shrink_0()
                         .px_3()
-                        .text_sm()
+                        .border_b_1()
+                        .border_color(theme.border)
                         .text_color(theme.muted_foreground)
                         .child("No open chats, files, media, terminals, or diffs"),
                 )
@@ -244,10 +246,8 @@ impl Tab {
                     .selected(selected)
                     .accessibility_label(label.clone())
                     .set_position(index + 1, self.items.len())
-                    .h_full()
                     .flex_shrink_0()
                     .px_3()
-                    .text_sm()
                     .cursor_pointer()
                     .bg(if selected {
                         theme.background
@@ -259,8 +259,8 @@ impl Tab {
                     } else {
                         theme.muted_foreground
                     })
-                    .border_b_2()
-                    .border_color(if selected { theme.primary } else { theme.muted })
+                    .border_b_1()
+                    .border_color(if selected { theme.primary } else { theme.border })
                     .hover(|style| style.bg(theme.accent))
                     .child(label)
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -275,5 +275,8 @@ impl Tab {
                         this.show_item(this.panes[this.active].entity_id(), id, window, cx);
                     }))
             }))
+            // Continue the same 1px border across unused space, without adding
+            // another border below the tabs and increasing the bar's height.
+            .child(div().flex_1().border_b_1().border_color(theme.border))
     }
 }

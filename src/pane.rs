@@ -40,7 +40,6 @@ pub(crate) struct Pane {
     media: HashMap<EntityId, Entity<MediaView>>,
     diffs: HashMap<EntityId, Entity<DiffView>>,
     pub(crate) bounds: Rc<Cell<Bounds<Pixels>>>,
-    pub(crate) show_title: bool,
     /// Reject late async loads/connections after the destination has changed.
     pub(crate) request: u64,
 }
@@ -57,7 +56,6 @@ impl Pane {
             media: HashMap::new(),
             diffs: HashMap::new(),
             bounds: Rc::default(),
-            show_title: false,
             request: 0,
         }
     }
@@ -295,7 +293,7 @@ impl Panel for Pane {
         }
     }
     fn title_bar(&self, _: &App) -> bool {
-        self.show_title || matches!(self.content, PaneContent::File(_) | PaneContent::Media(_))
+        false
     }
     fn inner_padding(&self, _: &App) -> bool {
         false

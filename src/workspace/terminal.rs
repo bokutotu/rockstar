@@ -45,7 +45,6 @@ impl Tab {
                             cx.new(|cx| TerminalSession::new(number, process, window, cx));
                         let id = this.register_item(OpenItem::Terminal(session), cx);
                         this.show_item(pane_id, id, window, cx);
-                        this.show_titles(cx);
                         // A background completion must not steal focus from a
                         // different pane, the finder, or another command.
                         if this.visible && this.panes[this.active] == pane && *cx.global::<Mode>() == Mode::Normal {

@@ -1,5 +1,5 @@
-//! Keep the standard dock appearance while measuring the entire pane frame,
-//! including its title bar, for the workspace's active-pane outline.
+//! Keep the standard dock appearance while measuring the entire pane frame
+//! for the workspace's active-pane outline.
 use std::{rc::Rc, sync::Arc};
 
 use gpui_kit::{
