@@ -1,6 +1,7 @@
 use std::path::Path;
 use gpui_kit::{
-    App, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, div, px, rgb,
+    App, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _,
+    component::ActiveTheme as _, div, prelude::FluentBuilder as _, px, rgb, rgba,
 };
 
 use crate::{agent::Message, markdown::MarkdownContent};
@@ -38,7 +39,7 @@ impl ChatMessage {
         content.shutdown(cx);
     }
 
-    pub(super) fn view(&self, index: usize) -> impl IntoElement + use<> {
+    pub(super) fn view(&self, index: usize, current: bool, cx: &App) -> impl IntoElement + use<> {
         let (label, color, markdown) = match self {
             Self::User(markdown) => ("You", rgb(0x2563eb), markdown),
             Self::Assistant(markdown) => ("Assistant", rgb(0x0f766e), markdown),
@@ -46,9 +47,14 @@ impl ChatMessage {
         div()
             .id(("message", index))
             .w_full()
+            .flex_shrink_0()
             .flex()
             .flex_col()
             .gap_2()
+            .border_l_2()
+            .border_color(if current { color } else { rgba(0x00000000) })
+            .pl_3()
+            .when(current, |message| message.bg(cx.theme().accent))
             .child(
                 div()
                     .text_size(px(13.0))

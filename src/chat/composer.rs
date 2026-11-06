@@ -33,7 +33,7 @@ fn input_hint(mode: Mode) -> &'static str {
     if mode == Mode::Insert {
         "Ask pi…"
     } else {
-        "NORMAL — click to type · : commands"
+        "NORMAL — j/k messages · yy copy Markdown · i type · : commands"
     }
 }
 

@@ -4,7 +4,7 @@ use gpui_kit::{
     ScrollHandle, StatefulInteractiveElement as _, Styled as _, Window, div,
 };
 
-use crate::agent::Message;
+use crate::{agent::Message, mode::Mode};
 
 use super::{
     message::ChatMessage,
@@ -15,6 +15,8 @@ use super::{
 pub(super) struct ConversationView {
     messages: Vec<ChatMessage>,
     scroll: ScrollHandle,
+    /// None follows the latest message; a cursor pauses automatic scrolling.
+    current: Option<usize>,
     base: PathBuf,
     visible: bool,
 }
@@ -24,7 +26,8 @@ impl ConversationView {
         cx.on_release(|this, cx| {
             for message in &this.messages { message.shutdown(cx); }
         }).detach();
-        let messages = session
+        cx.observe_global::<Mode>(|_, cx| cx.notify()).detach();
+        let messages: Vec<_> = session
             .read(cx)
             .messages
             .clone()
@@ -41,6 +44,7 @@ impl ConversationView {
                         message
                     }).collect();
                     this.scroll = ScrollHandle::new();
+                    this.current = None;
                 }
                 ConversationChange::Append(message) => {
                     let message = ChatMessage::new(message.clone(), &this.base, cx);
@@ -56,20 +60,55 @@ impl ConversationView {
                 }
                 ConversationChange::Remove(index) => {
                     this.messages.remove(*index).shutdown(cx);
+                    if let Some(current) = this.current
+                        && *index <= current
+                    {
+                        this.current = this.messages.len().checked_sub(1).map(|last| {
+                            if current > *index { current - 1 } else { current.min(last) }
+                        });
+                        if let Some(current) = this.current {
+                            this.scroll.scroll_to_top_of_item(current);
+                        }
+                    }
                 }
             }
-            this.scroll.scroll_to_bottom();
+            if this.current.is_none() {
+                this.scroll.scroll_to_top_of_item(this.messages.len());
+            }
             cx.notify();
         })
         .detach();
         let scroll = ScrollHandle::new();
-        scroll.scroll_to_bottom();
+        scroll.scroll_to_top_of_item(messages.len());
         Self {
             messages,
             scroll,
+            current: None,
             base: base.into(),
             visible: true,
         }
+    }
+
+    pub(super) fn current_message(&self) -> Option<usize> {
+        self.current.or_else(|| self.messages.len().checked_sub(1))
+    }
+
+    pub(super) fn move_message(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(current) = self.current_message() else { return; };
+        let next = if forward {
+            (current + 1).min(self.messages.len() - 1)
+        } else {
+            current.saturating_sub(1)
+        };
+        self.current = Some(next);
+        self.scroll.scroll_to_top_of_item(next);
+        cx.notify();
+    }
+
+    pub(super) fn follow_latest(&mut self, cx: &mut Context<Self>) {
+        self.current = None;
+        self.scroll.scroll_to_top_of_item(self.messages.len());
+        cx.notify();
     }
 
     pub(super) fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
@@ -79,21 +118,28 @@ impl ConversationView {
 }
 
 impl Render for ConversationView {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = (*cx.global::<Mode>() == Mode::Normal)
+            .then(|| self.current_message())
+            .flatten();
         div()
             .id("conversation")
             .size_full()
             .min_h_0()
+            .flex()
+            .flex_col()
+            .gap_5()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
             .p_6()
-            .child(
-                div().flex().flex_col().gap_5().children(
-                    self.messages
-                        .iter()
-                        .enumerate()
-                        .map(|(index, message)| message.view(index)),
-                ),
+            .children(
+                self.messages
+                    .iter()
+                    .enumerate()
+                    .map(|(index, message)| message.view(index, current == Some(index), cx)),
             )
+            // A tail anchor lets following and navigation replace the same pending
+            // scroll request, so a queued new-message scroll cannot override j/k.
+            .child(div().h_0().flex_shrink_0())
     }
 }

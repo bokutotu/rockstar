@@ -80,6 +80,11 @@ impl Tab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        cx.observe_global::<Mode>(|this, cx| {
+            if *cx.global::<Mode>() != Mode::Normal {
+                this.pending.clear();
+            }
+        }).detach();
         let dock = dock::new(window, cx);
         let lsp = cx.new(|cx| crate::lsp::LspWorkspace::new(root.clone(), window, cx));
         let mut workspace = Self {
@@ -492,6 +497,11 @@ impl Tab {
         cx: &mut Context<Self>,
     ) -> bool {
         let mode = *cx.global::<Mode>();
+        if self.pending == "y"
+            && (key.modifiers.control || key.modifiers.alt || key.modifiers.platform)
+        {
+            self.pending.clear();
+        }
         if mode == Mode::Confirm {
             return false;
         }
@@ -547,6 +557,9 @@ impl Tab {
             && !key.modifiers.alt
             && !key.modifiers.platform
         {
+            if self.pending == "y" && k != "y" {
+                self.pending.clear();
+            }
             if !self.pending.is_empty() {
                 self.pending.push_str(k);
                 let pending = std::mem::take(&mut self.pending);
@@ -557,6 +570,11 @@ impl Tab {
                     "sj" => self.move_focus(Placement::Bottom, window, cx),
                     "sk" => self.move_focus(Placement::Top, window, cx),
                     "sl" => self.move_focus(Placement::Right, window, cx),
+                    "yy" => {
+                        if let Some(chat) = self.panes[self.active].read(cx).chat() {
+                            chat.update(cx, |chat, cx| chat.yank_message(cx));
+                        }
+                    }
                     "\\f" | "\\w" | "\\t" | "\\g" => self.pending = pending,
                     "\\ff" => cx.set_global(Mode::FileFinder),
                     "\\ww" => cx.emit(TabAction::Workspaces),
@@ -585,6 +603,16 @@ impl Tab {
             }
             if k == ":" {
                 cx.set_global(Mode::CommandPalette);
+                return true;
+            }
+            if matches!(k, "j" | "k" | "y")
+                && let Some(chat) = self.panes[self.active].read(cx).chat()
+            {
+                if k == "y" {
+                    self.pending.push('y');
+                } else {
+                    chat.update(cx, |chat, cx| chat.move_message(k == "j", cx));
+                }
                 return true;
             }
         }

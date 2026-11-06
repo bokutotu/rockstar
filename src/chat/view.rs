@@ -1,11 +1,13 @@
 use std::path::Path;
 
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, FocusHandle, Focusable,
+    App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, Role,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, Window,
     div,
 };
+
+use crate::agent::Message;
 
 use super::{
     composer::{Composer, ComposerView},
@@ -42,7 +44,22 @@ impl ChatPane {
         self.conversation.update(cx, |view, cx| view.set_visible(visible, cx));
     }
 
+    pub(crate) fn move_message(&self, forward: bool, cx: &mut App) {
+        self.conversation.update(cx, |view, cx| view.move_message(forward, cx));
+    }
+
+    pub(crate) fn yank_message(&self, cx: &mut App) {
+        let Some(index) = self.conversation.read(cx).current_message() else { return; };
+        let text = match self.session.read(cx).messages.get(index) {
+            Some(Message::User(text) | Message::Assistant(text)) => text.clone(),
+            None => return,
+        };
+        // Copy the original Markdown, not the rendered text or the role label.
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
     pub(crate) fn focus_input(&self, window: &mut Window, cx: &mut App) {
+        self.conversation.update(cx, |view, cx| view.follow_latest(cx));
         self.composer
             .update(cx, |composer, cx| composer.focus(window, cx));
     }

@@ -191,6 +191,13 @@ impl Pane {
         displayed
     }
 
+    pub(crate) fn chat(&self) -> Option<Entity<ChatPane>> {
+        match &self.content {
+            PaneContent::Chat(chat) => Some(chat.clone()),
+            _ => None,
+        }
+    }
+
     pub(crate) fn terminal(&self) -> Option<Entity<TerminalView>> {
         match &self.content {
             PaneContent::Terminal(view) => Some(view.clone()),
