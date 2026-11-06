@@ -19,7 +19,7 @@ use super::{
 };
 
 use crate::{
-    agent::{DISCONNECTED_MESSAGE, PromptRequest},
+    agent::{ContextUsage, DISCONNECTED_MESSAGE, PromptRequest},
     file_search, input_shortcuts,
     mode::Mode,
 };
@@ -35,6 +35,31 @@ fn input_hint(mode: Mode) -> &'static str {
     } else {
         "NORMAL — j/k messages · yy copy Markdown · i type · : commands"
     }
+}
+
+fn format_context_usage(usage: Option<&ContextUsage>) -> String {
+    let Some(usage) = usage.filter(|usage| usage.limit_tokens > 0) else {
+        return "Context: —".into();
+    };
+    let remaining = usage.limit_tokens.saturating_sub(usage.used_tokens);
+    let percent = remaining as f64 / usage.limit_tokens as f64 * 100.;
+    format!(
+        "Context: {percent:.0}% left · {} / {} tokens",
+        format_tokens(remaining),
+        format_tokens(usage.limit_tokens),
+    )
+}
+
+fn format_tokens(tokens: u64) -> String {
+    let (scale, suffix) = if tokens >= 1_000_000 {
+        (1_000_000., "M")
+    } else if tokens >= 1_000 {
+        (1_000., "k")
+    } else {
+        return tokens.to_string();
+    };
+    let value = format!("{:.1}", tokens as f64 / scale);
+    format!("{}{suffix}", value.trim_end_matches(".0"))
 }
 
 /// The `@` mention being typed and the files that match it.
@@ -81,6 +106,8 @@ impl ComposerView {
                     input.set_selected_range(selection, cx);
                 });
             }
+            // The footer also depends on session state, even when the draft is unchanged.
+            cx.notify();
         })
         .detach();
         cx.subscribe_in(&session, window, |this, _, change, window, cx| {
@@ -363,6 +390,8 @@ impl View for Composer {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         self.state.update(cx, |state, cx| {
             let mode = *cx.global::<Mode>();
+            let context_usage =
+                format_context_usage(state.session.read(cx).context_usage.as_ref());
             div()
                 .key_context(input_shortcuts::CONTEXT)
                 // Capture Ctrl+Enter before the textarea inserts a newline.
@@ -390,14 +419,26 @@ impl View for Composer {
                 }))
                 .relative()
                 .flex()
+                .flex_col()
+                .gap_2()
                 .p_4()
                 .border_t_1()
                 .border_color(cx.theme().border)
                 .child(
                     Textarea::new(&state.input)
-                        .flex_1()
+                        .w_full()
                         .readonly(mode != Mode::Insert)
                         .aria_label("Message to pi"),
+                )
+                .child(
+                    div()
+                        .id("context-usage")
+                        .role(Role::Status)
+                        .aria_label(context_usage.clone())
+                        .text_xs()
+                        .text_right()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(context_usage),
                 )
                 .children(state.render_mention(cx))
         })

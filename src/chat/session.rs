@@ -4,7 +4,7 @@ use gpui_kit::{
     component::{WindowExt as _, notification::Notification},
 };
 
-use crate::agent::{AgentEvent, Message, OpenedChat, PromptRequest};
+use crate::agent::{AgentEvent, ContextUsage, Message, OpenedChat, PromptRequest};
 
 /// A conversation and draft shared by every pane displaying this session.
 /// The single receiver lives here, not in a view: splitting must not distribute
@@ -13,6 +13,7 @@ pub(crate) struct ChatSession {
     pub(crate) number: usize,
     pub(super) messages: Vec<Message>,
     pub(super) draft: SharedString,
+    pub(super) context_usage: Option<ContextUsage>,
     pub(super) prompts: Sender<PromptRequest>,
     assistant: Option<usize>,
     _events: Task<()>,
@@ -46,14 +47,16 @@ impl ChatSession {
                     .update_in(cx, |this, window, cx| this.apply_event(event, window, cx))
                     .is_err()
                 {
-                    break;
+                    return;
                 }
             }
+            let _ = this.update_in(cx, |this, _, cx| this.set_context_usage(None, cx));
         });
         Self {
             number,
             messages,
             draft: "".into(),
+            context_usage: None,
             prompts: agent.prompt_sender(),
             assistant: None,
             _events: task,
@@ -76,6 +79,13 @@ impl ChatSession {
     pub(super) fn set_draft(&mut self, draft: SharedString, cx: &mut Context<Self>) {
         if self.draft != draft {
             self.draft = draft;
+            cx.notify();
+        }
+    }
+
+    fn set_context_usage(&mut self, usage: Option<ContextUsage>, cx: &mut Context<Self>) {
+        if self.context_usage != usage {
+            self.context_usage = usage;
             cx.notify();
         }
     }
@@ -117,6 +127,7 @@ impl ChatSession {
                     self.append(Message::Assistant(text), cx);
                 }
             }
+            AgentEvent::ContextUsageUpdated(usage) => self.set_context_usage(usage, cx),
             AgentEvent::PromptFinished => {}
             AgentEvent::Error(error) => {
                 window

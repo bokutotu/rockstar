@@ -15,7 +15,8 @@ use futures_lite::future::{block_on, or};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{
-    self, AgentBackend, AgentError, AgentEvent, ChatStart, Message, OpenedChat, PromptRequest,
+    self, AgentBackend, AgentError, AgentEvent, ChatStart, ContextUsage, Message, OpenedChat,
+    PromptRequest,
 };
 
 mod sessions;
@@ -28,6 +29,7 @@ enum PiOutgoingRecord {
     Prompt { id: String, message: String },
     GetState { id: String },
     GetEntries { id: String },
+    GetSessionStats { id: String },
     ExtensionUiResponse { id: String, cancelled: bool },
 }
 
@@ -49,6 +51,7 @@ enum PiIncomingRecord {
     MessageEnd {
         message: PiMessage,
     },
+    CompactionEnd,
     ExtensionUiRequest(ExtensionUiRequest),
     ExtensionError {
         error: String,
@@ -63,6 +66,8 @@ enum PiResponse {
     Prompt(CommandResponse<PromptResponseData>),
     GetState(CommandResponse<SessionState>),
     GetEntries(CommandResponse<SessionEntries>),
+    // Optional status data must not break the chat if its payload is invalid.
+    GetSessionStats(WireCommandResponse<serde_json::Value>),
     #[serde(other)]
     Other,
 }
@@ -73,6 +78,7 @@ impl PiResponse {
             Self::Prompt(response) => response.id.as_deref(),
             Self::GetState(response) => response.id.as_deref(),
             Self::GetEntries(response) => response.id.as_deref(),
+            Self::GetSessionStats(response) => response.id.as_deref(),
             Self::Other => None,
         }
     }
@@ -82,6 +88,19 @@ impl PiResponse {
 #[serde(rename_all = "camelCase")]
 struct SessionState {
     session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PiSessionStats {
+    context_usage: Option<PiContextUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PiContextUsage {
+    tokens: Option<u64>,
+    context_window: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,6 +238,8 @@ struct PiCodingAgent {
     input: ChildStdin,
     records: Receiver<Result<PiIncomingRecord, AgentError>>,
     next_request_id: u64,
+    context_request_id: Option<String>,
+    context_dirty: bool,
 }
 
 impl Drop for PiCodingAgent {
@@ -297,6 +318,8 @@ pub(crate) fn connect(cwd: &Path, start: ChatStart) -> Result<OpenedChat, AgentE
         input,
         records,
         next_request_id: 0,
+        context_request_id: None,
+        context_dirty: true,
     };
     let _ = thread::Builder::new()
         .name("pi-stdout".into())
@@ -420,6 +443,8 @@ impl PiCodingAgent {
                 self.write_record(&record)?;
                 active = Some(request);
             }
+            // Status requests run independently of prompts and never hold up the queue.
+            self.request_context_usage()?;
             let incoming = or(
                 async {
                     backend.events.closed().await;
@@ -441,6 +466,14 @@ impl PiCodingAgent {
                 Incoming::ResultsClosed => return Ok(()),
             };
             self.handle_extension(&record)?;
+            if matches!(
+                record,
+                PiIncomingRecord::MessageEnd { .. }
+                    | PiIncomingRecord::AgentSettled { .. }
+                    | PiIncomingRecord::CompactionEnd
+            ) {
+                self.context_dirty = true;
+            }
             if let Some(event) = decode_event(&record)
                 && backend.events.try_send(event).is_err()
             {
@@ -451,11 +484,49 @@ impl PiCodingAgent {
                 .and_then(|request| request.handle_record(&record))
             {
                 active = None;
+                // Also refresh after commands handled without an agent run.
+                self.context_dirty = true;
                 if backend.events.try_send(event).is_err() {
                     return Ok(());
                 }
             }
+            if let PiIncomingRecord::Response(PiResponse::GetSessionStats(response)) = record
+                && response.id.is_some()
+                && response.id == self.context_request_id
+            {
+                self.context_request_id = None;
+                // A newer message or compaction invalidates the in-flight snapshot.
+                // The next loop requests one fresh snapshot for all intervening changes.
+                if self.context_dirty {
+                    continue;
+                }
+                let usage = if response.success {
+                    response
+                        .data
+                        .and_then(|data| serde_json::from_value(data).ok())
+                        .and_then(decode_context_usage)
+                } else {
+                    None
+                };
+                if backend
+                    .events
+                    .try_send(AgentEvent::ContextUsageUpdated(usage))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
         }
+    }
+
+    fn request_context_usage(&mut self) -> Result<(), AgentError> {
+        if self.context_dirty && self.context_request_id.is_none() {
+            let id = self.next_id();
+            self.write_record(&PiOutgoingRecord::GetSessionStats { id: id.clone() })?;
+            self.context_request_id = Some(id);
+            self.context_dirty = false;
+        }
+        Ok(())
     }
 
     fn next_id(&mut self) -> String {
@@ -575,6 +646,15 @@ impl ActiveRequest {
     }
 }
 
+fn decode_context_usage(stats: PiSessionStats) -> Option<ContextUsage> {
+    let usage = stats.context_usage?;
+    let used_tokens = usage.tokens?;
+    (usage.context_window > 0).then_some(ContextUsage {
+        used_tokens,
+        limit_tokens: usage.context_window,
+    })
+}
+
 fn decode_event(record: &PiIncomingRecord) -> Option<AgentEvent> {
     match record {
         PiIncomingRecord::MessageStart {
@@ -592,6 +672,7 @@ fn decode_event(record: &PiIncomingRecord) -> Option<AgentEvent> {
         PiIncomingRecord::MessageEnd {
             message: PiMessage::Assistant { content, .. },
         } => Some(AgentEvent::AssistantFinished(message_text(content))),
+        PiIncomingRecord::CompactionEnd => Some(AgentEvent::ContextUsageUpdated(None)),
         _ => None,
     }
 }

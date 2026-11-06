@@ -37,12 +37,20 @@ pub struct PromptRequest {
     pub text: String,
 }
 
+/// Current context-window usage, not cumulative session token consumption.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextUsage {
+    pub used_tokens: u64,
+    pub limit_tokens: u64,
+}
+
 #[derive(Debug)]
 pub enum AgentEvent {
     UserMessage(String),
     AssistantStarted,
     AssistantTextDelta(String),
     AssistantFinished(String),
+    ContextUsageUpdated(Option<ContextUsage>),
     PromptFinished,
     Error(AgentError),
 }
