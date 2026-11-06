@@ -28,6 +28,10 @@ impl ConversationView {
             .collect();
         cx.subscribe(session, |this, _, change, cx| {
             match change {
+                ConversationChange::Reset => {
+                    this.messages.clear();
+                    this.scroll = ScrollHandle::new();
+                }
                 ConversationChange::Append(message) => {
                     this.messages.push(ChatMessage::new(message.clone(), cx))
                 }
@@ -58,7 +62,7 @@ impl Render for ConversationView {
         div()
             .id("conversation")
             .test_support()
-            .flex_1()
+            .size_full()
             .min_h_0()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)

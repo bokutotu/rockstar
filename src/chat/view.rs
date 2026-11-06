@@ -3,7 +3,8 @@ use std::{collections::HashMap, path::Path};
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EntityId, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, Role,
-    StatefulInteractiveElement as _, Styled as _, Window, base::TestSupportExt as _, div,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, Window,
+    base::TestSupportExt as _, div,
 };
 
 use super::{
@@ -93,7 +94,13 @@ impl Render for ChatPane {
             .relative()
             .flex()
             .flex_col()
-            .child(views.conversation.clone())
+            // Typing in the composer must not rebuild the unchanged conversation.
+            .child(
+                views
+                    .conversation
+                    .clone()
+                    .cached(StyleRefinement::default().flex_1().min_h_0().w_full()),
+            )
             .child(Composer::new(&views.composer))
     }
 }

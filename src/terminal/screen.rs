@@ -2,10 +2,10 @@ use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
     grid::Dimensions,
-    index::{Column, Line, Point},
+    index::Line,
     term::{
         cell::{Cell, Flags},
-        color::Colors,
+        color::{COUNT, Colors},
     },
     vte::ansi::{Color, NamedColor, Rgb},
 };
@@ -74,21 +74,15 @@ pub(super) struct Screen {
 }
 impl Screen {
     /// Scroll offsets belong to views, not the shared terminal emulator.
-    pub fn rows(&self, offset: usize) -> Vec<Vec<Cell>> {
+    pub fn row(&self, row: usize, offset: usize) -> &[Cell] {
         let offset = offset.min(self.term.history_size());
-        (0..self.term.screen_lines())
-            .map(|row| {
-                let line = Line(row as i32 - offset as i32);
-                (0..self.term.columns())
-                    .map(|column| self.term.grid()[Point::new(line, Column(column))].clone())
-                    .collect()
-            })
-            .collect()
+        &self.term.grid()[Line(row as i32 - offset as i32)][..]
     }
+
+    #[cfg(test)]
     pub fn text(&self, offset: usize) -> String {
-        self.rows(offset)
-            .iter()
-            .map(|row| row_text(row))
+        (0..self.term.screen_lines())
+            .map(|row| row_text(self.row(row, offset)))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -108,15 +102,44 @@ pub(super) fn row_text(row: &[Cell]) -> String {
             text.extend(zero);
         }
     }
-    text.trim_end().to_owned()
+    text.truncate(text.trim_end().len());
+    text
 }
 
-// A fixed ANSI palette, with default foreground/background matching a dark
-// terminal surface. OSC palette overrides are respected by the renderer.
+/// Resolve the app's theme and OSC overrides once, rather than for every cell.
+pub(super) fn palette(
+    overrides: &Colors,
+    foreground: gpui_kit::Hsla,
+    background: gpui_kit::Hsla,
+) -> [Rgb; COUNT] {
+    let to_rgb = |color: gpui_kit::Hsla| {
+        let color = color.to_rgb();
+        Rgb {
+            r: (color.r * 255.).round() as u8,
+            g: (color.g * 255.).round() as u8,
+            b: (color.b * 255.).round() as u8,
+        }
+    };
+    let foreground = to_rgb(foreground);
+    let background = to_rgb(background);
+    std::array::from_fn(|index| {
+        overrides[index].unwrap_or_else(|| {
+            if index == NamedColor::Background as usize {
+                background
+            } else if index >= 256 {
+                foreground
+            } else {
+                indexed_color(index)
+            }
+        })
+    })
+}
+
+// ANSI colors for a light terminal surface. The color cube, grayscale, and RGB colors are unchanged.
 pub(super) fn indexed_color(index: usize) -> Rgb {
     const ANSI: [u32; 16] = [
-        0x1e1e2e, 0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xcba6f7, 0x94e2d5, 0xcdd6f4, 0x585b70,
-        0xf38ba8, 0xa6e3a1, 0xf9e2af, 0x89b4fa, 0xf5c2e7, 0x94e2d5, 0xffffff,
+        0x4c4f69, 0xd20f39, 0x40a02b, 0xdf8e1d, 0x1e66f5, 0x8839ef, 0x179299, 0xbcc0cc, 0x5c5f77,
+        0xd20f39, 0x40a02b, 0xdf8e1d, 0x1e66f5, 0xea76cb, 0x04a5e5, 0xeff1f5,
     ];
     let hex = if index < 16 {
         ANSI[index]
@@ -128,9 +151,9 @@ pub(super) fn indexed_color(index: usize) -> Rgb {
         let c = (8 + (index - 232) * 10) as u32;
         c << 16 | c << 8 | c
     } else if index == NamedColor::Background as usize {
-        0x1e1e2e
+        0xffffff
     } else {
-        0xcdd6f4
+        0x0a0a0a
     };
     Rgb {
         r: (hex >> 16) as u8,
@@ -138,12 +161,10 @@ pub(super) fn indexed_color(index: usize) -> Rgb {
         b: hex as u8,
     }
 }
-pub(super) fn color(color: Color, overrides: &Colors) -> Rgb {
+pub(super) fn color(color: Color, palette: &[Rgb; COUNT]) -> Rgb {
     match color {
         Color::Spec(rgb) => rgb,
-        Color::Indexed(i) => overrides[i as usize].unwrap_or_else(|| indexed_color(i as usize)),
-        Color::Named(name) => {
-            overrides[name as usize].unwrap_or_else(|| indexed_color(name as usize))
-        }
+        Color::Indexed(i) => palette[i as usize],
+        Color::Named(name) => palette[name as usize],
     }
 }

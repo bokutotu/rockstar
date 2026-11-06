@@ -36,10 +36,8 @@
           };
           renderEnvironment = {
             FONTCONFIG_FILE = fontconfigFile;
-            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath libraries;
-            VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
-            __EGL_VENDOR_LIBRARY_FILENAMES = "${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json";
-            LIBGL_ALWAYS_SOFTWARE = "1";
+            # Use the host GPU driver for both the application and cargo test.
+            LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath libraries}:/run/opengl-driver/lib";
           };
         in
         {
@@ -74,17 +72,13 @@
               cargoLock.lockFile = ./Cargo.lock;
 
               nativeBuildInputs = nativeBuildInputs ++ [ pkgs.makeWrapper ];
-              nativeCheckInputs = [ pkgs.gitMinimal pkgs.python3 ];
               buildInputs = libraries;
-              preCheck = ''
-                unset DISPLAY WAYLAND_DISPLAY
-                export XDG_RUNTIME_DIR
-                XDG_RUNTIME_DIR="$(mktemp -d)"
-              '';
+              # Tests are run directly with cargo test, not inside the build sandbox.
+              doCheck = false;
 
               postFixup = ''
                 wrapProgram "$out/bin/rockstar" \
-                  --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath libraries}" \
+                  --prefix LD_LIBRARY_PATH : "${renderEnvironment.LD_LIBRARY_PATH}" \
                   --prefix PATH : "${
                     pkgs.lib.makeBinPath [
                       pkgs.xdg-utils

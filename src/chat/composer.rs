@@ -14,7 +14,10 @@ use gpui_kit::{
     prelude::FluentBuilder as _,
 };
 
-use super::{ime::observe_ime_position, session::ChatSession};
+use super::{
+    ime::observe_ime_position,
+    session::{ChatSession, ConversationChange},
+};
 
 use crate::{
     agent::{DISCONNECTED_MESSAGE, PromptRequest},
@@ -78,6 +81,12 @@ impl ComposerView {
                     input.set_value(draft, window, cx);
                     input.set_selected_range(selection, cx);
                 });
+            }
+        })
+        .detach();
+        cx.subscribe_in(&session, window, |this, _, change, window, cx| {
+            if matches!(change, ConversationChange::Reset) {
+                this.clear(window, cx);
             }
         })
         .detach();
@@ -148,8 +157,9 @@ impl ComposerView {
         let found = file_search::mention_at(&text, input.cursor())
             .map(|(start, query)| (start, query.to_string()));
         let Some((start, query)) = found else {
-            self.mention = None;
-            cx.notify();
+            if self.mention.take().is_some() {
+                cx.notify();
+            }
             return;
         };
         if self.mention.is_none() {

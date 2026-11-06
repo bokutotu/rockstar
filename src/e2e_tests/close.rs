@@ -221,6 +221,7 @@ fn close_before_new_finishes_discards_the_connection_even_if_the_pane_index_is_r
     app.type_text("Shared draft");
     app.press("escape");
     app.split_pane("v");
+    app.press("ctrl-n"); // Reset a shared session, then close the requesting pane.
 
     // Do not drive the executor between these commands. The connection result
     // arrives only after its destination is gone and another pane has its index.

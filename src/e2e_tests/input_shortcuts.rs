@@ -1,5 +1,6 @@
 //! Exercise editing through the production window, without inspecting editor state.
 use super::*;
+use crate::agent::AgentEvent;
 
 #[derive(Clone, Copy, Debug)]
 enum Field {
@@ -330,22 +331,133 @@ fn edited_drafts_are_shared_between_panes_and_submit_once() {
             .collect();
         assert_eq!(drafts, ["", ""]);
     });
+
+    app.backend
+        .events
+        .try_send(AgentEvent::UserMessage("Shared history".into()))
+        .unwrap();
+    app.type_text("Shared draft to reset");
+    app.press("escape");
+    let panes = app.assert_active_pane(1);
+    app.command("new");
+    for _ in 0..200 {
+        app.ui(|_, _| {});
+        if app.backend.events.is_closed() {
+            break;
+        }
+        app.cx.advance_clock(Duration::from_millis(10));
+    }
+    assert!(app.backend.events.is_closed());
+    let reset = app.new_backends.try_recv().unwrap();
+    app.ui(|window, _| {
+        assert_eq!(window.within("open-items").find_all_by_role(Role::Tab).len(), 1);
+        assert_eq!(window.find_all("chat").len(), 2);
+        for chat in window.find_all("chat") {
+            assert_eq!(chat.label(), Some("Chat 1"));
+        }
+        for input in window.find_all_by_label("Message to pi") {
+            assert_eq!(input.value(), Some(""));
+        }
+        assert!(window.find_all(("message", 0_usize)).is_empty());
+    });
+    assert_eq!(app.assert_active_pane(1), panes);
+    reset
+        .events
+        .try_send(AgentEvent::UserMessage("New shared history".into()))
+        .unwrap();
+    app.press("i");
+    app.press("ctrl-z");
+    app.type_text("New shared draft");
+    app.ui(|window, _| {
+        assert_eq!(window.find_all(("message", 0_usize)).len(), 2);
+        for input in window.find_all_by_label("Message to pi") {
+            assert_eq!(input.value(), Some("New shared draft"));
+        }
+    });
+    app.press("ctrl-enter");
+    assert_eq!(reset.prompts.try_recv().unwrap().text, "New shared draft");
+    assert!(reset.prompts.is_empty());
 }
 
 #[test]
-fn edited_command_opens_a_new_chat() {
-    let mut app = Field::Command.open();
+fn edited_command_resets_the_current_chat() {
+    let mut app = Field::Message.open();
+    for event in [
+        AgentEvent::UserMessage("Old question".into()),
+        AgentEvent::AssistantStarted,
+        AgentEvent::AssistantTextDelta("Old partial answer".into()),
+    ] {
+        app.backend.events.try_send(event).unwrap();
+    }
+    app.type_text("Old draft");
+    for key in ["ctrl-home", "shift-right", "escape"] {
+        app.press(key);
+    }
+    let mut before = None;
+    app.ui(|window, _| {
+        assert!(window.find(("message", 1_usize)).visible());
+        before = Some((
+            window.find("chat").path().to_vec(),
+            window.find("pane").bounds(),
+            window.within("open-items").find_by_label("Chat 1").path().to_vec(),
+        ));
+    });
+    app.press(":");
     app.type_text("new trailing");
     app.press("ctrl-w");
     Field::Command.assert_value(&mut app, "new ");
     app.press("enter");
-    app.wait_for_chat(2);
+    for _ in 0..200 {
+        app.ui(|_, _| {});
+        if app.backend.events.is_closed() {
+            break;
+        }
+        app.cx.advance_clock(Duration::from_millis(10));
+    }
+    assert!(app.backend.prompts.is_closed());
+    assert!(app.backend.events.is_closed());
+    assert!(
+        app.backend
+            .events
+            .try_send(AgentEvent::AssistantTextDelta("Late answer".into()))
+            .is_err()
+    );
+    let reset = app.new_backends.try_recv().unwrap();
+    app.assert_popup(false);
     app.ui(|window, _| {
-        assert_eq!(window.find("chat").label(), Some("Chat 2"));
+        assert_eq!(window.find_all("pane").len(), 1);
+        assert_eq!(window.within("open-items").find_all_by_role(Role::Tab).len(), 1);
+        assert_eq!(window.find("chat").label(), Some("Chat 1"));
+        assert!(window.try_find(("message", 0_usize)).is_none());
+        assert_eq!(
+            Some((
+                window.find("chat").path().to_vec(),
+                window.find("pane").bounds(),
+                window.within("open-items").find_by_label("Chat 1").path().to_vec(),
+            )),
+            before
+        );
     });
     app.press("i");
+    app.press("ctrl-z");
+    Field::Message.assert_value(&mut app, "");
     app.type_text("New draft");
     Field::Message.assert_value(&mut app, "New draft");
+    app.press("ctrl-enter");
+    assert_eq!(reset.prompts.try_recv().unwrap().text, "New draft");
+    assert!(reset.prompts.is_empty());
+    for event in [
+        AgentEvent::UserMessage("New draft".into()),
+        AgentEvent::AssistantTextDelta("New answer".into()),
+        AgentEvent::AssistantFinished("New answer".into()),
+    ] {
+        reset.events.try_send(event).unwrap();
+    }
+    app.ui(|window, _| {
+        assert!(window.find(("message", 0_usize)).visible());
+        assert!(window.find(("message", 1_usize)).visible());
+        assert!(window.try_find(("message", 2_usize)).is_none());
+    });
 }
 
 #[test]

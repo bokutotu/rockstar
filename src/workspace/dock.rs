@@ -3,12 +3,15 @@
 use std::{rc::Rc, sync::Arc};
 
 use gpui_kit::{
-    AnyElement, AnyView, App, AppContext as _, Axis, Div, Entity, Stateful, Styled as _, Window,
+    AnyElement, AnyView, App, AppContext as _, Axis, Div, Entity, InteractiveElement as _,
+    IntoElement as _, ParentElement as _, Stateful, StatefulInteractiveElement as _, Styled as _,
+    Window,
     base::{ElementExt as _, ResizeHandleContext},
     component::dock::{
         BasePanelView, DockArea, DockAreaRenderer, DockContext, DockSkin, DropIndicator, NodeId,
         PanelState, TabGroupContext, TabGroupRenderer,
     },
+    div,
 };
 
 use crate::pane::Pane;
@@ -117,7 +120,24 @@ impl TabGroupRenderer for PaneFrameSkin {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        self.0.render_active_panel(panel, group, window, cx)
+        let is_chat = panel
+            .clone()
+            .downcast::<Pane>()
+            .is_ok_and(|pane| pane.read(cx).session(cx).is_some());
+        if is_chat && !group.is_collapsed() {
+            // The default panel cache forces all nested caches to refresh when
+            // a descendant changes. Let chat cache its conversation separately
+            // so composer edits do not invalidate the Markdown subtree.
+            div()
+                .id("tab-content")
+                .overflow_y_scroll()
+                .overflow_x_hidden()
+                .flex_1()
+                .child(div().absolute().size_full().child(panel))
+                .into_any_element()
+        } else {
+            self.0.render_active_panel(panel, group, window, cx)
+        }
     }
 
     fn render_drop_indicator(

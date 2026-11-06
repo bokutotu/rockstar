@@ -255,7 +255,8 @@ impl Workspace {
     }
 
     pub(crate) fn show_chat(&mut self, fresh: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if !fresh && self.panes[self.active].read(cx).session(cx).is_some() {
+        let session = self.panes[self.active].read(cx).session(cx);
+        if !fresh && session.is_some() {
             return;
         }
         let pane = self.panes[self.active].clone();
@@ -278,8 +279,11 @@ impl Workspace {
                 else {
                     return;
                 };
-                match result {
-                    Ok(agent) => {
+                match (result, session) {
+                    (Ok(agent), Some(session)) => {
+                        session.update(cx, |session, cx| session.reset(agent, window, cx));
+                    }
+                    (Ok(agent), None) => {
                         let number = this
                             .items
                             .iter()
@@ -293,7 +297,7 @@ impl Workspace {
                             this.show_titles(cx);
                         }
                     }
-                    Err(error) => window.push_notification(
+                    (Err(error), _) => window.push_notification(
                         Notification::error(error.to_string()).autohide(false),
                         cx,
                     ),

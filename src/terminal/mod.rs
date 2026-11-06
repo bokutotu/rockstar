@@ -1,4 +1,5 @@
 //! Retained PTY sessions and per-pane terminal views.
+mod cache;
 mod keys;
 mod process;
 mod screen;
@@ -7,7 +8,7 @@ mod view;
 use alacritty_terminal::event::Event;
 use gpui_kit::{
     AppContext as _, ClipboardItem, Context, Task, Window,
-    component::{WindowExt as _, notification::Notification},
+    component::{ActiveTheme as _, WindowExt as _, notification::Notification},
 };
 use portable_pty::CommandBuilder;
 use process::Command;
@@ -69,8 +70,11 @@ impl TerminalSession {
                                 Event::ColorRequest(index, format) => {
                                     let rgb = {
                                         let screen = this.process.screen.lock().unwrap();
-                                        screen.term.colors()[index]
-                                            .unwrap_or_else(|| screen::indexed_color(index))
+                                        screen::palette(
+                                            screen.term.colors(),
+                                            cx.theme().foreground,
+                                            cx.theme().background,
+                                        )[index]
                                     };
                                     let _ =
                                         this.process.send(Command::Write(format(rgb).into_bytes()));

@@ -153,11 +153,18 @@ impl Process {
     pub(super) fn send(&self, command: Command) -> Result<()> {
         self.commands
             .try_send(command)
-            .map_err(|error| anyhow::anyhow!("Terminal input unavailable: {error}"))
+            .map_err(|error| anyhow::anyhow!("Terminal input unavailable: {error}"))?;
+        if let Some(worker) = &self.worker {
+            worker.thread().unpark();
+        }
+        Ok(())
     }
 
     pub fn shutdown(&mut self) -> Option<JoinHandle<()>> {
         self.stop.store(true, Ordering::Release);
+        if let Some(worker) = &self.worker {
+            worker.thread().unpark();
+        }
         // Also signal synchronously: even if the application exits before the
         // worker is scheduled again, the shell/foreground job cannot outlive it.
         if let Some(child) = self.child.lock().unwrap().as_mut() {
@@ -263,7 +270,8 @@ fn run(
             let _ = events.try_send(Event::Wakeup);
             break;
         }
-        thread::sleep(Duration::from_millis(8));
+        // Input wakes this wait immediately; do not add a polling delay to every key.
+        thread::park_timeout(Duration::from_millis(8));
     }
     // Keep the master alive until ChildControl is removed: it stores its fd.
     let child = child.lock().unwrap().take();

@@ -1,19 +1,32 @@
 use super::*;
 
 #[test]
-fn source_editing_and_saving_work_when_pi_is_unavailable() {
+fn chat_contents_and_source_editing_survive_pi_connection_failure() {
     let project = Project::new(&[("main.rs", "hello\n")]);
+    let (agent, backend) = mock_agent();
+    let first = std::sync::Mutex::new(Some(agent));
     let mut app = Driver::open_using(
         project.0.clone(),
-        Some(Arc::new(|_| anyhow::bail!("pi unavailable"))),
+        Some(Arc::new(move |_| {
+            first
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("pi unavailable"))
+        })),
     );
     app.cx.update(|cx| cx.set_reduce_motion(true));
     app.ui(|window, _| assert_eq!(window.find("plain").label(), Some("Plain")));
-    app.open_file("main.rs", &project.0.join("main.rs"));
-    app.press("A");
-    app.type_text(" world");
-    app.press("escape");
     app.command("chat");
+    app.wait_for_chat(1);
+    backend
+        .events
+        .try_send(crate::agent::AgentEvent::UserMessage("Keep history".into()))
+        .unwrap();
+    app.press("i");
+    app.type_text("Keep draft");
+    app.press("escape");
+    app.command("new");
     for _ in 0..200 {
         let mut shown = false;
         app.ui(|window, _| shown = window.find_all("notification").iter().any(|e| e.visible()));
@@ -22,9 +35,34 @@ fn source_editing_and_saving_work_when_pi_is_unavailable() {
         }
         app.cx.advance_clock(Duration::from_millis(10));
     }
-    app.assert_sources(&["hello world\n"]);
+    app.assert_draft("Keep draft");
     app.ui(|window, _| {
         assert!(window.find("notification").visible());
+        assert!(window.find(("message", 0_usize)).visible());
+        assert_eq!(window.find("chat").label(), Some("Chat 1"));
+        assert_eq!(window.within("open-items").find_all_by_role(Role::Tab).len(), 1);
+    });
+    assert!(!backend.events.is_closed());
+    app.press("i");
+    app.press("ctrl-enter");
+    assert_eq!(backend.prompts.try_recv().unwrap().text, "Keep draft");
+    app.press("escape");
+    app.open_file("main.rs", &project.0.join("main.rs"));
+    app.press("A");
+    app.type_text(" world");
+    app.press("escape");
+    app.command("chat");
+    for _ in 0..200 {
+        let mut shown = false;
+        app.ui(|window, _| shown = window.find_all("notification").len() == 2);
+        if shown {
+            break;
+        }
+        app.cx.advance_clock(Duration::from_millis(10));
+    }
+    app.assert_sources(&["hello world\n"]);
+    app.ui(|window, _| {
+        assert_eq!(window.find_all("notification").len(), 2);
         assert_eq!(window.find_by_label("Source code").focused(), Some(true));
     });
     app.command("w");

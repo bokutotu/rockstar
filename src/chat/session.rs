@@ -19,6 +19,7 @@ pub(crate) struct ChatSession {
 }
 
 pub(super) enum ConversationChange {
+    Reset,
     Append(Message),
     AppendText(usize, String),
     Replace(usize, Message),
@@ -53,6 +54,14 @@ impl ChatSession {
             assistant: None,
             _events: task,
         }
+    }
+
+    /// Keep this session's identity while replacing its conversation and connection.
+    pub(crate) fn reset(&mut self, agent: Agent, window: &mut Window, cx: &mut Context<Self>) {
+        // Dropping the old receiver task prevents late replies from entering the new chat.
+        *self = Self::new(agent, self.number, window, cx);
+        cx.emit(ConversationChange::Reset);
+        cx.notify();
     }
 
     pub(super) fn set_draft(&mut self, draft: SharedString, cx: &mut Context<Self>) {

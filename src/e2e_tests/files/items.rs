@@ -160,9 +160,10 @@ fn chat_draft_caret_and_viewport_survive_file_and_chat_switches() {
             .map(|i| Message::User(format!("Message {i}")))
             .collect(),
     );
+    app.open_file("main.txt", &project.0.join("main.txt"));
     app.command("new");
     app.wait_for_chat(2);
-    app.open_file("main.txt", &project.0.join("main.txt"));
+    let second = app.new_backends.try_recv().unwrap();
     app.click_item("Chat 1");
     app.press("i");
     app.type_text("alpha beta");
@@ -192,7 +193,7 @@ fn chat_draft_caret_and_viewport_survive_file_and_chat_switches() {
     app.click_item("Chat 2");
     app.press("i");
     app.type_text("second draft");
-    app.keys(&["escape", "ctrl-p"]);
+    app.keys(&["escape", "ctrl-n"]);
     app.assert_draft("alpha beta");
     app.ui(|window, _| {
         assert_eq!(window.find(("message", 0_usize)).bounds().origin, origin);
@@ -201,9 +202,38 @@ fn chat_draft_caret_and_viewport_survive_file_and_chat_switches() {
     app.press("i");
     app.type_text("|");
     app.assert_draft("alpha |beta");
-    app.keys(&["escape", "ctrl-n"]);
+    app.keys(&["escape", "ctrl-p"]);
     app.assert_draft("second draft");
     app.assert_no_requests();
+
+    // Resetting the scrolled chat clears its view without replacing or reordering items.
+    app.click_item("Chat 1");
+    let labels = ["Chat 1", "main.txt", "Chat 2"];
+    app.assert_items(&labels, Some("Chat 1"));
+    app.command("new");
+    for _ in 0..200 {
+        app.ui(|_, _| {});
+        if app.backend.events.is_closed() {
+            break;
+        }
+        app.cx.advance_clock(Duration::from_millis(10));
+    }
+    assert!(app.backend.events.is_closed());
+    app.assert_items(&labels, Some("Chat 1"));
+    app.assert_draft("");
+    app.ui(|window, _| assert!(window.try_find(("message", 0_usize)).is_none()));
+    let reset = app.new_backends.try_recv().unwrap();
+    reply_with_messages(&reset.events, vec![Message::User("New conversation".into())]);
+    app.ui(|window, _| {
+        let message = window.find(("message", 0_usize));
+        assert!(message.visible());
+        assert!(message.bounds().top() >= window.find("conversation").bounds().top());
+        assert_eq!(window.find("open-items").bounds(), bar);
+    });
+    app.click_item("Chat 2");
+    app.assert_draft("second draft");
+    assert!(!second.prompts.is_closed());
+    assert!(!second.events.is_closed());
 }
 
 #[test]
@@ -363,33 +393,47 @@ fn item_bar_scrolls_horizontally_reveals_selection_and_stays_above_the_document(
 
 #[test]
 fn selecting_an_item_discards_a_late_chat_connection() {
-    let project = Project::new(&[("main.txt", "source")]);
-    let mut app = Driver::open_in(project.0.clone());
-    app.open_file("main.txt", &project.0.join("main.txt"));
-    // Queue the connection and select an existing item before driving background work.
-    app.cx
-        .update_window(app.window, |_, window, cx| window.press(":", cx))
-        .unwrap();
-    app.cx
-        .update_window(app.window, |_, window, cx| window.input("new", cx))
-        .unwrap();
-    app.cx
-        .update_window(app.window, |_, window, cx| window.press("enter", cx))
-        .unwrap();
-    app.cx
-        .update_window(app.window, |_, window, cx| {
-            window.render_frame(cx);
-            let item = window.within("open-items").find_by_label("Chat 1");
-            window
-                .within("open-items")
-                .click(item.path().last().unwrap().clone(), cx);
-        })
-        .unwrap();
-    app.assert_items(&["Chat 1", "main.txt"], Some("Chat 1"));
-    app.ui(|window, _| assert_eq!(window.find("chat").label(), Some("Chat 1")));
-    let discarded = app.new_backends.try_recv().unwrap();
-    assert!(discarded.prompts.is_closed());
-    assert!(discarded.events.is_closed());
+    for reset in [false, true] {
+        let project = Project::new(&[("main.txt", "source")]);
+        let mut app = Driver::open_in(project.0.clone());
+        reply_with_messages(&app.backend.events, vec![Message::User("Keep history".into())]);
+        app.press("i");
+        app.type_text("Keep draft");
+        app.press("escape");
+        app.open_file("main.txt", &project.0.join("main.txt"));
+        if reset {
+            app.click_item("Chat 1");
+        }
+        let selected = if reset { "main.txt" } else { "Chat 1" };
+        // Queue the connection and select an existing item before driving background work.
+        app.cx
+            .update_window(app.window, |_, window, cx| window.press(":", cx))
+            .unwrap();
+        app.cx
+            .update_window(app.window, |_, window, cx| window.input("new", cx))
+            .unwrap();
+        app.cx
+            .update_window(app.window, |_, window, cx| window.press("enter", cx))
+            .unwrap();
+        app.cx
+            .update_window(app.window, |_, window, cx| {
+                window.render_frame(cx);
+                let item = window.within("open-items").find_by_label(selected);
+                window
+                    .within("open-items")
+                    .click(item.path().last().unwrap().clone(), cx);
+            })
+            .unwrap();
+        app.assert_items(&["Chat 1", "main.txt"], Some(selected));
+        let discarded = app.new_backends.try_recv().unwrap();
+        assert!(discarded.prompts.is_closed());
+        assert!(discarded.events.is_closed());
+        app.click_item("Chat 1");
+        app.assert_draft("Keep draft");
+        app.ui(|window, _| assert!(window.find(("message", 0_usize)).visible()));
+        assert!(!app.backend.prompts.is_closed());
+        assert!(!app.backend.events.is_closed());
+    }
 }
 
 #[test]

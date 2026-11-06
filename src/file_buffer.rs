@@ -77,12 +77,16 @@ impl FileBuffer {
     }
 
     pub(crate) fn dirty(&self) -> bool {
-        self.text
-            != self
-                .saved_text
-                .strip_prefix('\u{feff}')
-                .unwrap_or(&self.saved_text)
-                .replace("\r\n", "\n")
+        let saved = self
+            .saved_text
+            .strip_prefix('\u{feff}')
+            .unwrap_or(&self.saved_text);
+        if saved.contains("\r\n") {
+            self.text != saved.replace("\r\n", "\n")
+        } else {
+            // LF files need no normalized copy on every title/status paint.
+            self.text != saved
+        }
     }
 
     pub(crate) fn saved_text(&self) -> String {

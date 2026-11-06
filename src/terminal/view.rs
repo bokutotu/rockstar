@@ -1,21 +1,17 @@
-use super::{
-    TerminalSession, keys,
-    screen::{self, Size},
-};
+use super::{TerminalSession, cache::RenderCache, keys, screen::Size};
 use crate::mode::Mode;
 use alacritty_terminal::{
     grid::Dimensions,
     index::{Column, Line, Point as TermPoint},
-    term::{TermMode, cell::Flags},
-    vte::ansi::{CursorShape, Rgb},
+    term::TermMode,
+    vte::ansi::CursorShape,
 };
 use gpui_kit::{
     App, Bounds, ClipboardItem, Context, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, Focusable, Font, FontStyle, FontWeight, InteractiveElement as _, IntoElement,
-    Keystroke, MouseButton, ParentElement as _, Pixels, Point, Render, Role,
-    StatefulInteractiveElement as _, Styled as _, TextAlign, TextRun, UTF16Selection,
-    UnderlineStyle, Window, base::TestSupportExt as _, canvas, component::ActiveTheme as _, div,
-    fill, outline, point, px, rgb, size,
+    FocusHandle, Focusable, Font, InteractiveElement as _, IntoElement, Keystroke, MouseButton,
+    ParentElement as _, Pixels, Point, Render, Role, StatefulInteractiveElement as _, Styled as _,
+    TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, base::TestSupportExt as _, canvas,
+    component::ActiveTheme as _, div, outline, point, px, size,
 };
 use std::ops::Range;
 
@@ -29,6 +25,7 @@ pub(crate) struct TerminalView {
     selection: Option<((usize, usize), (usize, usize))>,
     preedit: String,
     preedit_selection: Range<usize>,
+    cache: RenderCache,
 }
 
 impl TerminalView {
@@ -37,13 +34,8 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        cx.observe_in(&session, window, |this, _, window, cx| {
-            if this.focus.is_focused(window) {
-                window.invalidate_character_coordinates();
-            }
-            cx.notify();
-        })
-        .detach();
+        cx.observe_in(&session, window, |_, _, _, cx| cx.notify())
+            .detach();
         Self {
             session,
             focus: cx.focus_handle(),
@@ -54,6 +46,7 @@ impl TerminalView {
             selection: None,
             preedit: String::new(),
             preedit_selection: 0..0,
+            cache: RenderCache::default(),
         }
     }
 
@@ -62,11 +55,15 @@ impl TerminalView {
     }
 
     fn send(&mut self, bytes: Vec<u8>, window: &mut Window, cx: &mut Context<Self>) {
+        let view_changed = self.scroll != 0 || self.selection.is_some();
         self.scroll = 0;
         self.selection = None;
         self.session
             .update(cx, |session, cx| session.write(bytes, window, cx));
-        cx.notify();
+        // The PTY echo notifies us when there is new output to draw.
+        if view_changed {
+            cx.notify();
+        }
     }
 
     fn terminal_mode(&self, cx: &App) -> TermMode {
@@ -139,13 +136,16 @@ impl TerminalView {
 
     fn scroll_by(&mut self, lines: i32, cx: &mut Context<Self>) {
         let screen = self.session.read(cx).process.screen.lock().unwrap();
-        self.scroll = self
+        let scroll = self
             .scroll
             .saturating_add_signed(lines as isize)
             .min(screen.term.history_size());
-        self.selection = None;
         drop(screen);
-        cx.notify();
+        if scroll != self.scroll || self.selection.is_some() {
+            self.scroll = scroll;
+            self.selection = None;
+            cx.notify();
+        }
     }
 
     fn position(&self, position: Point<Pixels>, cx: &App) -> (usize, usize) {
@@ -226,7 +226,14 @@ impl Render for TerminalView {
         let session = self.session.read(cx);
         let label = session.label();
         let screen = session.process.screen.lock().unwrap();
-        let text = screen.text(self.scroll);
+        self.scroll = self.scroll.min(screen.term.history_size());
+        self.cache.sync(
+            &screen,
+            self.scroll,
+            cx.theme().foreground,
+            cx.theme().background,
+        );
+        let text = self.cache.text.clone();
         let status = screen.exit.clone().unwrap_or_else(|| {
             if *cx.global::<Mode>() == Mode::Insert {
                 "INSERT · Esc: Normal".into()
@@ -248,8 +255,8 @@ impl Render for TerminalView {
             .min_h_0()
             .flex()
             .flex_col()
-            .bg(rgb(0x1e1e2e))
-            .text_color(rgb(0xcdd6f4))
+            .bg(self.cache.background())
+            .text_color(self.cache.foreground())
             .child(
                 div()
                     .id("terminal-screen")
@@ -279,9 +286,12 @@ impl Render for TerminalView {
                         |this, event: &gpui_kit::MouseMoveEvent, window, cx| {
                             if event.pressed_button == Some(MouseButton::Left) {
                                 if let Some((start, _)) = this.selection {
-                                    this.selection =
+                                    let selection =
                                         Some((start, this.position(event.position, cx)));
-                                    cx.notify();
+                                    if this.selection != selection {
+                                        this.selection = selection;
+                                        cx.notify();
+                                    }
                                 } else if this
                                     .terminal_mode(cx)
                                     .intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
@@ -344,7 +354,8 @@ impl Render for TerminalView {
                     .px_2()
                     .py_1()
                     .text_xs()
-                    .bg(rgb(0x181825))
+                    .bg(cx.theme().muted)
+                    .text_color(cx.theme().muted_foreground)
                     .child(status),
             )
     }
@@ -358,24 +369,9 @@ impl TerminalView {
         }
     }
     fn layout(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        let font = Self::font(cx);
-        let font_size = cx.theme().mono_font_size;
-        let run = TextRun {
-            len: 1,
-            font,
-            color: rgb(0xcdd6f4).into(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        self.cell = size(
-            window
-                .text_system()
-                .shape_line("M".into(), font_size, &[run], None)
-                .width
-                .max(px(1.)),
-            (font_size * 1.5).ceil(),
-        );
+        self.cache
+            .prepare(Self::font(cx), cx.theme().mono_font_size, window);
+        self.cell = self.cache.cell;
         let size = Size {
             columns: ((bounds.size.width / self.cell.width).floor() as u16).clamp(2, 1000),
             rows: ((bounds.size.height / self.cell.height).floor() as u16).clamp(1, 1000),
@@ -386,9 +382,7 @@ impl TerminalView {
         if self.focus.is_focused(window) {
             self.session.update(cx, |session, _| session.resize(size));
         }
-        let screen = self.session.read(cx).process.screen.lock().unwrap();
-        self.scroll = self.scroll.min(screen.term.history_size());
-        let cursor = screen.term.grid().cursor.point;
+        let cursor = self.cache.cursor;
         let next = Bounds::new(
             point(
                 bounds.left() + self.cell.width * cursor.column.0 as f32,
@@ -412,97 +406,13 @@ impl TerminalView {
                 cx,
             );
         }
-        let font = Self::font(cx);
-        let font_size = cx.theme().mono_font_size;
-        let screen = self.session.read(cx).process.screen.lock().unwrap();
-        let rows = screen.rows(self.scroll);
-        let mode = *screen.term.mode();
-        let cursor_shape = screen.term.cursor_style().shape;
-        let colors = *screen.term.colors();
-        drop(screen);
         let selected = self
             .selection
             .map(|(a, b)| if a <= b { (a, b) } else { (b, a) });
-        for (r, row) in rows.iter().enumerate() {
-            for (c, cell) in row.iter().enumerate() {
-                let origin = point(
-                    bounds.left() + self.cell.width * c as f32,
-                    bounds.top() + self.cell.height * r as f32,
-                );
-                let mut fg = to_color(screen::color(cell.fg, &colors));
-                let mut bg = to_color(screen::color(cell.bg, &colors));
-                if cell.flags.contains(Flags::INVERSE) {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-                if selected.is_some_and(|(a, b)| (r, c) >= a && (r, c) <= b) {
-                    bg = rgb(0x45475a).into();
-                }
-                window.paint_quad(fill(Bounds::new(origin, self.cell), bg));
-            }
-            // Paint every background first. Otherwise a wide glyph's right
-            // half gets erased by the following spacer cell's background.
-            for (c, cell) in row.iter().enumerate() {
-                let origin = point(
-                    bounds.left() + self.cell.width * c as f32,
-                    bounds.top() + self.cell.height * r as f32,
-                );
-                let mut fg = to_color(screen::color(
-                    if cell.flags.contains(Flags::INVERSE) {
-                        cell.bg
-                    } else {
-                        cell.fg
-                    },
-                    &colors,
-                ));
-                if cell.flags.contains(Flags::DIM) {
-                    fg.a *= 0.65;
-                }
-                if (cell.c == ' '
-                    && !cell
-                        .flags
-                        .intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT))
-                    || cell.flags.intersects(
-                        Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER | Flags::HIDDEN,
-                    )
-                {
-                    continue;
-                }
-                let mut text = cell.c.to_string();
-                if let Some(zero) = cell.zerowidth() {
-                    text.extend(zero);
-                }
-                let mut font = font.clone();
-                if cell.flags.contains(Flags::BOLD) {
-                    font.weight = FontWeight::BOLD;
-                }
-                if cell.flags.contains(Flags::ITALIC) {
-                    font.style = FontStyle::Italic;
-                }
-                let run = TextRun {
-                    len: text.len(),
-                    font,
-                    color: fg,
-                    background_color: None,
-                    underline: cell.flags.intersects(Flags::ALL_UNDERLINES).then_some(
-                        UnderlineStyle {
-                            color: Some(fg),
-                            thickness: px(1.),
-                            wavy: cell.flags.contains(Flags::UNDERCURL),
-                        },
-                    ),
-                    strikethrough: cell.flags.contains(Flags::STRIKEOUT).then_some(
-                        gpui_kit::StrikethroughStyle {
-                            color: Some(fg),
-                            thickness: px(1.),
-                        },
-                    ),
-                };
-                let line = window
-                    .text_system()
-                    .shape_line(text.into(), font_size, &[run], None);
-                let _ = line.paint(origin, self.cell.height, TextAlign::Left, None, window, cx);
-            }
-        }
+        self.cache
+            .paint(bounds, selected, cx.theme().selection, window, cx);
+        let mode = self.cache.mode;
+        let cursor_shape = self.cache.cursor_shape;
         if self.scroll == 0
             && mode.contains(TermMode::SHOW_CURSOR)
             && self.focus.is_focused(window)
@@ -519,15 +429,15 @@ impl TerminalView {
                 _ => self.cursor,
             };
             window.paint_quad(
-                outline(cursor, rgb(0xcdd6f4), Default::default()).border_widths(px(1.)),
+                outline(cursor, self.cache.foreground(), Default::default()).border_widths(px(1.)),
             );
         }
         if !self.preedit.is_empty() {
             let run = TextRun {
                 len: self.preedit.len(),
-                font,
-                color: rgb(0xcdd6f4).into(),
-                background_color: Some(rgb(0x313244).into()),
+                font: Self::font(cx),
+                color: self.cache.foreground(),
+                background_color: Some(cx.theme().muted),
                 underline: Some(UnderlineStyle {
                     color: None,
                     thickness: px(1.),
@@ -537,7 +447,7 @@ impl TerminalView {
             };
             let line = window.text_system().shape_line(
                 self.preedit.clone().into(),
-                font_size,
+                cx.theme().mono_font_size,
                 &[run],
                 None,
             );
@@ -552,10 +462,6 @@ impl TerminalView {
         }
     }
 }
-fn to_color(rgb_value: Rgb) -> gpui_kit::Hsla {
-    rgb((rgb_value.r as u32) << 16 | (rgb_value.g as u32) << 8 | rgb_value.b as u32).into()
-}
-
 impl EntityInputHandler for TerminalView {
     fn accepts_text_input(&self, _: &mut Window, cx: &mut Context<Self>) -> bool {
         *cx.global::<Mode>() == Mode::Insert
@@ -587,6 +493,9 @@ impl EntityInputHandler for TerminalView {
         (!self.preedit.is_empty()).then(|| 0..self.preedit.encode_utf16().count())
     }
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preedit.is_empty() && self.preedit_selection == (0..0) {
+            return;
+        }
         self.preedit.clear();
         self.preedit_selection = 0..0;
         window.notify_text_input_changed(&self.focus);
