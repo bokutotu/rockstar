@@ -50,6 +50,7 @@ pub enum AgentEvent {
     AssistantStarted,
     AssistantTextDelta(String),
     AssistantFinished(String),
+    ToolActivity(String),
     ContextUsageUpdated(Option<ContextUsage>),
     PromptFinished,
     Error(AgentError),

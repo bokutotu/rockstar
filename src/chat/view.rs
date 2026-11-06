@@ -4,7 +4,7 @@ use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Render, Role,
     StatefulInteractiveElement as _, StyleRefinement, Styled as _, Window,
-    div,
+    base::TestSupportExt as _, component::ActiveTheme as _, div,
 };
 
 use crate::agent::Message;
@@ -31,6 +31,8 @@ impl ChatPane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Live status changes must reach every pane without rebuilding its conversation.
+        cx.observe(&session, |_, _, cx| cx.notify()).detach();
         Self {
             focus: cx.focus_handle(),
             conversation: cx.new(|cx| ConversationView::new(&session, root, cx)),
@@ -87,6 +89,7 @@ impl Render for ChatPane {
                 }),
             )
             .size_full()
+            .min_w_0()
             .relative()
             .flex()
             .flex_col()
@@ -96,6 +99,26 @@ impl Render for ChatPane {
                     .clone()
                     .cached(StyleRefinement::default().flex_1().min_h_0().w_full()),
             )
+            .children(
+                self.session.read(cx).activity.as_deref().map(|text| activity_view(text, cx)),
+            )
             .child(Composer::new(&self.composer))
     }
+}
+
+fn activity_view(text: &str, cx: &App) -> impl IntoElement + use<> {
+    div()
+        .id("chat-activity")
+        .role(Role::Status)
+        .aria_label(text.to_owned())
+        .w_full()
+        .min_w_0()
+        .flex_shrink_0()
+        .px_4()
+        .py_1()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .truncate()
+        .child(text.to_owned())
+        .test_support()
 }

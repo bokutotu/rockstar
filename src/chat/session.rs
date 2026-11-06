@@ -13,6 +13,8 @@ pub(crate) struct ChatSession {
     pub(crate) number: usize,
     pub(super) messages: Vec<Message>,
     pub(super) draft: SharedString,
+    /// Latest tool operation for the current response; never part of history.
+    pub(super) activity: Option<String>,
     pub(super) context_usage: Option<ContextUsage>,
     pub(super) prompts: Sender<PromptRequest>,
     assistant: Option<usize>,
@@ -50,12 +52,16 @@ impl ChatSession {
                     return;
                 }
             }
-            let _ = this.update_in(cx, |this, _, cx| this.set_context_usage(None, cx));
+            let _ = this.update_in(cx, |this, _, cx| {
+                this.set_activity(None, cx);
+                this.set_context_usage(None, cx);
+            });
         });
         Self {
             number,
             messages,
             draft: "".into(),
+            activity: None,
             context_usage: None,
             prompts: agent.prompt_sender(),
             assistant: None,
@@ -79,6 +85,13 @@ impl ChatSession {
     pub(super) fn set_draft(&mut self, draft: SharedString, cx: &mut Context<Self>) {
         if self.draft != draft {
             self.draft = draft;
+            cx.notify();
+        }
+    }
+
+    fn set_activity(&mut self, value: Option<String>, cx: &mut Context<Self>) {
+        if self.activity != value {
+            self.activity = value;
             cx.notify();
         }
     }
@@ -127,9 +140,11 @@ impl ChatSession {
                     self.append(Message::Assistant(text), cx);
                 }
             }
+            AgentEvent::ToolActivity(text) => self.set_activity(Some(text), cx),
             AgentEvent::ContextUsageUpdated(usage) => self.set_context_usage(usage, cx),
-            AgentEvent::PromptFinished => {}
+            AgentEvent::PromptFinished => self.set_activity(None, cx),
             AgentEvent::Error(error) => {
+                self.set_activity(None, cx);
                 window
                     .push_notification(Notification::error(error.to_string()).autohide(false), cx);
             }

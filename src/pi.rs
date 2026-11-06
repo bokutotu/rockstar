@@ -13,6 +13,7 @@ use anyhow::{Context as _, anyhow, bail};
 use async_channel::{Receiver, RecvError};
 use futures_lite::future::{block_on, or};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::agent::{
     self, AgentBackend, AgentError, AgentEvent, ChatStart, ContextUsage, Message, OpenedChat,
@@ -20,6 +21,8 @@ use crate::agent::{
 };
 
 mod sessions;
+#[cfg(test)]
+mod tests;
 use sessions::SessionEntries;
 pub(crate) use sessions::list_sessions;
 
@@ -50,6 +53,12 @@ enum PiIncomingRecord {
     },
     MessageEnd {
         message: PiMessage,
+    },
+    ToolExecutionStart {
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        #[serde(default)]
+        args: Value,
     },
     CompactionEnd,
     ExtensionUiRequest(ExtensionUiRequest),
@@ -672,9 +681,39 @@ fn decode_event(record: &PiIncomingRecord) -> Option<AgentEvent> {
         PiIncomingRecord::MessageEnd {
             message: PiMessage::Assistant { content, .. },
         } => Some(AgentEvent::AssistantFinished(message_text(content))),
+        PiIncomingRecord::ToolExecutionStart { tool_name, args } => {
+            Some(AgentEvent::ToolActivity(tool_activity(tool_name, args)))
+        }
         PiIncomingRecord::CompactionEnd => Some(AgentEvent::ContextUsageUpdated(None)),
         _ => None,
     }
+}
+
+/// Show the operation's target, never file contents, edits, or tool output.
+fn tool_activity(name: &str, args: &Value) -> String {
+    let detail = match name {
+        "read" | "edit" | "write" => args.get("path"),
+        "bash" => args.get("command"),
+        _ => None,
+    }
+    .and_then(Value::as_str)
+    .map(str::trim)
+    .filter(|detail| !detail.is_empty());
+    let text = match detail {
+        Some(detail) => format!("{name} {detail}"),
+        None => name.to_owned(),
+    };
+    // Preserve ordinary spaces, including those inside quoted shell arguments.
+    text.replace("\r\n", "\n")
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
 }
 
 impl MessageContent {
