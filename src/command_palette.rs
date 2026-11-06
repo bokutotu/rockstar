@@ -1,22 +1,27 @@
+use std::path::PathBuf;
+
 use gpui_kit::{
     App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, Role, StatefulInteractiveElement as _, Styled as _, WeakEntity,
-    Window,
+    ParentElement as _, Render, Role, StatefulInteractiveElement as _, Styled as _, Task,
+    WeakEntity, Window,
     component::{
         ActiveTheme as _, WindowExt as _,
         dialog::DialogEntrance,
-        input::{Enter, Input, InputState},
+        input::{Enter, IndentInline, Input, InputEvent, InputState, OutdentInline},
         notification::Notification,
     },
     div, px,
 };
 
 use crate::{
-    input_shortcuts,
     diff::{DiffRequest, IndexAction, LocalFilter},
+    input_shortcuts,
     mode::Mode,
     workspace::{WipeMode, WorkspaceWindow},
 };
+
+mod path_completion;
+use path_completion::{PathCompletion, wsnew_argument, wsnew_candidates};
 
 pub(crate) fn bind_mode(workspace: &Entity<WorkspaceWindow>, window: &mut Window, cx: &mut App) {
     workspace.update(cx, |workspace, cx| workspace.focus_active(window, cx));
@@ -88,6 +93,8 @@ fn open(workspace: WeakEntity<WorkspaceWindow>, window: &mut Window, cx: &mut Ap
 struct CommandPaletteView {
     input: Entity<InputState>,
     workspace: WeakEntity<WorkspaceWindow>,
+    completion: Option<PathCompletion>,
+    completion_task: Option<Task<()>>,
 }
 
 impl CommandPaletteView {
@@ -97,10 +104,110 @@ impl CommandPaletteView {
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Command…"));
-        Self { input, workspace }
+        cx.subscribe(&input, |this, input, event: &InputEvent, cx| {
+            // Our own replacements emit Change too; keep the cycle only while
+            // the input still equals the candidate we just selected.
+            let edited = matches!(event, InputEvent::Change)
+                && this.completion.as_ref().is_none_or(|completion| {
+                    completion.current() != input.read(cx).value().as_ref()
+                });
+            if edited || matches!(event, InputEvent::Blur) {
+                this.completion = None;
+                this.completion_task = None;
+            }
+        })
+        .detach();
+        Self {
+            input,
+            workspace,
+            completion: None,
+            completion_task: None,
+        }
+    }
+
+    fn complete_path(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let input = self.input.read(cx);
+        let command = input.value();
+        let Some(argument) = wsnew_argument(&command) else {
+            return false;
+        };
+        if input.is_composing() {
+            return false;
+        }
+        let selection = input.selected_range();
+        let before_closing_quote = argument.starts_with('"')
+            && command.trim_end().ends_with('"')
+            && input.cursor() + 1 == command.trim_end().len();
+        if !selection.is_empty() || (input.cursor() != command.len() && !before_closing_quote) {
+            return true;
+        }
+        if let Some(completion) = &mut self.completion
+            && completion.current() == command.as_ref()
+            && !completion.is_unique()
+        {
+            completion.advance(forward);
+            self.apply_completion(window, cx);
+            return true;
+        }
+
+        // A unique candidate already ends in '/', so the next request searches
+        // inside it instead of cycling over that same candidate forever.
+        self.completion = None;
+        let Some(workspace) = self.workspace.upgrade() else {
+            return true;
+        };
+        let root = workspace.read(cx).active_root().to_owned();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let request = command.clone();
+        let scan =
+            cx.background_spawn(async move { wsnew_candidates(&request, &root, home.as_deref()) });
+        self.completion_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = scan.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.completion_task = None;
+                let input = this.input.read(cx);
+                if *cx.global::<Mode>() != Mode::CommandPalette
+                    || !input.focus_handle(cx).is_focused(window)
+                    || input.is_composing()
+                    || input.value() != command
+                    || input.selected_range() != selection
+                {
+                    return;
+                }
+                match result {
+                    Ok(candidates) => {
+                        this.completion = PathCompletion::start(candidates, forward);
+                        this.apply_completion(window, cx);
+                    }
+                    Err(error) => window.push_notification(
+                        Notification::error(format!("Path completion: {error:#}")),
+                        cx,
+                    ),
+                }
+            });
+        }));
+        true
+    }
+
+    fn apply_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(completion) = &self.completion else {
+            return;
+        };
+        let command = completion.current().to_owned();
+        let cursor = command.len() - usize::from(command.ends_with('"'));
+        self.input.update(cx, |input, cx| {
+            input.replace_all(command, window, cx);
+            input.set_selected_range(cursor..cursor, cx);
+        });
     }
 
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.completion_task = None;
         let command = self.input.read(cx).value();
         let Some(workspace) = self.workspace.upgrade() else {
             return;
@@ -201,6 +308,8 @@ impl CommandPaletteView {
     }
 
     fn dismiss(&mut self, cx: &mut Context<Self>) {
+        self.completion = None;
+        self.completion_task = None;
         cx.set_global(Mode::Normal);
     }
 }
@@ -213,6 +322,16 @@ impl Render for CommandPaletteView {
             .role(Role::Group)
             .aria_label("Commands")
             .w_full()
+            .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                if this.complete_path(true, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &OutdentInline, window, cx| {
+                if this.complete_path(false, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .capture_action(cx.listener(|this, action: &Enter, window, cx| {
                 if !action.secondary {
                     this.confirm(window, cx);

@@ -86,6 +86,10 @@ impl WorkspaceWindow {
         workspace.tabs[workspace.active].clone()
     }
 
+    pub(crate) fn active_root(&self) -> &Path {
+        &self.workspaces[self.active].root
+    }
+
     pub(crate) fn focus_active(&self, window: &mut Window, cx: &mut App) {
         self.active_tab()
             .update(cx, |tab, cx| tab.focus_active(window, cx));
