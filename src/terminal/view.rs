@@ -34,6 +34,8 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Repaint cached panes so entering Insert registers the text input handler again.
+        cx.observe_global::<Mode>(|_, cx| cx.notify()).detach();
         cx.observe_in(&session, window, |_, _, _, cx| cx.notify())
             .detach();
         Self {
