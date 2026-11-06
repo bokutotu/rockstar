@@ -1,14 +1,13 @@
 use crate::{
     file_search,
     mode::{Mode, text_key},
-    workspace::Workspace,
+    workspace::Tab,
 };
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyBinding, Keystroke, ParentElement as _, Render, Role,
     ScrollStrategy, StatefulInteractiveElement as _, Styled as _, Task, UniformListScrollHandle,
     WeakEntity, Window,
-    base::TestSupportExt as _,
     component::{
         ActiveTheme as _, WindowExt as _,
         dialog::DialogEntrance,
@@ -29,7 +28,7 @@ pub(crate) fn init(cx: &mut App) {
 }
 
 pub(crate) fn open_finder(
-    workspace: WeakEntity<Workspace>,
+    workspace: WeakEntity<Tab>,
     target: EntityId,
     root: PathBuf,
     window: &mut Window,
@@ -56,7 +55,7 @@ pub(crate) fn open_finder(
 }
 
 struct FileFinder {
-    workspace: WeakEntity<Workspace>,
+    workspace: WeakEntity<Tab>,
     target: EntityId,
     root: PathBuf,
     input: Entity<InputState>,
@@ -68,7 +67,7 @@ struct FileFinder {
 }
 impl FileFinder {
     fn new(
-        workspace: WeakEntity<Workspace>,
+        workspace: WeakEntity<Tab>,
         target: EntityId,
         root: PathBuf,
         window: &mut Window,
@@ -142,7 +141,6 @@ impl Render for FileFinder {
         let first = self.selected.saturating_sub(9);
         div()
             .id("file-finder")
-            .test_support()
             .role(Role::Group)
             .aria_label("Find files")
             .key_context("FilePicker")
@@ -187,7 +185,6 @@ impl Render for FileFinder {
                     .map(|(index, path)| {
                         div()
                             .id(("file-candidate", index))
-                            .test_support()
                             .role(Role::ListBoxOption)
                             .aria_label(path.clone())
                             .aria_selected(index == self.selected)
@@ -344,7 +341,6 @@ impl Render for FileTree {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("file-tree")
-            .test_support()
             .role(Role::Group)
             .aria_label("File tree")
             .track_focus(&self.focus)
@@ -386,7 +382,6 @@ impl Render for FileTree {
                                 };
                                 div()
                                     .id(("tree-entry", index))
-                                    .test_support()
                                     .role(Role::TreeItem)
                                     .aria_label(path.clone())
                                     .aria_selected(index == this.selected)

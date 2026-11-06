@@ -1,6 +1,6 @@
+use std::path::Path;
 use gpui_kit::{
-    App, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _,
-    base::TestSupportExt as _, div, px, rgb,
+    App, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, div, px, rgb,
 };
 
 use crate::{agent::Message, markdown::MarkdownContent};
@@ -11,21 +11,31 @@ pub(super) enum ChatMessage {
 }
 
 impl ChatMessage {
-    pub(super) fn new(message: Message, cx: &mut App) -> Self {
+    pub(super) fn new(message: Message, base: &Path, cx: &mut App) -> Self {
         match message {
-            Message::User(text) => Self::User(MarkdownContent::new(&text, cx)),
-            Message::Assistant(text) => Self::Assistant(MarkdownContent::new(&text, cx)),
+            Message::User(text) => Self::User(MarkdownContent::new(&text, base, cx)),
+            Message::Assistant(text) => Self::Assistant(MarkdownContent::new(&text, base, cx)),
         }
     }
 
-    pub(super) fn append_text(&self, text: &str, cx: &mut App) {
+    pub(super) fn append_text(&mut self, text: &str, cx: &mut App) {
         let (Self::User(content) | Self::Assistant(content)) = self;
         content.append_text(text, cx);
     }
 
-    pub(super) fn set_text(&self, text: &str, cx: &mut App) {
+    pub(super) fn set_text(&mut self, text: &str, cx: &mut App) {
         let (Self::User(content) | Self::Assistant(content)) = self;
         content.set_text(text, cx);
+    }
+
+    pub(super) fn set_visible(&self, visible: bool, cx: &mut App) {
+        let (Self::User(content) | Self::Assistant(content)) = self;
+        content.set_visible(visible, cx);
+    }
+
+    pub(super) fn shutdown(&self, cx: &mut App) {
+        let (Self::User(content) | Self::Assistant(content)) = self;
+        content.shutdown(cx);
     }
 
     pub(super) fn view(&self, index: usize) -> impl IntoElement + use<> {
@@ -35,7 +45,6 @@ impl ChatMessage {
         };
         div()
             .id(("message", index))
-            .test_support()
             .w_full()
             .flex()
             .flex_col()

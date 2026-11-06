@@ -78,14 +78,6 @@ impl Screen {
         let offset = offset.min(self.term.history_size());
         &self.term.grid()[Line(row as i32 - offset as i32)][..]
     }
-
-    #[cfg(test)]
-    pub fn text(&self, offset: usize) -> String {
-        (0..self.term.screen_lines())
-            .map(|row| row_text(self.row(row, offset)))
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
 }
 
 pub(super) fn row_text(row: &[Cell]) -> String {

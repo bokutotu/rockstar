@@ -4,7 +4,6 @@ use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, Render, Role,
     SharedString, StatefulInteractiveElement as _, Styled as _, Task, TextRun, Window,
-    base::TestSupportExt as _,
     canvas,
     component::{
         ActiveTheme as _, WindowExt as _,
@@ -46,6 +45,9 @@ impl FileView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        cx.on_release(|this, cx| {
+            if let Some(panel) = &this.lsp_ui.documentation { panel.content.shutdown(cx); }
+        }).detach();
         let document = buffer.read(cx);
         let (language, indent) = language_settings(&document.path);
         let text = document.text.clone();
@@ -260,6 +262,7 @@ impl FileView {
             (state.path.clone(), state.saved_text(), state.serialized());
         buffer.update(cx, |buffer, cx| {
             buffer.saving = true;
+            buffer.disk_epoch += 1;
             cx.notify();
         });
         let saving = cx.background_spawn(async move {
@@ -273,6 +276,7 @@ impl FileView {
                 Err(error) => {
                     buffer.update(cx, |buffer, cx| {
                         buffer.saving = false;
+                        buffer.disk_epoch += 1;
                         cx.notify();
                     });
                     window.push_notification(
@@ -796,7 +800,7 @@ impl Render for FileView {
         let lsp_status = self.lsp_status(cx);
         let buffer = self.buffer.read(cx);
         let status = format!(
-            "{} · {}:{}{}{}",
+            "{} · {}:{}{}{}{}",
             self.vim.mode.label(),
             row(&buffer.text, self.vim.cursor) + 1,
             column(&buffer.text, self.vim.cursor) + 1,
@@ -807,6 +811,11 @@ impl Render for FileView {
             } else {
                 " · Saved"
             },
+            match &buffer.disk_state {
+                file_buffer::DiskState::Current => "",
+                file_buffer::DiskState::Changed => " · Changed on disk (:e! to reload)",
+                file_buffer::DiskState::Unavailable(_) => " · File unavailable on disk",
+            },
             lsp_status
         );
         let numbers = self.input.clone();
@@ -815,7 +824,6 @@ impl Render for FileView {
         let mode = self.vim.mode;
         div()
             .id("fileview")
-            .test_support()
             .role(Role::Group)
             .aria_label(format!("File {}", buffer.path.display()))
             .size_full()
@@ -837,7 +845,6 @@ impl Render for FileView {
             .child(
                 div()
                     .id("source-area")
-                    .test_support()
                     .flex_1()
                     .min_h_0()
                     .w_full()
@@ -946,7 +953,6 @@ impl Render for FileView {
                 this.child(
                     div()
                         .id("file-search")
-                        .test_support()
                         .capture_action(cx.listener(|this, _: &Enter, window, cx| {
                             this.end_search(true, window, cx);
                             cx.stop_propagation();
@@ -962,7 +968,6 @@ impl Render for FileView {
             .child(
                 div()
                     .id("file-status")
-                    .test_support()
                     .role(Role::Status)
                     .aria_label(status.clone())
                     .px_2()

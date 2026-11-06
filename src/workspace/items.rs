@@ -1,27 +1,54 @@
 //! Retained workspace contents and the single list used to select them.
 use super::*;
-use gpui_kit::base::Tab;
+use gpui_kit::base::Tab as ItemTab;
 
 #[derive(Clone)]
 pub(super) enum OpenItem {
     Chat(Entity<ChatSession>),
     File(Entity<FileBuffer>),
     Terminal(Entity<crate::terminal::TerminalSession>),
+    Media(Entity<crate::media::MediaSession>),
+    Diff(Entity<crate::diff::DiffSession>),
+}
+
+pub(crate) enum WipeMode {
+    Safe,
+    Force,
 }
 
 impl OpenItem {
-    fn id(&self) -> EntityId {
+    fn check_wipe(&self, mode: WipeMode, cx: &App) -> anyhow::Result<()> {
+        if let Self::File(buffer) = self {
+            let buffer = buffer.read(cx);
+            if buffer.saving {
+                anyhow::bail!("File is being saved. Please wait before wiping it.");
+            }
+            if matches!(mode, WipeMode::Safe) && buffer.dirty() {
+                anyhow::bail!("File has unsaved changes. Save it or use :bw! to discard them.");
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn id(&self) -> EntityId {
         match self {
             Self::Chat(session) => session.entity_id(),
             Self::File(buffer) => buffer.entity_id(),
             Self::Terminal(session) => session.entity_id(),
+            Self::Media(session) => session.entity_id(),
+            Self::Diff(session) => session.entity_id(),
         }
     }
 
-    fn label(&self, root: &Path, cx: &App) -> String {
+    pub(super) fn label(&self, root: &Path, cx: &App) -> String {
         match self {
             Self::Chat(session) => format!("Chat {}", session.read(cx).number),
             Self::Terminal(session) => session.read(cx).label(),
+            Self::Diff(session) => session.read(cx).label(),
+            Self::Media(session) => match &session.read(cx).source {
+                crate::media::MediaSource::File(path) => path.strip_prefix(root).unwrap_or(path).display().to_string(),
+                source => source.label(),
+            },
             Self::File(buffer) => {
                 let buffer = buffer.read(cx);
                 format!(
@@ -38,11 +65,51 @@ impl OpenItem {
     }
 }
 
-impl Workspace {
+impl Tab {
+    pub(crate) fn wipe_active_item(
+        &mut self,
+        mode: WipeMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let current = self.panes[self.active].read(cx).item_id(cx);
+        let Some(index) = self.items.iter().position(|item| Some(item.id()) == current) else {
+            anyhow::bail!("This pane has no item to wipe.");
+        };
+        self.items[index].check_wipe(mode, cx)?;
+        let replacement = self.next_item(current, true).filter(|id| Some(*id) != current);
+        let item = self.items.remove(index);
+        let id = item.id();
+        let mut affected = Vec::new();
+        for pane in &self.panes {
+            if pane.update(cx, |pane, cx| pane.forget_item(id, cx)) {
+                affected.push(pane.entity_id());
+            }
+        }
+        if let OpenItem::File(buffer) = &item {
+            self.lsp.update(cx, |lsp, cx| lsp.unbind(buffer, cx));
+        }
+        if let OpenItem::Media(session) = &item {
+            session.update(cx, |session, cx| session.shutdown(cx));
+        }
+        if let Some(replacement) = replacement {
+            for pane_id in affected {
+                self.show_item(pane_id, replacement, window, cx);
+            }
+        }
+        self.pending.clear();
+        self.reveal_active_item(cx);
+        if !cx.global::<Mode>().is_overlay() {
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+        Ok(())
+    }
+
     pub(super) fn buffers(&self) -> impl Iterator<Item = &Entity<FileBuffer>> {
         self.items.iter().filter_map(|item| match item {
             OpenItem::File(buffer) => Some(buffer),
-            OpenItem::Chat(_) | OpenItem::Terminal(_) => None,
+            OpenItem::Chat(_) | OpenItem::Terminal(_) | OpenItem::Media(_) | OpenItem::Diff(_) => None,
         })
     }
 
@@ -58,6 +125,7 @@ impl Workspace {
             if let OpenItem::File(buffer) = &item {
                 // The item bar must update even when no pane displays this buffer.
                 cx.observe(buffer, |_, _, cx| cx.notify()).detach();
+                self.watches.update(cx, |watches, cx| watches.attach(buffer, cx));
             }
             if let OpenItem::Terminal(session) = &item {
                 let mut label = session.read(cx).label();
@@ -120,7 +188,10 @@ impl Workspace {
                 OpenItem::Chat(session) => pane.show_chat(session, &self.root, window, cx),
                 OpenItem::File(buffer) => pane.show_file(buffer, window, cx),
                 OpenItem::Terminal(session) => pane.show_terminal(session, window, cx),
+                OpenItem::Media(session) => pane.show_media(session, window, cx),
+                OpenItem::Diff(session) => pane.show_diff(session, cx),
             }
+            pane.set_content_visible(self.visible, cx);
         });
         if self.panes[self.active] == pane {
             self.reveal_active_item(cx);
@@ -144,9 +215,8 @@ impl Workspace {
         let theme = cx.theme();
         div()
             .id("open-items")
-            .test_support()
             .role(Role::TabList)
-            .aria_label("Open chats, files, and terminals")
+            .aria_label("Open chats, files, media, terminals, and diffs")
             .w_full()
             .h(px(32.))
             .flex_shrink_0()
@@ -163,14 +233,14 @@ impl Workspace {
                         .px_3()
                         .text_sm()
                         .text_color(theme.muted_foreground)
-                        .child("No open chats, files, or terminals"),
+                        .child("No open chats, files, media, terminals, or diffs"),
                 )
             })
             .children(self.items.iter().enumerate().map(|(index, item)| {
                 let id = item.id();
                 let selected = Some(id) == current;
                 let label = item.label(&self.root, cx);
-                Tab::new(("open-item", id.as_u64()))
+                ItemTab::new(("open-item", id.as_u64()))
                     .selected(selected)
                     .accessibility_label(label.clone())
                     .set_position(index + 1, self.items.len())
@@ -196,7 +266,7 @@ impl Workspace {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if matches!(
                             *cx.global::<Mode>(),
-                            Mode::CommandPalette | Mode::FileFinder | Mode::Confirm
+                            Mode::CommandPalette | Mode::FileFinder | Mode::Switcher | Mode::Confirm
                         ) {
                             return;
                         }

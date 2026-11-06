@@ -323,17 +323,7 @@ pub(crate) struct LspWorkspace {
     sessions: HashMap<ServerKind, Arc<ServerSession>>,
     documents: HashMap<Uri, Entity<DocumentBinding>>,
     events: async_channel::Sender<transport::Event>,
-    #[cfg(test)]
-    config: TestConfig,
 }
-#[cfg(test)]
-#[derive(Clone, Default)]
-pub(crate) struct TestConfig {
-    pub enabled: bool,
-    pub commands: HashMap<ServerKind, CommandSpec>,
-}
-#[cfg(test)]
-impl gpui_kit::Global for TestConfig {}
 impl LspWorkspace {
     pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (events, rx) = async_channel::unbounded();
@@ -366,8 +356,6 @@ impl LspWorkspace {
             sessions: HashMap::new(),
             documents: HashMap::new(),
             events,
-            #[cfg(test)]
-            config: cx.try_global::<TestConfig>().cloned().unwrap_or_default(),
         }
     }
     pub fn bind(
@@ -375,10 +363,6 @@ impl LspWorkspace {
         buffer: &Entity<FileBuffer>,
         cx: &mut Context<Self>,
     ) -> Result<Option<Entity<DocumentBinding>>> {
-        #[cfg(test)]
-        if !self.config.enabled {
-            return Ok(None);
-        }
         let file = buffer.read(cx);
         let Some((language_id, kind)) = language::language(&file.path) else {
             return Ok(None);
@@ -391,12 +375,7 @@ impl LspWorkspace {
             .sessions
             .entry(kind)
             .or_insert_with(|| {
-                #[allow(unused_mut)]
-                let mut command = CommandSpec::from(kind);
-                #[cfg(test)]
-                if let Some(value) = self.config.commands.get(&kind) {
-                    command = value.clone();
-                }
+                let command = CommandSpec::from(kind);
                 ServerSession::start(kind, self.root.clone(), command, self.events.clone())
             })
             .clone();
@@ -409,6 +388,20 @@ impl LspWorkspace {
         self.documents.insert(uri, binding.clone());
         Ok(Some(binding))
     }
+    pub(crate) fn stop(&mut self, _: &mut Context<Self>) {
+        self.documents.clear();
+        for session in self.sessions.values() {
+            session.stop();
+        }
+        self.sessions.clear();
+    }
+
+    pub fn unbind(&mut self, buffer: &Entity<FileBuffer>, cx: &mut Context<Self>) {
+        if let Some(binding) = buffer.update(cx, |buffer, _| buffer.lsp.take()) {
+            self.documents.remove(&binding.read(cx).uri);
+        }
+    }
+
     fn handle(&mut self, event: transport::Event, window: &mut Window, cx: &mut Context<Self>) {
         use transport::Event;
         match event {

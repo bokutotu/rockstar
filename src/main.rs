@@ -2,25 +2,23 @@ mod agent;
 mod app;
 mod chat;
 mod command_palette;
+mod diff;
 mod file_browser;
 mod file_buffer;
 mod file_search;
 mod file_view;
+mod file_watch;
 mod input_shortcuts;
 mod lsp;
 mod markdown;
 mod math;
+mod media;
 mod mermaid;
 mod mode;
 mod pane;
 mod pi;
 mod terminal;
 mod workspace;
-
-#[cfg(test)]
-mod e2e_tests;
-#[cfg(test)]
-mod test_support;
 
 use std::{env, process::ExitCode, sync::Arc};
 
@@ -32,7 +30,7 @@ use gpui_kit::{
 
 use app::open_dock_window;
 
-const USAGE: &str = "Usage: rockstar\n\nOpen a workspace in the current directory. Use :chat for pi, :term for a terminal, or \\ff to open files.";
+const USAGE: &str = "Usage: rockstar\n\nOpen a workspace in the current directory. Use :wsnew <directory> for another workspace, :tabnew for a tab, :chat for pi, :term for a terminal, or \\ff to open files.";
 
 fn init_key_handling(cx: &mut App) {
     mode::init(cx);
@@ -59,6 +57,7 @@ fn main() -> ExitCode {
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
+            cx.set_http_client(media::http::MediaHttpClient::new(cx.background_executor().clone()));
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();

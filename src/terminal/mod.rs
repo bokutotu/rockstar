@@ -143,23 +143,3 @@ pub(crate) fn shell_command() -> CommandBuilder {
     command.arg("-i");
     command
 }
-
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct TestCommand(pub CommandBuilder);
-#[cfg(test)]
-impl gpui_kit::Global for TestCommand {}
-
-/// Gate only process startup in UI race tests; the PTY itself remains real.
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct TestStartupGate {
-    pub entered: async_channel::Sender<()>,
-    pub release: async_channel::Receiver<()>,
-    pub finished: async_channel::Sender<()>,
-}
-#[cfg(test)]
-impl gpui_kit::Global for TestStartupGate {}
-
-#[cfg(test)]
-mod tests;

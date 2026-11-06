@@ -22,6 +22,7 @@
             libx11
             libxcb
             libxkbcommon
+            mpv-unwrapped
             vulkan-loader
             wayland
           ];
@@ -36,7 +37,7 @@
           };
           renderEnvironment = {
             FONTCONFIG_FILE = fontconfigFile;
-            # Use the host GPU driver for both the application and cargo test.
+            # Use the host GPU driver for the application.
             LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath libraries}:/run/opengl-driver/lib";
           };
         in
@@ -73,7 +74,6 @@
 
               nativeBuildInputs = nativeBuildInputs ++ [ pkgs.makeWrapper ];
               buildInputs = libraries;
-              # Tests are run directly with cargo test, not inside the build sandbox.
               doCheck = false;
 
               postFixup = ''
@@ -83,6 +83,7 @@
                     pkgs.lib.makeBinPath [
                       pkgs.xdg-utils
                       pkgs.gitMinimal
+                      pkgs.gh
                     ]
                   }" \
                   --set FONTCONFIG_FILE "${fontconfigFile}"
@@ -129,9 +130,8 @@
                 nixd
                 nixfmt
                 gitMinimal
+                gh
                 xdg-utils
-                xdotool
-                python3
               ];
               inherit nativeBuildInputs;
               buildInputs = libraries;

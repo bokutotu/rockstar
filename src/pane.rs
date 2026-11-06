@@ -1,16 +1,17 @@
 //! A stable dock panel whose content can change without disturbing the layout.
 use crate::{
     chat::{ChatPane, ChatSession},
+    diff::{DiffSession, DiffView},
     file_buffer::FileBuffer,
     file_view::FileView,
     mode::Mode,
+    media::{MediaSession, MediaView},
     terminal::{TerminalSession, TerminalView},
 };
 use gpui_kit::{
     App, AppContext as _, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Render, Role,
     StatefulInteractiveElement as _, Styled as _, Window,
-    base::TestSupportExt as _,
     component::{
         ActiveTheme as _,
         dock::{BasePanel, Panel, PanelEvent},
@@ -24,6 +25,8 @@ pub(crate) enum PaneContent {
     Chat(Entity<ChatPane>),
     File(Entity<FileView>),
     Terminal(Entity<TerminalView>),
+    Media(Entity<MediaView>),
+    Diff(Entity<DiffView>),
 }
 
 pub(crate) struct PaneActivated;
@@ -31,9 +34,11 @@ pub(crate) struct PaneActivated;
 pub(crate) struct Pane {
     pub(crate) content: PaneContent,
     focus: FocusHandle,
-    chat: Option<Entity<ChatPane>>,
+    chats: HashMap<EntityId, Entity<ChatPane>>,
     files: HashMap<EntityId, Entity<FileView>>,
     terminals: HashMap<EntityId, Entity<TerminalView>>,
+    media: HashMap<EntityId, Entity<MediaView>>,
+    diffs: HashMap<EntityId, Entity<DiffView>>,
     pub(crate) bounds: Rc<Cell<Bounds<Pixels>>>,
     pub(crate) show_title: bool,
     /// Reject late async loads/connections after the destination has changed.
@@ -42,12 +47,15 @@ pub(crate) struct Pane {
 
 impl Pane {
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
+        cx.on_release(|this, cx| this.set_content_visible(false, cx)).detach();
         Self {
             content: PaneContent::Plain,
             focus: cx.focus_handle(),
-            chat: None,
+            chats: HashMap::new(),
             files: HashMap::new(),
             terminals: HashMap::new(),
+            media: HashMap::new(),
+            diffs: HashMap::new(),
             bounds: Rc::default(),
             show_title: false,
             request: 0,
@@ -61,15 +69,14 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let chat = if let Some(chat) = &self.chat {
-            chat.update(cx, |chat, cx| chat.show_session(session, root, window, cx));
-            chat.clone()
-        } else {
-            let chat = cx.new(|cx| ChatPane::new(session, root, window, cx));
-            self.chat = Some(chat.clone());
-            chat
-        };
+        if self.item_id(cx) != Some(session.entity_id()) { self.set_content_visible(false, cx); }
+        let chat = self
+            .chats
+            .entry(session.entity_id())
+            .or_insert_with(|| cx.new(|cx| ChatPane::new(session, root, window, cx)))
+            .clone();
         self.content = PaneContent::Chat(chat);
+        self.set_content_visible(true, cx);
         cx.emit(PanelEvent::LayoutChanged);
         cx.notify();
     }
@@ -81,6 +88,7 @@ impl Pane {
         cx: &mut Context<Self>,
     ) {
         let id = buffer.entity_id();
+        if self.item_id(cx) != Some(id) { self.set_content_visible(false, cx); }
         let view = self
             .files
             .entry(id)
@@ -99,6 +107,7 @@ impl Pane {
             })
             .clone();
         self.content = PaneContent::File(view);
+        self.set_content_visible(true, cx);
         cx.emit(PanelEvent::LayoutChanged);
         cx.notify();
     }
@@ -109,6 +118,7 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.item_id(cx) != Some(session.entity_id()) { self.set_content_visible(false, cx); }
         let view = self.terminals.entry(session.entity_id()).or_insert_with(|| {
             let mut label = session.read(cx).label();
             cx.observe(&session, move |_, session, cx| {
@@ -126,9 +136,71 @@ impl Pane {
         cx.notify();
     }
 
+    pub(crate) fn show_diff(&mut self, session: Entity<DiffSession>, cx: &mut Context<Self>) {
+        let id = session.entity_id();
+        if self.item_id(cx) != Some(id) { self.set_content_visible(false, cx); }
+        let view = self.diffs.entry(id).or_insert_with(|| cx.new(|cx| DiffView::new(session, cx))).clone();
+        self.content = PaneContent::Diff(view);
+        self.set_content_visible(true, cx);
+        cx.emit(PanelEvent::LayoutChanged);
+        cx.notify();
+    }
+
+    pub(crate) fn show_media(&mut self, session: Entity<MediaSession>, window: &mut Window, cx: &mut Context<Self>) {
+        let id = session.entity_id();
+        if self.item_id(cx) != Some(id) { self.set_content_visible(false, cx); }
+        let view = self.media.entry(id).or_insert_with(|| cx.new(|cx| MediaView::new(session, false, window, cx))).clone();
+        self.content = PaneContent::Media(view);
+        self.set_content_visible(true, cx);
+        cx.emit(PanelEvent::LayoutChanged);
+        cx.notify();
+    }
+
+    pub(crate) fn set_content_visible(&self, visible: bool, cx: &mut App) {
+        match &self.content {
+            PaneContent::Media(view) => view.update(cx, |view, cx| view.set_visible(visible, cx)),
+            PaneContent::Chat(chat) => chat.update(cx, |chat, cx| chat.set_visible(visible, cx)),
+            PaneContent::File(view) => view.update(cx, |view, cx| view.set_media_visible(visible, cx)),
+            PaneContent::Diff(view) => view.update(cx, |view, cx| view.set_visible(visible, cx)),
+            _ => {}
+        }
+    }
+
+    /// Cancel UI-only requests before hiding a tab, without stopping its sessions.
+    pub(crate) fn suspend(&mut self, cx: &mut Context<Self>) {
+        for view in self.files.values() {
+            view.update(cx, |view, cx| view.suspend(cx));
+        }
+    }
+
+    /// Forget both visible and cached views of an item. The layout stays intact.
+    pub(crate) fn forget_item(&mut self, id: EntityId, cx: &mut Context<Self>) -> bool {
+        let displayed = self.item_id(cx) == Some(id);
+        if displayed { self.set_content_visible(false, cx); }
+        self.media.remove(&id);
+        self.chats.remove(&id);
+        self.files.remove(&id);
+        self.terminals.remove(&id);
+        self.diffs.remove(&id);
+        if displayed {
+            self.content = PaneContent::Plain;
+            self.request += 1;
+            cx.emit(PanelEvent::LayoutChanged);
+            cx.notify();
+        }
+        displayed
+    }
+
     pub(crate) fn terminal(&self) -> Option<Entity<TerminalView>> {
         match &self.content {
             PaneContent::Terminal(view) => Some(view.clone()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn diff(&self) -> Option<Entity<DiffView>> {
+        match &self.content {
+            PaneContent::Diff(view) => Some(view.clone()),
             _ => None,
         }
     }
@@ -140,6 +212,8 @@ impl Pane {
             PaneContent::Chat(chat) => Some(chat.read(cx).session.entity_id()),
             PaneContent::File(view) => Some(view.read(cx).buffer.entity_id()),
             PaneContent::Terminal(view) => Some(view.read(cx).session.entity_id()),
+            PaneContent::Media(view) => Some(view.read(cx).session.entity_id()),
+            PaneContent::Diff(view) => Some(view.read(cx).session.entity_id()),
         }
     }
 
@@ -174,6 +248,8 @@ impl Pane {
             }
             PaneContent::File(view) => view.update(cx, |view, cx| view.focus(window, cx)),
             PaneContent::Terminal(view) => view.update(cx, |view, cx| view.focus(window, cx)),
+            PaneContent::Media(view) => view.update(cx, |view, cx| view.focus(window, cx)),
+            PaneContent::Diff(view) => view.update(cx, |view, cx| view.focus(window, cx)),
         }
     }
 }
@@ -192,6 +268,11 @@ impl Panel for Pane {
             PaneContent::Plain => "Plain".to_string(),
             PaneContent::Chat(chat) => format!("Chat {}", chat.read(cx).session.read(cx).number),
             PaneContent::Terminal(view) => view.read(cx).session.read(cx).label(),
+            PaneContent::Diff(view) => view.read(cx).session.read(cx).label(),
+            PaneContent::Media(view) => match &view.read(cx).session.read(cx).source {
+                crate::media::MediaSource::File(path) => path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                source => source.label(),
+            },
             PaneContent::File(view) => {
                 let buffer = view.read(cx).buffer.read(cx);
                 format!(
@@ -207,7 +288,7 @@ impl Panel for Pane {
         }
     }
     fn title_bar(&self, _: &App) -> bool {
-        self.show_title || matches!(self.content, PaneContent::File(_))
+        self.show_title || matches!(self.content, PaneContent::File(_) | PaneContent::Media(_))
     }
     fn inner_padding(&self, _: &App) -> bool {
         false
@@ -227,7 +308,6 @@ impl Render for Pane {
         let content = match &self.content {
             PaneContent::Plain => div()
                 .id("plain")
-                .test_support()
                 .role(Role::Group)
                 .aria_label("Plain")
                 .size_full()
@@ -240,17 +320,20 @@ impl Render for Pane {
                 .child("Rockstar")
                 .child(":chat  Start a chat")
                 .child(":term  Open a terminal")
+                .child(":diff / :prdiff  Review changes")
                 .child("\\ff    Find a file")
                 .child("Ctrl-b  File tree")
                 .child("ss / sv  Split pane")
+                .child("\\ww / \\tt  Workspaces / tabs")
                 .into_any_element(),
             PaneContent::Chat(chat) => chat.clone().into_any_element(),
             PaneContent::File(view) => view.clone().into_any_element(),
             PaneContent::Terminal(view) => view.clone().into_any_element(),
+            PaneContent::Media(view) => view.clone().into_any_element(),
+            PaneContent::Diff(view) => view.clone().into_any_element(),
         };
         div()
             .id("pane")
-            .test_support()
             .role(Role::Group)
             .aria_label("Workspace pane")
             .track_focus(&self.focus)

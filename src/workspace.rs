@@ -1,6 +1,7 @@
 use crate::{
     agent::{Agent, AgentError},
     chat::ChatSession,
+    diff::{DiffRequest, IndexAction, LocalFilter},
     file_browser::{self, FileTree, OpenFile},
     file_buffer::FileBuffer,
     mode::{Mode, text_key},
@@ -8,9 +9,9 @@ use crate::{
 };
 use gpui_kit::{
     App, AppContext as _, Bounds, Context, Entity, EntityId, Focusable as _,
-    InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, Pixels, Render, Role,
+    EventEmitter, InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, Pixels, Render, Role,
     ScrollHandle, StatefulInteractiveElement as _, Styled as _, Window,
-    base::{Placement, TestSupportExt as _},
+    base::Placement,
     canvas,
     component::{
         ActiveTheme as _, WindowExt as _,
@@ -32,12 +33,19 @@ use std::{
 mod dock;
 mod items;
 mod terminal;
+mod window;
+mod picker;
+pub(crate) use window::WorkspaceWindow;
 use items::OpenItem;
+pub(crate) use items::WipeMode;
 
 pub(crate) type AgentConnector = Arc<dyn Fn(&Path) -> Result<Agent, AgentError> + Send + Sync>;
 
-pub(crate) struct Workspace {
+/// One independent editing context inside a directory-scoped workspace.
+pub(crate) struct Tab {
     root: PathBuf,
+    visible: bool,
+    watches: Entity<crate::file_watch::FileWatches>,
     lsp: Entity<crate::lsp::LspWorkspace>,
     items: Vec<OpenItem>,
     item_scroll: ScrollHandle,
@@ -50,10 +58,21 @@ pub(crate) struct Workspace {
     pending: String,
 }
 
-impl Workspace {
+#[derive(Clone, Copy)]
+enum TabAction {
+    Workspaces,
+    Tabs,
+    CloseWorkspace,
+    CloseTab,
+    OpenDiff(DiffRequest),
+}
+impl EventEmitter<TabAction> for Tab {}
+
+impl Tab {
     pub(crate) fn new(
         root: PathBuf,
         connect: AgentConnector,
+        watches: Entity<crate::file_watch::FileWatches>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -61,6 +80,8 @@ impl Workspace {
         let lsp = cx.new(|cx| crate::lsp::LspWorkspace::new(root.clone(), window, cx));
         let mut workspace = Self {
             root,
+            visible: false,
+            watches,
             lsp,
             items: Vec::new(),
             item_scroll: ScrollHandle::new(),
@@ -98,7 +119,7 @@ impl Workspace {
             &pane,
             window,
             |this, pane, event: &crate::file_view::Navigate, window, cx| {
-                if this.panes.get(this.active) != Some(pane) {
+                if !this.visible || this.panes.get(this.active) != Some(pane) {
                     return;
                 }
                 match crate::lsp::language::path(&event.uri) {
@@ -121,6 +142,9 @@ impl Workspace {
     }
 
     fn activate_pane(&mut self, id: EntityId, cx: &mut Context<Self>) {
+        if !self.visible {
+            return;
+        }
         if let Some(index) = self.panes.iter().position(|pane| pane.entity_id() == id) {
             if self.active != index {
                 self.active = index;
@@ -139,6 +163,9 @@ impl Workspace {
     }
 
     pub(crate) fn focus_active(&self, window: &mut Window, cx: &mut App) {
+        if !self.visible {
+            return;
+        }
         self.reveal_active_item(cx);
         self.panes[self.active].update(cx, |pane, cx| pane.focus_content(window, cx));
     }
@@ -152,6 +179,7 @@ impl Workspace {
             anyhow::bail!("Cannot close the last pane.");
         }
         let pane = self.panes.remove(self.active);
+        pane.update(cx, |pane, cx| pane.set_content_visible(false, cx));
         self.active = self.active.min(self.panes.len() - 1);
         self.dock
             .update(cx, |dock, cx| dock.remove_panel(pane, window, cx));
@@ -259,6 +287,8 @@ impl Workspace {
         if !fresh && session.is_some() {
             return;
         }
+        // A pending reset must not keep a wiped session and its connection alive.
+        let session = session.map(|session| session.downgrade());
         let pane = self.panes[self.active].clone();
         let pane_id = pane.entity_id();
         let request = pane.update(cx, |pane, _| {
@@ -281,14 +311,20 @@ impl Workspace {
                 };
                 match (result, session) {
                     (Ok(agent), Some(session)) => {
-                        session.update(cx, |session, cx| session.reset(agent, window, cx));
+                        if let Some(session) = session.upgrade() {
+                            session.update(cx, |session, cx| session.reset(agent, window, cx));
+                        }
                     }
                     (Ok(agent), None) => {
                         let number = this
                             .items
                             .iter()
-                            .filter(|item| matches!(item, OpenItem::Chat(_)))
-                            .count()
+                            .filter_map(|item| match item {
+                                OpenItem::Chat(session) => Some(session.read(cx).number),
+                                _ => None,
+                            })
+                            .max()
+                            .unwrap_or(0)
                             + 1;
                         let session = cx.new(|cx| ChatSession::new(agent, number, window, cx));
                         let id = this.register_item(OpenItem::Chat(session), cx);
@@ -351,13 +387,30 @@ impl Workspace {
         };
         if let Some(buffer) = self.find_buffer(&canonical, cx) {
             self.show_item(pane_id, buffer.entity_id(), window, cx);
+            let activate = self.visible && self.panes[self.active] == pane && !cx.global::<Mode>().is_overlay();
             pane.update(cx, |pane, cx| {
                 if let Some((position, encoding)) = location
                     && let Some(file) = pane.file()
                 {
-                    file.update(cx, |file, cx| file.jump_to(position, encoding, window, cx));
+                    file.update(cx, |file, cx| file.jump_to(position, encoding, activate, window, cx));
                 }
             });
+            return;
+        }
+        if location.is_none()
+            && let Some(kind) = crate::media::classify_file(&path).or_else(|| crate::media::classify_file(&canonical))
+        {
+            let source = crate::media::MediaSource::File(canonical);
+            let existing = self.items.iter().find_map(|item| match item {
+                OpenItem::Media(session) if session.read(cx).source == source => Some(session.clone()),
+                _ => None,
+            });
+            let session = existing.unwrap_or_else(|| {
+                let session = cx.new(|cx| crate::media::MediaSession::new(kind, source, cx));
+                self.register_item(OpenItem::Media(session.clone()), cx);
+                session
+            });
+            self.show_item(pane_id, session.entity_id(), window, cx);
             return;
         }
         let loading = cx.background_spawn(async move { FileBuffer::load(&canonical) });
@@ -387,12 +440,13 @@ impl Workspace {
                             buffer
                         });
                         this.show_item(pane_id, buffer.entity_id(), window, cx);
+                        let activate = this.visible && this.panes[this.active] == pane && !cx.global::<Mode>().is_overlay();
                         pane.update(cx, |pane, cx| {
                             if let Some((position, encoding)) = location
                                 && let Some(file) = pane.file()
                             {
                                 file.update(cx, |file, cx| {
-                                    file.jump_to(position, encoding, window, cx)
+                                    file.jump_to(position, encoding, activate, window, cx)
                                 });
                             }
                         });
@@ -405,6 +459,12 @@ impl Workspace {
             });
         })
         .detach();
+    }
+
+    pub(crate) fn update_diff_index(&mut self, action: IndexAction, cx: &mut Context<Self>) -> anyhow::Result<()> {
+        let view = self.panes[self.active].read(cx).diff()
+            .ok_or_else(|| anyhow::anyhow!("This pane has no diff; open :diff and select a file first"))?;
+        view.update(cx, |view, cx| view.update_index(action, cx))
     }
 
     pub(crate) fn save_active(
@@ -464,7 +524,7 @@ impl Workspace {
         if mode == Mode::Confirm {
             return false;
         }
-        if matches!(mode, Mode::CommandPalette | Mode::FileFinder) {
+        if matches!(mode, Mode::CommandPalette | Mode::FileFinder | Mode::Switcher) {
             if key.key == "escape" {
                 cx.set_global(Mode::Normal);
                 return true;
@@ -490,6 +550,7 @@ impl Workspace {
         if self.tree_visible
             && let Some(tree) = &self.tree
             && tree.focus_handle(cx).contains_focused(window, cx)
+            && !(mode == Mode::Normal && (self.pending.starts_with('\\') || text_key(key) == "\\"))
         {
             if key.key == "escape" {
                 self.focus_active(window, cx);
@@ -518,8 +579,22 @@ impl Workspace {
                     "sj" => self.move_focus(Placement::Bottom, window, cx),
                     "sk" => self.move_focus(Placement::Top, window, cx),
                     "sl" => self.move_focus(Placement::Right, window, cx),
-                    "\\f" => self.pending = pending,
+                    "\\f" | "\\w" | "\\t" | "\\g" => self.pending = pending,
                     "\\ff" => cx.set_global(Mode::FileFinder),
+                    "\\ww" => cx.emit(TabAction::Workspaces),
+                    "\\tt" => cx.emit(TabAction::Tabs),
+                    "\\wd" => cx.emit(TabAction::CloseWorkspace),
+                    "\\td" => cx.emit(TabAction::CloseTab),
+                    "\\gd" => cx.emit(TabAction::OpenDiff(DiffRequest::Local(LocalFilter::All))),
+                    "\\gp" => cx.emit(TabAction::OpenDiff(DiffRequest::PullRequest)),
+                    "\\gi" => cx.emit(TabAction::OpenDiff(DiffRequest::Local(LocalFilter::Staged))),
+                    "\\gw" => cx.emit(TabAction::OpenDiff(DiffRequest::Local(LocalFilter::Unstaged))),
+                    "\\gs" | "\\gu" => {
+                        let action = if pending == "\\gs" { IndexAction::Stage } else { IndexAction::Unstage };
+                        if let Err(error) = self.update_diff_index(action, cx) {
+                            window.push_notification(Notification::error(format!("{error:#}")), cx);
+                        }
+                    }
                     _ => {}
                 }
                 return true;
@@ -536,6 +611,11 @@ impl Workspace {
         }
         if let Some(file) = file {
             return file.update(cx, |file, cx| file.key(key, window, cx));
+        }
+        if let Some(diff) = self.panes[self.active].read(cx).diff()
+            && diff.update(cx, |diff, cx| diff.key(key, cx))
+        {
+            return true;
         }
         if let Some(terminal) = &terminal
             && terminal.update(cx, |terminal, cx| terminal.key(key, window, cx))
@@ -561,65 +641,65 @@ impl Workspace {
         false
     }
 
-    /// Used both by the native window close gesture and :quit.
-    pub(crate) fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.buffers().any(|buffer| buffer.read(cx).saving) {
-            window.push_notification(
-                Notification::info("Saving files. Please wait before closing."),
-                cx,
-            );
-            return false;
+    fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.visible = visible;
+        self.pending.clear();
+        for pane in &self.panes {
+            pane.update(cx, |pane, cx| pane.set_content_visible(visible, cx));
         }
-        let dirty = self
-            .buffers()
-            .filter(|buffer| buffer.read(cx).dirty())
-            .map(|buffer| buffer.read(cx).path.display().to_string())
-            .collect::<Vec<_>>();
-        if dirty.is_empty() {
-            return true;
+        if !visible {
+            for pane in &self.panes {
+                pane.update(cx, |pane, cx| pane.suspend(cx));
+            }
         }
-        if *cx.global::<Mode>() == Mode::Confirm {
-            return false;
+        cx.notify();
+    }
+
+    fn shutdown(&mut self, cx: &mut Context<Self>) {
+        self.set_visible(false, cx);
+        for pane in &self.panes {
+            pane.update(cx, |pane, _| pane.request += 1);
         }
-        window.close_dialog(cx);
-        cx.set_global(Mode::Confirm);
-        window.open_dialog(cx, move |dialog, _, _| {
-            dialog
-                .centered()
-                .w(px(520.))
-                .p_4()
-                .entrance(DialogEntrance::None)
-                .title("Unsaved files")
-                .on_ok(|_, _, _| false)
-                .on_close(|_, _, cx| cx.set_global(Mode::Normal))
-                .child(
-                    div()
-                        .id("unsaved-files")
-                        .test_support()
-                        .role(Role::Group)
-                        .aria_label("Unsaved files")
-                        .child("Save these files before closing, or discard their changes:")
-                        .children(dirty.iter().map(|path| div().child(path.clone())))
-                        .child(
-                            div()
-                                .flex()
-                                .gap_2()
-                                .mt_3()
-                                .child(Button::new("cancel-close").label("Keep editing").on_click(
-                                    |_, window, cx| {
-                                        window.close_dialog(cx);
-                                        cx.set_global(Mode::Normal);
-                                    },
-                                ))
-                                .child(
-                                    Button::new("discard-close")
-                                        .label("Discard and close")
-                                        .on_click(|_, window, _| window.remove_window()),
-                                ),
-                        ),
-                )
-        });
-        false
+        let ids = self.items.iter().map(OpenItem::id).collect::<Vec<_>>();
+        for id in ids {
+            for pane in &self.panes {
+                pane.update(cx, |pane, cx| { pane.forget_item(id, cx); });
+            }
+        }
+        for item in &self.items {
+            if let OpenItem::Media(session) = item {
+                session.update(cx, |session, cx| session.shutdown(cx));
+            }
+        }
+        self.items.clear();
+        self.lsp.update(cx, |lsp, cx| lsp.stop(cx));
+    }
+
+    pub(crate) fn reload_active_file(&self, window: &mut Window, cx: &mut Context<Self>) -> anyhow::Result<()> {
+        let file = self.panes[self.active].read(cx).file().ok_or_else(|| anyhow::anyhow!("This pane has no file to reload."))?;
+        let buffer = file.read(cx).buffer.clone();
+        let state = buffer.read(cx);
+        anyhow::ensure!(!state.saving, "File is being saved. Please wait before reloading.");
+        let stamp = (state.version, state.disk_epoch);
+        let path = state.path.clone();
+        let buffer = buffer.downgrade();
+        let reading = cx.background_spawn(async move { crate::file_buffer::read_disk(&path) });
+        cx.spawn_in(window, async move |_, cx| {
+            let result = reading.await;
+            let _ = cx.update(|window, cx| {
+                let Some(buffer) = buffer.upgrade() else { return; };
+                let state = buffer.read(cx);
+                if state.saving || (state.version, state.disk_epoch) != stamp {
+                    window.push_notification(Notification::error("File changed while reloading; reload cancelled."), cx);
+                    return;
+                }
+                match result {
+                    Ok(contents) => buffer.update(cx, |buffer, cx| buffer.replace_from_disk(contents, cx)),
+                    Err(error) => window.push_notification(Notification::error(format!("{error:#}")), cx),
+                }
+            });
+        }).detach();
+        Ok(())
     }
 }
 
@@ -633,7 +713,7 @@ fn cycle_index(current: usize, len: usize, forward: bool) -> usize {
 fn paint_active_border(bounds: Bounds<Pixels>, window: &mut Window, cx: &App) {
     window.paint_quad(outline(bounds, cx.theme().border, Default::default()).border_widths(px(2.)));
 }
-impl Render for Workspace {
+impl Render for Tab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_bounds = self.panes[self.active].read(cx).bounds.clone();
         div()

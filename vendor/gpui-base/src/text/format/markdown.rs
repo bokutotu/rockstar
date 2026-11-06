@@ -129,6 +129,7 @@ fn shift_positions(node: &mut Node, origin: &Point) {
 enum InlineGroup<'a> {
     Node(&'a Node),
     Marked(TextMark, &'a [Node]),
+    Custom(crate::text::MarkdownNode),
 }
 
 /// CommonMark hands each raw inline tag over as its own `Html` node, so
@@ -136,7 +137,7 @@ enum InlineGroup<'a> {
 /// text. Pair the formatting tags this renderer knows with their closing tag
 /// among the siblings and treat what lies between as a marked run, the same
 /// way `**x**` is handled.
-fn inline_groups(children: &[Node]) -> Vec<InlineGroup<'_>> {
+fn inline_groups<'a>(source: &str, children: &'a [Node], cx: &NodeContext) -> Vec<InlineGroup<'a>> {
     let mut groups = Vec::with_capacity(children.len());
     let mut ix = 0;
     while ix < children.len() {
@@ -147,6 +148,28 @@ fn inline_groups(children: &[Node]) -> Vec<InlineGroup<'_>> {
             groups.push(InlineGroup::Marked(mark, &children[ix + 1..close]));
             ix = close + 1;
             continue;
+        }
+        // Media tags are separate siblings in CommonMark's inline AST. Give
+        // extensions the entire element so its fallback children and closing
+        // tag belong to the same atomic object and copy/source range. Without
+        // an extension claiming it, retain the existing HTML handling.
+        if let Some((false, name, _)) = inline_html_tag(&children[ix])
+            && matches!(name.as_str(), "audio" | "video")
+            && let Some(close) = matching_close_tag(children, ix, &name)
+            && let (Some(first), Some(last)) = (children[ix].position(), children[close].position())
+            && let Some(literal) = source.get(first.start.offset..last.end.offset)
+        {
+            let node = Node::Html(mdast::Html {
+                value: literal.to_owned(),
+                position: Some(markdown::unist::Position { start: first.start.clone(), end: last.end.clone() }),
+            });
+            let parse_cx = MarkdownParseContext::new(source, cx.offset);
+            if let Some(mut custom) = cx.markdown_extensions.parse_inline(&node, &parse_cx) {
+                custom.set_span(Some(Span { start: cx.offset + first.start.offset, end: cx.offset + last.end.offset }));
+                groups.push(InlineGroup::Custom(custom.with_inline_source(literal)));
+                ix = close + 1;
+                continue;
+            }
         }
         groups.push(InlineGroup::Node(&children[ix]));
         ix += 1;
@@ -255,8 +278,12 @@ fn parse_inline_children(
     cx: &mut NodeContext,
 ) -> String {
     let mut text = String::new();
-    for group in inline_groups(children) {
+    for group in inline_groups(source, children, cx) {
         match group {
+            InlineGroup::Custom(node) => {
+                text.push_str(node.as_text());
+                paragraph.push(InlineNode::custom(node));
+            }
             InlineGroup::Node(child) => {
                 text.push_str(&parse_paragraph(source, paragraph, child, cx));
             }
@@ -351,9 +378,14 @@ fn merge_children_with_mark(
     let mut merged_marks = Vec::new();
     let mut merged_source_segments = Vec::new();
 
-    for group in inline_groups(children) {
+    for group in inline_groups(source, children, cx) {
         let mut child_paragraph = Paragraph::default();
         let child_text = match group {
+            InlineGroup::Custom(node) => {
+                let text = node.as_text().to_owned();
+                child_paragraph.push(InlineNode::custom(node));
+                text
+            }
             InlineGroup::Node(child) => parse_paragraph(source, &mut child_paragraph, child, cx),
             InlineGroup::Marked(child_mark, nodes) => {
                 merge_children_with_mark(source, &mut child_paragraph, nodes, child_mark, cx)
@@ -2430,6 +2462,38 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn paired_inline_media_is_one_object_with_a_complete_source_range() {
+        let html = "<audio controls><source src='a.wav'>fallback</audio>";
+        for source in [format!("前 {html} after"), format!("**前 {html} after**")] {
+            let mut cx = NodeContext {
+                markdown_extensions: MarkdownExtensions::default().plugin(
+                    crate::text::markdown_ext::TestInlinePlugin::new("media").parse_with(|node, _| {
+                        let Node::Html(html) = node else { return None };
+                        html.value.contains("</audio>").then(|| MarkdownNode::new("media", ())
+                            .text(html.value.clone()).markdown(html.value.clone()))
+                    }),
+                ).into(),
+                ..Default::default()
+            };
+            let document = parse(&source, &mut cx).unwrap();
+            let BlockNode::Paragraph(paragraph) = &document.blocks[0] else { panic!() };
+            let objects = paragraph.children.iter().filter_map(|node| node.custom.as_ref()).collect::<Vec<_>>();
+            assert_eq!(objects.len(), 1);
+            assert_eq!(objects[0].as_text(), html);
+            assert_eq!(objects[0].as_markdown(), html);
+            let start = source.find("<audio").unwrap();
+            assert_eq!(objects[0].source_range(), Some(start..start + html.len()));
+        }
+    }
+
+    #[test]
+    fn unclaimed_inline_media_retains_ordinary_fallback_text() {
+        let mut cx = NodeContext::default();
+        let document = parse("before <audio controls><source src='a.wav'>fallback</audio> after", &mut cx).unwrap();
+        assert_eq!(document.text(), "before fallback after\n");
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub(crate) enum Mode {
     VisualLine,
     CommandPalette,
     FileFinder,
+    Switcher,
     Search,
     LspPopup,
     Confirm,
@@ -23,6 +24,7 @@ impl Mode {
             Self::VisualLine => "VISUAL LINE",
             Self::CommandPalette => "COMMAND",
             Self::FileFinder => "FILES",
+            Self::Switcher => "SWITCH",
             Self::Search => "SEARCH",
             Self::LspPopup => "LSP",
             Self::Confirm => "CONFIRM",
@@ -35,7 +37,7 @@ impl Mode {
     pub(crate) fn is_overlay(self) -> bool {
         matches!(
             self,
-            Self::CommandPalette | Self::FileFinder | Self::Search | Self::LspPopup | Self::Confirm
+            Self::CommandPalette | Self::FileFinder | Self::Switcher | Self::Search | Self::LspPopup | Self::Confirm
         )
     }
 }

@@ -4,7 +4,6 @@ use gpui_kit::{
     App, AppContext as _, Context, Entity, EntityId, Focusable as _, InteractiveElement as _,
     IntoElement, MouseButton, ParentElement as _, Role, StatefulInteractiveElement as _,
     Styled as _, Task, View, Window,
-    base::TestSupportExt as _,
     component::{
         ActiveTheme as _, WindowExt as _,
         input::{Enter, IndentInline, InputEvent, MoveDown, MoveUp, Textarea, TextareaState},
@@ -288,7 +287,6 @@ impl ComposerView {
                 let selected = index == mention.selected;
                 div()
                     .id(index)
-                    .test_support()
                     .role(Role::ListBoxOption)
                     .aria_label(path.clone())
                     .aria_selected(selected)
@@ -313,7 +311,6 @@ impl ComposerView {
         Some(
             div()
                 .id("file-mention-popup")
-                .test_support()
                 .role(Role::ListBox)
                 .aria_label("Files")
                 .occlude()

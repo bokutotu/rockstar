@@ -10,7 +10,7 @@ use gpui_kit::{
     App, Bounds, ClipboardItem, Context, ElementInputHandler, Entity, EntityInputHandler,
     FocusHandle, Focusable, Font, InteractiveElement as _, IntoElement, Keystroke, MouseButton,
     ParentElement as _, Pixels, Point, Render, Role, StatefulInteractiveElement as _, Styled as _,
-    TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, base::TestSupportExt as _, canvas,
+    TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, canvas,
     component::ActiveTheme as _, div, outline, point, px, size,
 };
 use std::ops::Range;
@@ -246,7 +246,6 @@ impl Render for TerminalView {
         let paint_view = cx.entity();
         div()
             .id("terminal")
-            .test_support()
             .role(Role::Group)
             .aria_label(label)
             .track_focus(&self.focus)
@@ -260,7 +259,6 @@ impl Render for TerminalView {
             .child(
                 div()
                     .id("terminal-screen")
-                    .test_support()
                     .role(Role::TextInput)
                     .aria_label("Terminal screen")
                     .aria_value(text)
@@ -347,7 +345,6 @@ impl Render for TerminalView {
             .child(
                 div()
                     .id("terminal-status")
-                    .test_support()
                     .role(Role::Status)
                     .aria_label(status.clone())
                     .flex_shrink_0()

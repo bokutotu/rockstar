@@ -52,6 +52,13 @@ syntax highlighting. These local extensions provide the missing display layer:
   temporary IME preedit. Annotations invalidated by preedit are restored after
   cancellation or refreshed after commit.
 
+Markdown's inline parser also gives media extensions a complete paired
+`<audio>`/`<video>` element, including `<source>` children and fallback text.
+It preserves the full source span for selection/copy and retains the previous
+HTML handling when no extension claims the element. Rockstar's integration is
+in `src/media/markdown.rs`; the documentation media test exercises copying and
+source-relative loading through the production renderer.
+
 Application integration and protocol adapters are in `src/lsp/` and
 `src/file_view/lsp.rs`. Tests and the reviewed screenshot are described in
 `tests/README.md`. Re-run both the production UI suite and

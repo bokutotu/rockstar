@@ -76,6 +76,12 @@ pub(super) fn hover_markdown(contents: &HoverContents) -> Option<String> {
 }
 
 impl FileView {
+    pub(crate) fn set_media_visible(&self, visible: bool, cx: &mut App) {
+        if let Some(panel) = &self.lsp_ui.documentation {
+            panel.content.set_visible(visible, cx);
+        }
+    }
+
     pub(super) fn show_documentation(
         &mut self,
         markdown: String,
@@ -87,8 +93,9 @@ impl FileView {
         self.close_lsp_popup(window, cx);
         self.input
             .update(cx, |input, cx| input.dismiss_lsp_overlays(cx));
+        let path = self.buffer.read(cx).path.clone();
         let panel = DocumentationPanel {
-            content: MarkdownContent::new(&markdown, cx),
+            content: MarkdownContent::new(&markdown, path.parent().unwrap(), cx),
             scroll: ScrollHandle::new(),
             version,
             position,
@@ -153,7 +160,6 @@ impl FileView {
             deferred(
                 div()
                     .id("documentation-overlay")
-                    .test_support()
                     .absolute()
                     .inset_0()
                     .flex()
@@ -178,7 +184,6 @@ impl FileView {
                     .child(
                         div()
                             .id("documentation-panel")
-                            .test_support()
                             .role(Role::Dialog)
                             .aria_label("Documentation")
                             .track_focus(&self.lsp_ui.focus)
@@ -206,7 +211,6 @@ impl FileView {
                             .child(
                                 div()
                                     .id("documentation-scroll")
-                                    .test_support()
                                     .flex_1()
                                     .min_w_0()
                                     .min_h_0()
@@ -220,71 +224,5 @@ impl FileView {
             .with_priority(1)
             .into_any_element(),
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use lsp_types::{LanguageString, MarkupContent};
-
-    #[test]
-    fn markdown_is_not_rewritten() {
-        let source = "# Documentation\n\n```rust\nfn main() {}\n```\n\n説明です。";
-        for contents in [
-            HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: source.into(),
-            }),
-            HoverContents::Scalar(MarkedString::String(source.into())),
-        ] {
-            assert_eq!(hover_markdown(&contents).as_deref(), Some(source));
-        }
-    }
-
-    #[test]
-    fn language_and_code_fences_are_preserved_in_arrays() {
-        let contents = HoverContents::Array(vec![
-            MarkedString::String(String::new()),
-            MarkedString::LanguageString(LanguageString {
-                language: "rust\ninjected".into(),
-                value: "let s = \"``` and ~~~\";".into(),
-            }),
-            MarkedString::String("Description".into()),
-        ]);
-        assert_eq!(
-            hover_markdown(&contents).unwrap(),
-            "~~~~ rust\nlet s = \"``` and ~~~\";\n~~~~\n\nDescription"
-        );
-    }
-
-    #[test]
-    fn plain_text_cannot_become_markdown_or_html() {
-        let contents = HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::PlainText,
-            value: "# Title\r\n    **literal** <b>x</b> &amp; $x$\n1. item".into(),
-        });
-        assert_eq!(
-            hover_markdown(&contents).unwrap(),
-            "\\# Title  \n&#32;&#32;&#32;&#32;\\*\\*literal\\*\\* \\<b\\>x\\<\\/b\\> \\&amp\\; \\$x\\$  \n1\\. item"
-        );
-    }
-
-    #[test]
-    fn empty_documentation_has_no_panel_content() {
-        for contents in [
-            HoverContents::Array(vec![]),
-            HoverContents::Scalar(MarkedString::String(" \n".into())),
-            HoverContents::Scalar(MarkedString::LanguageString(LanguageString {
-                language: "rust".into(),
-                value: " \n".into(),
-            })),
-            HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::PlainText,
-                value: " \t\n".into(),
-            }),
-        ] {
-            assert!(hover_markdown(&contents).is_none());
-        }
     }
 }

@@ -1,7 +1,7 @@
+use std::path::{Path, PathBuf};
 use gpui_kit::{
     Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    ScrollHandle, StatefulInteractiveElement as _, Styled as _, Window, base::TestSupportExt as _,
-    div,
+    ScrollHandle, StatefulInteractiveElement as _, Styled as _, Window, div,
 };
 
 use crate::agent::Message;
@@ -15,25 +15,33 @@ use super::{
 pub(super) struct ConversationView {
     messages: Vec<ChatMessage>,
     scroll: ScrollHandle,
+    base: PathBuf,
+    visible: bool,
 }
 
 impl ConversationView {
-    pub(super) fn new(session: &Entity<ChatSession>, cx: &mut Context<Self>) -> Self {
+    pub(super) fn new(session: &Entity<ChatSession>, base: &Path, cx: &mut Context<Self>) -> Self {
+        cx.on_release(|this, cx| {
+            for message in &this.messages { message.shutdown(cx); }
+        }).detach();
         let messages = session
             .read(cx)
             .messages
             .clone()
             .into_iter()
-            .map(|message| ChatMessage::new(message, cx))
+            .map(|message| ChatMessage::new(message, base, cx))
             .collect();
         cx.subscribe(session, |this, _, change, cx| {
             match change {
                 ConversationChange::Reset => {
+                    for message in &this.messages { message.shutdown(cx); }
                     this.messages.clear();
                     this.scroll = ScrollHandle::new();
                 }
                 ConversationChange::Append(message) => {
-                    this.messages.push(ChatMessage::new(message.clone(), cx))
+                    let message = ChatMessage::new(message.clone(), &this.base, cx);
+                    message.set_visible(this.visible, cx);
+                    this.messages.push(message)
                 }
                 ConversationChange::AppendText(index, text) => {
                     this.messages[*index].append_text(text, cx)
@@ -43,7 +51,7 @@ impl ConversationView {
                     this.messages[*index].set_text(text, cx)
                 }
                 ConversationChange::Remove(index) => {
-                    this.messages.remove(*index);
+                    this.messages.remove(*index).shutdown(cx);
                 }
             }
             this.scroll.scroll_to_bottom();
@@ -53,7 +61,14 @@ impl ConversationView {
         Self {
             messages,
             scroll: ScrollHandle::new(),
+            base: base.into(),
+            visible: true,
         }
+    }
+
+    pub(super) fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.visible = visible;
+        for message in &self.messages { message.set_visible(visible, cx); }
     }
 }
 
@@ -61,7 +76,6 @@ impl Render for ConversationView {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("conversation")
-            .test_support()
             .size_full()
             .min_h_0()
             .overflow_y_scroll()

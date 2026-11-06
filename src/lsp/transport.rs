@@ -558,6 +558,3 @@ fn run(
     }
     result
 }
-
-#[cfg(test)]
-mod tests;

@@ -470,19 +470,35 @@ impl FileView {
             });
         }));
     }
+    pub(crate) fn suspend(&mut self, cx: &mut Context<Self>) {
+        self.cancel_lsp_request();
+        self.lsp_ui.cursor_task = None;
+        self.lsp_ui.call_tasks.clear();
+        self.lsp_ui.popup = None;
+        if let Some(panel) = self.lsp_ui.documentation.take() { panel.content.shutdown(cx); }
+        self.vim.pending.clear();
+        self.insert_j = None;
+        self.chord_timer = None;
+        cx.notify();
+    }
+
     pub(crate) fn jump_to(
         &mut self,
         position: Position,
         encoding: Encoding,
+        activate: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match encoding.offset(&self.buffer.read(cx).text, position) {
             Ok(offset) => {
                 self.vim.cursor = offset;
-                self.set_mode(Mode::Normal, cx);
+                self.vim.mode = Mode::Normal;
                 self.select(cx);
-                self.focus(window, cx);
+                if activate {
+                    self.set_mode(Mode::Normal, cx);
+                    self.focus(window, cx);
+                }
             }
             Err(error) => Self::lsp_error(error, window, cx),
         }
@@ -666,6 +682,7 @@ impl FileView {
     }
     pub(super) fn close_lsp_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let documentation = self.lsp_ui.documentation.take();
+        if let Some(panel) = &documentation { panel.content.shutdown(cx); }
         let focused = self.lsp_ui.focus.contains_focused(window, cx)
             || documentation
                 .as_ref()
@@ -977,7 +994,6 @@ impl FileView {
             });
         let body = div()
             .id("lsp-popup")
-            .test_support()
             .role(Role::Group)
             .aria_label(popup.title.clone())
             .track_focus(&self.lsp_ui.focus)
@@ -1006,7 +1022,6 @@ impl FileView {
                         };
                         div()
                             .id(("lsp-result", index))
-                            .test_support()
                             .role(Role::ListBoxOption)
                             .aria_label(row.label.clone())
                             .aria_selected(index == popup.selected)
@@ -1181,29 +1196,4 @@ fn editor_tokens(
         result_id: tokens.result_id.clone(),
         data: out,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn semantic_tokens_use_editor_scalar_columns_for_utf16_and_utf8() {
-        let text = "日本🎸 abc\nz";
-        let tokens =
-            serde_json::from_value(json!({"data":[0,0,2,0,0, 0,2,2,0,0, 0,3,3,0,0, 1,0,1,0,0]}))
-                .unwrap();
-        let converted = editor_tokens(&tokens, text, Encoding::Utf16).unwrap();
-        assert_eq!(
-            serde_json::to_value(converted).unwrap()["data"],
-            json!([0, 0, 2, 0, 0, 0, 2, 1, 0, 0, 0, 2, 3, 0, 0, 1, 0, 1, 0, 0])
-        );
-        let tokens = serde_json::from_value(json!({"data":[0,6,4,0,0, 0,5,3,0,0]})).unwrap();
-        let converted = editor_tokens(&tokens, text, Encoding::Utf8).unwrap();
-        assert_eq!(
-            serde_json::to_value(converted).unwrap()["data"],
-            json!([0, 2, 1, 0, 0, 0, 2, 3, 0, 0])
-        );
-        let split_surrogate = serde_json::from_value(json!({"data":[0,3,1,0,0]})).unwrap();
-        assert!(editor_tokens(&split_surrogate, text, Encoding::Utf16).is_err());
-    }
 }

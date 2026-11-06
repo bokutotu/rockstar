@@ -2,7 +2,6 @@ use gpui_kit::{
     App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, Role, StatefulInteractiveElement as _, Styled as _, WeakEntity,
     Window,
-    base::TestSupportExt as _,
     component::{
         ActiveTheme as _, WindowExt as _,
         dialog::DialogEntrance,
@@ -12,9 +11,14 @@ use gpui_kit::{
     div, px,
 };
 
-use crate::{input_shortcuts, mode::Mode, workspace::Workspace};
+use crate::{
+    input_shortcuts,
+    diff::{DiffRequest, IndexAction, LocalFilter},
+    mode::Mode,
+    workspace::{WipeMode, WorkspaceWindow},
+};
 
-pub(crate) fn bind_mode(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
+pub(crate) fn bind_mode(workspace: &Entity<WorkspaceWindow>, window: &mut Window, cx: &mut App) {
     workspace.update(cx, |workspace, cx| workspace.focus_active(window, cx));
     let target_window = window.window_handle();
     let weak = workspace.downgrade();
@@ -52,14 +56,14 @@ pub(crate) fn bind_mode(workspace: &Entity<Workspace>, window: &mut Window, cx: 
                     let _ =
                         workspace.update(cx, |workspace, cx| workspace.focus_active(window, cx));
                 }
-                Mode::Search | Mode::LspPopup | Mode::Confirm => {}
+                Mode::Search | Mode::LspPopup | Mode::Confirm | Mode::Switcher => {}
             }
             let _ = workspace.update(cx, |_, cx| cx.notify());
         })
         .detach();
 }
 
-fn open(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut App) {
+fn open(workspace: WeakEntity<WorkspaceWindow>, window: &mut Window, cx: &mut App) {
     let palette = cx.new(|cx| CommandPaletteView::new(workspace, window, cx));
     let focus = palette.read(cx).input.focus_handle(cx);
     window.open_dialog(cx, move |dialog, _, cx| {
@@ -83,11 +87,15 @@ fn open(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut App) {
 /// The input and UI retained for one open/close cycle of the palette.
 struct CommandPaletteView {
     input: Entity<InputState>,
-    workspace: WeakEntity<Workspace>,
+    workspace: WeakEntity<WorkspaceWindow>,
 }
 
 impl CommandPaletteView {
-    fn new(workspace: WeakEntity<Workspace>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        workspace: WeakEntity<WorkspaceWindow>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("Command…"));
         Self { input, workspace }
     }
@@ -97,28 +105,73 @@ impl CommandPaletteView {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let result = match command.trim().to_ascii_lowercase().as_str() {
+        let command = command.trim();
+        let (name, argument) = command
+            .split_once(char::is_whitespace)
+            .unwrap_or((command, ""));
+        if !argument.trim().is_empty() && !name.eq_ignore_ascii_case("wsnew") {
+            window.push_notification(
+                Notification::error(format!("Unexpected argument: {argument}")),
+                cx,
+            );
+            return;
+        }
+        let tab = workspace.read(cx).active_tab();
+        let result = match name.to_ascii_lowercase().as_str() {
+            "wsnew" => workspace.update(cx, |workspace, cx| {
+                workspace.open_workspace(argument, window, cx)
+            }),
+            "tabnew" => {
+                workspace.update(cx, |workspace, cx| workspace.new_tab(window, cx));
+                Ok(())
+            }
+            "wsclose" => {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.request_close_workspace(window, cx)
+                });
+                return;
+            }
+            "tabclose" => {
+                workspace.update(cx, |workspace, cx| workspace.request_close_tab(window, cx));
+                return;
+            }
+            "diff" | "diffstaged" | "diffunstaged" | "prdiff" => {
+                let request = match name.to_ascii_lowercase().as_str() {
+                    "diffstaged" => DiffRequest::Local(LocalFilter::Staged),
+                    "diffunstaged" => DiffRequest::Local(LocalFilter::Unstaged),
+                    "prdiff" => DiffRequest::PullRequest,
+                    _ => DiffRequest::Local(LocalFilter::All),
+                };
+                workspace.update(cx, |workspace, cx| workspace.open_diff(request, window, cx))
+            }
+            "stage" => tab.update(cx, |tab, cx| tab.update_diff_index(IndexAction::Stage, cx)),
+            "unstage" => tab.update(cx, |tab, cx| tab.update_diff_index(IndexAction::Unstage, cx)),
+            "e!" => tab.update(cx, |tab, cx| tab.reload_active_file(window, cx)),
             "chat" => {
-                workspace.update(cx, |workspace, cx| workspace.show_chat(false, window, cx));
+                tab.update(cx, |workspace, cx| workspace.show_chat(false, window, cx));
                 Ok(())
             }
             "term" => {
                 // Dismiss before opening: an existing terminal can enter Insert
                 // immediately without the palette resetting it to Normal.
                 self.dismiss(cx);
-                workspace.update(cx, |workspace, cx| workspace.show_terminal(window, cx));
+                tab.update(cx, |workspace, cx| workspace.show_terminal(window, cx));
                 return;
             }
             "new" => {
-                workspace.update(cx, |workspace, cx| workspace.show_chat(true, window, cx));
+                tab.update(cx, |workspace, cx| workspace.show_chat(true, window, cx));
                 Ok(())
             }
             "close" | "q" => {
-                workspace.update(cx, |workspace, cx| workspace.close_active_pane(window, cx))
+                tab.update(cx, |workspace, cx| workspace.close_active_pane(window, cx))
             }
-            "w" | "write" => {
-                workspace.update(cx, |workspace, cx| workspace.save_active(window, cx))
-            }
+            "bw" => tab.update(cx, |workspace, cx| {
+                workspace.wipe_active_item(WipeMode::Safe, window, cx)
+            }),
+            "bw!" => tab.update(cx, |workspace, cx| {
+                workspace.wipe_active_item(WipeMode::Force, window, cx)
+            }),
+            "w" | "write" => tab.update(cx, |workspace, cx| workspace.save_active(window, cx)),
             "quit" | "qa" => {
                 if workspace.update(cx, |workspace, cx| workspace.request_close(window, cx)) {
                     window.remove_window();
@@ -151,7 +204,6 @@ impl Render for CommandPaletteView {
         div()
             .key_context(input_shortcuts::CONTEXT)
             .id("command-popup")
-            .test_support()
             .role(Role::Group)
             .aria_label("Commands")
             .w_full()

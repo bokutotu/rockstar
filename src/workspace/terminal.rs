@@ -1,7 +1,7 @@
 use super::*;
 use crate::terminal::{self, TerminalSession};
 
-impl Workspace {
+impl Tab {
     pub(crate) fn show_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.panes[self.active].read(cx).terminal() {
             cx.set_global(Mode::Insert);
@@ -16,26 +16,7 @@ impl Workspace {
         });
         let root = self.root.clone();
         let command = terminal::shell_command();
-        #[cfg(test)]
-        let command = cx
-            .try_global::<terminal::TestCommand>()
-            .map(|config| config.0.clone())
-            .unwrap_or(command);
-        #[cfg(test)]
-        let gate = cx.try_global::<terminal::TestStartupGate>().cloned();
-        let starting = cx.background_spawn(async move {
-            #[cfg(test)]
-            if let Some(gate) = &gate {
-                let _ = gate.entered.try_send(());
-                let _ = gate.release.recv().await;
-            }
-            let result = TerminalSession::spawn(&root, command);
-            #[cfg(test)]
-            if let Some(gate) = &gate {
-                let _ = gate.finished.try_send(());
-            }
-            result
-        });
+        let starting = cx.background_spawn(async move { TerminalSession::spawn(&root, command) });
         cx.spawn_in(window, async move |this, cx| {
             let result = starting.await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -53,8 +34,12 @@ impl Workspace {
                         let number = this
                             .items
                             .iter()
-                            .filter(|item| matches!(item, OpenItem::Terminal(_)))
-                            .count()
+                            .filter_map(|item| match item {
+                                OpenItem::Terminal(session) => Some(session.read(cx).number),
+                                _ => None,
+                            })
+                            .max()
+                            .unwrap_or(0)
                             + 1;
                         let session =
                             cx.new(|cx| TerminalSession::new(number, process, window, cx));
@@ -63,7 +48,7 @@ impl Workspace {
                         this.show_titles(cx);
                         // A background completion must not steal focus from a
                         // different pane, the finder, or another command.
-                        if this.panes[this.active] == pane && *cx.global::<Mode>() == Mode::Normal {
+                        if this.visible && this.panes[this.active] == pane && *cx.global::<Mode>() == Mode::Normal {
                             cx.set_global(Mode::Insert);
                             this.focus_active(window, cx);
                         }

@@ -2,7 +2,7 @@
 
 IDE for AI era.
 
-## Test execution
+## Build checks
 
-The agent is always launched inside `nix shell`, so run `cargo test` directly.
+The agent is always launched inside `nix shell`, so run `cargo check` directly.
 

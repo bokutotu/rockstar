@@ -7,7 +7,7 @@ use gpui_kit::{
 
 use crate::{
     command_palette,
-    workspace::{AgentConnector, Workspace},
+    workspace::{AgentConnector, WorkspaceWindow},
 };
 
 pub(crate) fn open_dock_window(
@@ -17,7 +17,7 @@ pub(crate) fn open_dock_window(
     cx: &mut App,
 ) -> gpui_kit::Result<AnyWindowHandle> {
     let (handle, workspace) = gpui_kit::open_window(options, cx, |window, cx| {
-        cx.new(|cx| Workspace::new(root, connect, window, cx))
+        cx.new(|cx| WorkspaceWindow::new(root, connect, window, cx))
     })?;
     handle.update(cx, |_, window, cx| {
         Root::update(window, cx, |root, _, cx| {
