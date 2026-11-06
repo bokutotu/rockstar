@@ -327,11 +327,11 @@ impl WorkspaceWindow {
     }
 
     pub(crate) fn request_close_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.confirm_close(CloseTarget::Tab(self.active_tab().entity_id()), window, cx);
+        self.close_target(CloseTarget::Tab(self.active_tab().entity_id()), window, cx);
     }
 
     pub(crate) fn request_close_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.confirm_close(
+        self.close_target(
             CloseTarget::Workspace(self.workspaces[self.active].id),
             window,
             cx,
@@ -407,12 +407,12 @@ impl WorkspaceWindow {
                             cx.set_global(Mode::Normal);
                         }))
                         .child(Button::new("discard-close").label("Discard and close").on_click(move |_, window, cx| {
-                            let _ = owner.update(cx, |this, cx| this.close_confirmed(target, window, cx));
+                            let _ = owner.update(cx, |this, cx| this.close_target(target, window, cx));
                         }))))
         });
     }
 
-    fn close_confirmed(
+    fn close_target(
         &mut self,
         target: CloseTarget,
         window: &mut Window,
