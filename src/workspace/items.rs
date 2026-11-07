@@ -193,7 +193,7 @@ impl Tab {
             pane.request += 1;
             match item {
                 OpenItem::Chat(session) => pane.show_chat(session, &self.root, window, cx),
-                OpenItem::File(buffer) => pane.show_file(buffer, window, cx),
+                OpenItem::File(buffer) => pane.show_file(buffer, self.vim.clone(), window, cx),
                 OpenItem::Terminal(session) => pane.show_terminal(session, window, cx),
                 OpenItem::Media(session) => pane.show_media(session, window, cx),
                 OpenItem::Diff(session) => pane.show_diff(session, cx),

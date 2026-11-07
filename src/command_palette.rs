@@ -60,7 +60,8 @@ pub(crate) fn bind_mode(workspace: &Entity<WorkspaceWindow>, window: &mut Window
                             workspace.update(cx, |workspace, cx| workspace.open_finder(window, cx));
                     }
                 }
-                Mode::Normal | Mode::Insert | Mode::Visual | Mode::VisualLine => {
+                Mode::Normal | Mode::Insert | Mode::Replace | Mode::VirtualReplace
+                | Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
                     if window.has_active_dialog(cx) {
                         window.close_dialog(cx);
                     }

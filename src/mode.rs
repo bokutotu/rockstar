@@ -5,8 +5,11 @@ use gpui_kit::{App, Global, Keystroke};
 pub(crate) enum Mode {
     Normal,
     Insert,
+    Replace,
+    VirtualReplace,
     Visual,
     VisualLine,
+    VisualBlock,
     CommandPalette,
     FileFinder,
     Switcher,
@@ -20,8 +23,11 @@ impl Mode {
         match self {
             Self::Normal => "NORMAL",
             Self::Insert => "INSERT",
+            Self::Replace => "REPLACE",
+            Self::VirtualReplace => "VIRTUAL REPLACE",
             Self::Visual => "VISUAL",
             Self::VisualLine => "VISUAL LINE",
+            Self::VisualBlock => "VISUAL BLOCK",
             Self::CommandPalette => "COMMAND",
             Self::FileFinder => "FILES",
             Self::Switcher => "SWITCH",
@@ -31,8 +37,11 @@ impl Mode {
         }
     }
 
+    pub(crate) fn is_insert(self) -> bool {
+        matches!(self, Self::Insert | Self::Replace | Self::VirtualReplace)
+    }
     pub(crate) fn is_visual(self) -> bool {
-        matches!(self, Self::Visual | Self::VisualLine)
+        matches!(self, Self::Visual | Self::VisualLine | Self::VisualBlock)
     }
     pub(crate) fn is_overlay(self) -> bool {
         matches!(

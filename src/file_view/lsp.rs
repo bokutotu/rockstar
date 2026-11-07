@@ -477,8 +477,8 @@ impl FileView {
         self.lsp_ui.popup = None;
         if let Some(panel) = self.lsp_ui.documentation.take() { panel.content.shutdown(cx); }
         self.vim.pending.clear();
-        self.insert_j = None;
-        self.chord_timer = None;
+        self.insert = None;
+        self.buffer.update(cx, |buffer, _| buffer.end_insert());
         cx.notify();
     }
 
@@ -494,6 +494,10 @@ impl FileView {
             Ok(offset) => {
                 self.vim.cursor = offset;
                 self.vim.mode = Mode::Normal;
+                self.vim.pending.clear();
+                self.insert = None;
+                self.buffer.update(cx, |buffer, _| buffer.end_insert());
+                self.input.update(cx, |input, cx| input.set_readonly(true, cx));
                 self.select(cx);
                 if activate {
                     self.set_mode(Mode::Normal, cx);
@@ -905,7 +909,7 @@ impl FileView {
             _ if text_key(key) == "K" && self.vim.mode == Mode::Normal => {
                 self.start_lsp_request("textDocument/hover", "hoverProvider", window, cx)
             }
-            "space" if key.modifiers.control && self.vim.mode == Mode::Insert => {
+            "space" if key.modifiers.control && self.vim.mode.is_insert() => {
                 if self
                     .buffer
                     .read(cx)
@@ -924,7 +928,7 @@ impl FileView {
                 }
             }
             "escape"
-                if self.vim.mode == Mode::Insert
+                if self.vim.mode.is_insert()
                     && self.input.read(cx).completion_menu_state().open =>
             {
                 self.input
@@ -932,7 +936,7 @@ impl FileView {
             }
             "n" | "p"
                 if key.modifiers.control
-                    && self.vim.mode == Mode::Insert
+                    && self.vim.mode.is_insert()
                     && self.input.read(cx).completion_menu_state().open =>
             {
                 self.input.update(cx, |input, cx| {

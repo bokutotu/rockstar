@@ -82,6 +82,7 @@ impl Pane {
     pub(crate) fn show_file(
         &mut self,
         buffer: Entity<FileBuffer>,
+        vim: Entity<crate::file_view::VimSharedState>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -91,7 +92,7 @@ impl Pane {
             .files
             .entry(id)
             .or_insert_with(|| {
-                let view = cx.new(|cx| FileView::new(buffer.clone(), window, cx));
+                let view = cx.new(|cx| FileView::new(buffer.clone(), vim, window, cx));
                 cx.subscribe(&view, |_, _, event: &crate::file_view::Navigate, cx| {
                     cx.emit(event.clone())
                 })

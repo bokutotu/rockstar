@@ -51,6 +51,9 @@ syntax highlighting. These local extensions provide the missing display layer:
 - `is_composing` lets the host avoid displaying analysis for committed text over
   temporary IME preedit. Annotations invalidated by preedit are restored after
   cancellation or refreshed after commit.
+- `set_selection_reversed` lets FileView place the caret at the active end of a
+  Vim Visual selection, including a row in a block selection, without changing
+  the selected text or removing additional selections.
 
 Markdown's inline parser also gives media extensions a complete paired
 `<audio>`/`<video>` element, including `<source>` children and fallback text.

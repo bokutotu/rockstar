@@ -3519,6 +3519,15 @@ impl<M: InputModeKind> InputBaseState<M> {
         self.select_to(end, cx);
     }
 
+    /// Set which end of the active selection is its caret, without changing
+    /// the selected text or removing additional selections.
+    pub fn set_selection_reversed(&mut self, reversed: bool, cx: &mut Context<Self>) {
+        self.active_selection_mut().reversed = reversed;
+        let cursor = self.cursor();
+        self.scroll_to(cursor, None, cx);
+        cx.notify();
+    }
+
     /// Add `range` as an additional selection, keeping the existing ones —
     /// the programmatic equivalent of Alt-clicking another cursor into the
     /// text.

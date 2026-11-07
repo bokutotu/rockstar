@@ -23,6 +23,7 @@ pub(crate) struct WorkspaceWindow {
     connect: AgentConnector,
     watches: Entity<FileWatches>,
     diff_watches: Entity<DiffWatches>,
+    vim: Entity<crate::file_view::VimSharedState>,
     opening_diffs: Vec<(EntityId, DiffRequest)>,
 }
 
@@ -41,6 +42,7 @@ impl WorkspaceWindow {
             connect,
             watches,
             diff_watches,
+            vim: cx.new(|_| crate::file_view::VimSharedState::default()),
             opening_diffs: Vec::new(),
         };
         let root = root.canonicalize().unwrap_or(root);
@@ -62,7 +64,7 @@ impl WorkspaceWindow {
         cx: &mut Context<Self>,
     ) -> Entity<Tab> {
         let tab =
-            cx.new(|cx| Tab::new(root, self.connect.clone(), self.watches.clone(), window, cx));
+            cx.new(|cx| Tab::new(root, self.connect.clone(), self.watches.clone(), self.vim.clone(), window, cx));
         cx.observe(&tab, |_, _, cx| cx.notify()).detach();
         cx.subscribe_in(&tab, window, |this, tab, action: &TabAction, window, cx| {
             if this.active_tab() != *tab {

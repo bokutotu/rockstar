@@ -51,6 +51,7 @@ pub(crate) struct Tab {
     visible: bool,
     watches: Entity<crate::file_watch::FileWatches>,
     lsp: Entity<crate::lsp::LspWorkspace>,
+    vim: Entity<crate::file_view::VimSharedState>,
     items: Vec<OpenItem>,
     item_scroll: ScrollHandle,
     panes: Vec<Entity<Pane>>,
@@ -77,6 +78,7 @@ impl Tab {
         root: PathBuf,
         connect: AgentConnector,
         watches: Entity<crate::file_watch::FileWatches>,
+        vim: Entity<crate::file_view::VimSharedState>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -92,6 +94,7 @@ impl Tab {
             visible: false,
             watches,
             lsp,
+            vim,
             items: Vec::new(),
             item_scroll: ScrollHandle::new(),
             panes: Vec::new(),
@@ -509,7 +512,9 @@ impl Tab {
         if matches!(mode, Mode::Search | Mode::LspPopup) {
             return file.is_some_and(|file| file.update(cx, |file, cx| file.key(key, window, cx)));
         }
-        if mode == Mode::Normal && key.modifiers.control && key.key == "b" {
+        if mode == Mode::Normal && key.modifiers.control && key.key == "b"
+            && (file.is_none() || self.focused_target(window, cx) == Some(FocusTarget::FileTree))
+        {
             self.pending.clear();
             self.toggle_tree(window, cx);
             return true;
@@ -587,7 +592,7 @@ impl Tab {
                 self.pending.push_str(k);
                 return true;
             }
-            if k == ":" {
+            if k == ":" && file.as_ref().is_none_or(|file| !file.read(cx).pending()) {
                 cx.set_global(Mode::CommandPalette);
                 return true;
             }

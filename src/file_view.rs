@@ -3,8 +3,7 @@ use std::{ops::Range, time::Duration};
 use gpui_kit::{
     App, AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, Render, Role,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Task, TextRun, Window,
-    canvas,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Task, TextRun, Window, canvas,
     component::{
         ActiveTheme as _, WindowExt as _,
         input::{Editor, EditorState, Enter, Input, InputEvent, InputState, Redo, TabSize, Undo},
@@ -21,21 +20,25 @@ use crate::{
     syntax::language_settings,
 };
 mod documentation;
+mod editing;
+mod keys;
 mod lsp;
 mod vim;
+use editing::InsertSession;
 use lsp::LspViewState;
 pub(crate) use lsp::Navigate;
+pub(crate) use vim::VimSharedState;
 use vim::*;
 
 pub(crate) struct FileView {
     pub(crate) buffer: Entity<FileBuffer>,
     input: Entity<EditorState>,
-    vim: VimState,
+    vim: VimViewState,
+    shared: Entity<VimSharedState>,
+    insert: Option<InsertSession>,
     search: Entity<InputState>,
     search_open: bool,
     search_origin: usize,
-    insert_j: Option<(usize, usize)>,
-    chord_timer: Option<Task<()>>,
     indent: usize,
     lsp_ui: LspViewState,
 }
@@ -43,12 +46,16 @@ pub(crate) struct FileView {
 impl FileView {
     pub(crate) fn new(
         buffer: Entity<FileBuffer>,
+        shared: Entity<VimSharedState>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.on_release(|this, cx| {
-            if let Some(panel) = &this.lsp_ui.documentation { panel.content.shutdown(cx); }
-        }).detach();
+            if let Some(panel) = &this.lsp_ui.documentation {
+                panel.content.shutdown(cx);
+            }
+        })
+        .detach();
         let document = buffer.read(cx);
         let (language, indent) = language_settings(&document.path);
         let text = document.text.clone();
@@ -65,19 +72,26 @@ impl FileView {
                 .default_value(text)
                 .searchable(false)
         });
-        input.update(cx, |input, cx| input.set_readonly(true, cx));
+        input.update(cx, |input, cx| {
+            input.set_readonly(true, cx);
+            // Pair insertion is not a Neovim default and also interferes with R.
+            input.set_auto_close(false, window, cx);
+        });
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search (smartcase)…"));
         cx.observe_in(&buffer, window, |this, _, window, cx| {
             let text = this.buffer.read(cx).text.clone();
             let old = this.input.read(cx).value();
             if old.as_ref() != text {
-                let selection = this.input.read(cx).selected_range();
-                let mapped = map_offset(&old, &text, this.vim.cursor);
-                this.vim.cursor = mapped;
+                // An external edit invalidates insertion replay positions.
+                this.insert = None;
+                this.vim.pending.clear();
+                this.vim.cursor = map_offset(&old, &text, this.vim.cursor);
                 this.vim.anchor = map_offset(&old, &text, this.vim.anchor);
-                let selection = map_offset(&old, &text, selection.start)
-                    ..map_offset(&old, &text, selection.end);
-                this.set_input(&text, selection, true, window, cx);
+                if !this.vim.mode.is_insert() {
+                    this.vim.cursor = normal_cursor(&text, this.vim.cursor);
+                }
+                this.set_input(&text, this.vim.cursor..this.vim.cursor, true, window, cx);
+                this.select(cx);
             }
             cx.notify();
         })
@@ -88,24 +102,22 @@ impl FileView {
             }
             if matches!(event, InputEvent::Blur) {
                 this.vim.pending.clear();
-                this.insert_j = None;
-                this.chord_timer = None;
+                if let Some(insert) = &mut this.insert {
+                    insert.count = 1;
+                    insert.block = None;
+                }
                 this.buffer.update(cx, |buffer, _| buffer.end_insert());
             }
             if matches!(event, InputEvent::Change) {
-                let text = this.input.read(cx).value().to_string();
-                let before = this.vim.cursor;
-                this.vim.cursor = this.input.read(cx).cursor();
-                let id = cx.entity_id();
-                let insert = this.vim.mode == Mode::Insert;
-                this.buffer
-                    .update(cx, |buffer, cx| buffer.edit(text, before, id, insert, cx));
-                cx.notify();
+                this.input_changed(window, cx);
             }
         })
         .detach();
         cx.observe_in(&input, window, |this, _, window, cx| {
-            if !this.vim.mode.is_visual() && !this.search_open {
+            if !this.vim.mode.is_visual()
+                && !this.search_open
+                && !this.input.read(cx).is_composing()
+            {
                 let input = this.input.read(cx);
                 let selection = input.selected_range();
                 let cursor = input.cursor();
@@ -126,6 +138,28 @@ impl FileView {
                     }
                     this.vim.cursor = cursor;
                 }
+            } else if matches!(this.vim.mode, Mode::Visual | Mode::VisualLine)
+                && !this.search_open
+                && this.input.focus_handle(cx).is_focused(window)
+            {
+                let input = this.input.read(cx);
+                let selection = input.selected_range();
+                let expected = visual_target(&this.buffer.read(cx).text, &this.vim, this.indent);
+                if expected.ranges.first() != Some(&selection) {
+                    let cursor = input.cursor();
+                    if selection.is_empty() {
+                        this.vim.cursor = normal_cursor(&input.value(), cursor);
+                        this.set_mode(Mode::Normal, cx);
+                    } else {
+                        let last = prev(&input.value(), selection.end);
+                        (this.vim.anchor, this.vim.cursor) = if cursor == selection.start {
+                            (last, selection.start)
+                        } else {
+                            (selection.start, last)
+                        };
+                        this.set_mode(Mode::Visual, cx);
+                    }
+                }
             }
             if this.input.focus_handle(cx).is_focused(window) {
                 window.invalidate_character_coordinates();
@@ -144,12 +178,12 @@ impl FileView {
         let mut view = Self {
             buffer,
             input,
-            vim: VimState::default(),
+            shared,
+            vim: VimViewState::default(),
+            insert: None,
             search,
             search_open: false,
             search_origin: 0,
-            insert_j: None,
-            chord_timer: None,
             indent,
             lsp_ui,
         };
@@ -163,7 +197,6 @@ impl FileView {
     pub(crate) fn pending(&self) -> bool {
         !self.vim.pending.is_empty()
     }
-
     pub(crate) fn focus(&self, window: &mut Window, cx: &mut App) {
         if self.focus_lsp_popup(window, cx) {
             return;
@@ -182,21 +215,34 @@ impl FileView {
             self.input.focus_handle(cx).focus(window, cx);
         }
     }
-
+    fn remember_visual(&mut self) {
+        if self.vim.mode.is_visual() {
+            self.vim.last_visual = Some(VisualSelection {
+                kind: match self.vim.mode {
+                    Mode::VisualLine => SelectionKind::Line,
+                    Mode::VisualBlock => SelectionKind::Block,
+                    _ => SelectionKind::Character,
+                },
+                anchor: self.vim.anchor,
+                cursor: self.vim.cursor,
+                columns: self.vim.block_columns,
+            });
+        }
+    }
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        if !mode.is_visual() {
+            self.remember_visual();
+        }
         self.vim.mode = mode;
         self.vim.pending.clear();
-        self.insert_j = None;
-        self.chord_timer = None;
-        if mode != Mode::Insert {
+        if !mode.is_insert() {
             self.buffer.update(cx, |buffer, _| buffer.end_insert());
         }
         self.input
-            .update(cx, |input, cx| input.set_readonly(mode != Mode::Insert, cx));
+            .update(cx, |input, cx| input.set_readonly(!mode.is_insert(), cx));
         cx.set_global(mode);
         cx.notify();
     }
-
     fn set_input(
         &self,
         text: &str,
@@ -214,45 +260,47 @@ impl FileView {
             }
         });
     }
-
     fn select(&self, cx: &mut Context<Self>) {
         let text = &self.buffer.read(cx).text;
-        let range = if self.vim.mode == Mode::VisualLine {
-            line_range(text, self.vim.anchor, self.vim.cursor)
-        } else if self.vim.mode == Mode::Visual {
-            self.vim.anchor.min(self.vim.cursor)..next(text, self.vim.anchor.max(self.vim.cursor))
+        let mut ranges = if self.vim.mode.is_visual() {
+            visual_target(text, &self.vim, self.indent).ranges
         } else {
-            self.vim.cursor..self.vim.cursor
+            vec![self.vim.cursor..self.vim.cursor]
         };
-        self.input
-            .update(cx, |input, cx| input.set_selected_range(range, cx));
+        let reversed = if self.vim.mode == Mode::VisualBlock {
+            if self.vim.cursor < self.vim.anchor {
+                ranges.reverse();
+            }
+            self.vim.block_columns.1 < self.vim.block_columns.0
+        } else {
+            self.vim.mode.is_visual() && self.vim.cursor < self.vim.anchor
+        };
+        self.input.update(cx, |input, cx| {
+            if let Some(first) = ranges.first() {
+                input.set_selected_range(first.clone(), cx);
+            }
+            for range in ranges.iter().skip(1) {
+                input.add_selection(range.clone(), cx);
+            }
+            input.set_selection_reversed(reversed, cx);
+        });
         cx.notify();
     }
-
-    fn replace(
-        &mut self,
-        range: Range<usize>,
-        replacement: &str,
-        cursor: usize,
-        insert: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let mut text = self.buffer.read(cx).text.clone();
-        let before = self.vim.cursor;
-        text.replace_range(range, replacement);
-        self.vim.cursor = boundary(&text, cursor);
-        if !insert {
-            self.vim.cursor = normal_cursor(&text, self.vim.cursor);
+    fn geometry(&self, cx: &App) -> ViewGeometry {
+        let input = self.input.read(cx);
+        let width = input.text_bounds().map_or(80., |b| {
+            f32::from(b.size.width) / f32::from(cx.theme().mono_font_size) / 0.6
+        });
+        let left =
+            (-f32::from(input.scroll_offset().x) / f32::from(cx.theme().mono_font_size) / 0.6)
+                .max(0.);
+        ViewGeometry {
+            rows: input.visible_row_range().unwrap_or(0..20),
+            left_column: left as usize,
+            columns: (width as usize).max(1),
+            tab: self.indent,
         }
-        self.set_input(&text, self.vim.cursor..self.vim.cursor, true, window, cx);
-        let id = cx.entity_id();
-        self.buffer
-            .update(cx, |buffer, cx| buffer.edit(text, before, id, insert, cx));
-        self.vim.column = None;
-        cx.notify();
     }
-
     pub(crate) fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let buffer = self.buffer.clone();
         let state = buffer.read(cx);
@@ -289,8 +337,8 @@ impl FileView {
         })
         .detach();
     }
-
     fn undo(&mut self, redo: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert = None;
         let cursor = self
             .buffer
             .update(cx, |buffer, cx| buffer.undo(self.vim.cursor, redo, cx));
@@ -301,107 +349,6 @@ impl FileView {
             self.select(cx);
         }
     }
-
-    fn yank(&self, range: Range<usize>, linewise: bool, cx: &mut App) {
-        let mut text = self.buffer.read(cx).text[range].to_string();
-        if linewise && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        cx.write_to_clipboard(ClipboardItem::new_string_with_metadata(
-            text,
-            if linewise {
-                "rockstar-linewise"
-            } else {
-                "rockstar-characterwise"
-            }
-            .into(),
-        ));
-    }
-
-    fn operate(
-        &mut self,
-        operator: char,
-        mut range: Range<usize>,
-        linewise: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if range.is_empty() && operator != 'c' {
-            self.set_mode(Mode::Normal, cx);
-            return;
-        }
-        if matches!(operator, 'd' | 'c' | 'y') {
-            self.yank(range.clone(), linewise, cx);
-        }
-        let cursor = range.start;
-        match operator {
-            'y' => {
-                self.vim.cursor = cursor;
-                self.set_mode(Mode::Normal, cx);
-                self.select(cx);
-            }
-            'd' => {
-                let text = &self.buffer.read(cx).text;
-                if linewise && range.end == text.len() && !text.ends_with('\n') && range.start > 0 {
-                    range.start -= 1;
-                }
-                self.set_mode(Mode::Normal, cx);
-                self.replace(range, "", cursor, false, window, cx);
-            }
-            'c' => {
-                let text = &self.buffer.read(cx).text;
-                let replacement = if linewise {
-                    let indent = &text[range.start..first_nonblank(text, range.start)];
-                    format!(
-                        "{indent}{}",
-                        if text[range.clone()].ends_with('\n') {
-                            "\n"
-                        } else {
-                            ""
-                        }
-                    )
-                } else {
-                    String::new()
-                };
-                let cursor = cursor + replacement.trim_end_matches('\n').len();
-                self.set_mode(Mode::Insert, cx);
-                self.replace(range, &replacement, cursor, true, window, cx);
-            }
-            '>' | '<' => {
-                let range = line_range(
-                    &self.buffer.read(cx).text,
-                    range.start,
-                    range.end.saturating_sub(1),
-                );
-                let old = &self.buffer.read(cx).text[range.clone()];
-                let replacement = old
-                    .split_inclusive('\n')
-                    .map(|line| {
-                        if operator == '>' {
-                            format!("{}{line}", " ".repeat(self.indent))
-                        } else {
-                            let remove = if line.starts_with('\t') {
-                                1
-                            } else {
-                                line.chars()
-                                    .take(self.indent)
-                                    .take_while(|c| *c == ' ')
-                                    .count()
-                            };
-                            line[remove..].to_string()
-                        }
-                    })
-                    .collect::<String>();
-                let cursor = range.start;
-                self.set_mode(Mode::Normal, cx);
-                self.replace(range, &replacement, cursor, false, window, cx);
-                self.vim.cursor = first_nonblank(&self.buffer.read(cx).text, cursor);
-                self.select(cx);
-            }
-            _ => {}
-        }
-    }
-
     fn update_search(&mut self, cx: &mut Context<Self>) {
         let query = self.search.read(cx).value().to_string();
         let insensitive = !query.chars().any(char::is_uppercase);
@@ -424,7 +371,6 @@ impl FileView {
         }
         cx.notify();
     }
-
     fn search_next(&mut self, forward: bool, cx: &mut Context<Self>) {
         let query = self.search.read(cx).value().to_string();
         self.input.update(cx, |input, cx| {
@@ -453,7 +399,6 @@ impl FileView {
             self.select(cx);
         }
     }
-
     pub(crate) fn end_search(&mut self, accept: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !accept {
             self.vim.cursor = self.search_origin;
@@ -463,331 +408,7 @@ impl FileView {
         self.select(cx);
         self.input.focus_handle(cx).focus(window, cx);
     }
-
-    pub(crate) fn key(
-        &mut self,
-        key: &Keystroke,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if self.lsp_ui.documentation.is_some() {
-            return self.documentation_key(key, window, cx);
-        }
-        if self.lsp_key(key, window, cx) {
-            return true;
-        }
-        let k = text_key(key);
-        if key.key == "escape" {
-            if self.search_open {
-                self.end_search(false, window, cx);
-                return true;
-            }
-            if self.vim.mode == Mode::Normal {
-                self.input.update(cx, |input, cx| input.close_search(cx));
-            } else if self.vim.mode == Mode::Insert {
-                let text = &self.buffer.read(cx).text;
-                if self.vim.cursor > start(text, self.vim.cursor) {
-                    self.vim.cursor = prev(text, self.vim.cursor);
-                }
-            }
-            self.set_mode(Mode::Normal, cx);
-            self.select(cx);
-            return true;
-        }
-        if self.search_open {
-            return false;
-        }
-        if key.modifiers.control {
-            match key.key.as_str() {
-                "r" if self.vim.mode != Mode::Insert => self.undo(true, window, cx),
-                "z" => self.undo(key.modifiers.shift, window, cx),
-                "d" | "u" if self.vim.mode == Mode::Normal => {
-                    let rows = self
-                        .input
-                        .read(cx)
-                        .visible_row_range()
-                        .map_or(20, |r| r.len() / 2)
-                        .max(1);
-                    let direction = if key.key == "d" { "j" } else { "k" };
-                    self.vim.cursor = motion(
-                        &self.buffer.read(cx).text,
-                        self.vim.cursor,
-                        direction,
-                        rows,
-                        &mut self.vim.column,
-                        true,
-                    )
-                    .unwrap();
-                    self.select(cx);
-                }
-                _ => return false,
-            }
-            return true;
-        }
-        if key.modifiers.alt || key.modifiers.platform {
-            return false;
-        }
-        if self.vim.mode == Mode::Insert {
-            let at = self.input.read(cx).cursor();
-            if let Some((start, count)) = self.insert_j {
-                let text = &self.buffer.read(cx).text;
-                let intact = at == start + count
-                    && text.get(start..at).is_some_and(|s| s == "j".repeat(count));
-                if intact && ((k == "k" && count == 1) || (k == "j" && count == 2)) {
-                    self.replace(start..at, "", start, true, window, cx);
-                    self.set_mode(Mode::Normal, cx);
-                    if k == "j" {
-                        let text = &self.buffer.read(cx).text;
-                        self.vim.cursor =
-                            first_nonblank(text, line_at(text, row(text, self.vim.cursor) + 1));
-                    } else {
-                        let text = &self.buffer.read(cx).text;
-                        if self.vim.cursor > vim::start(text, self.vim.cursor) {
-                            self.vim.cursor = prev(text, self.vim.cursor);
-                        }
-                        self.save(window, cx);
-                    }
-                    self.select(cx);
-                    return true;
-                }
-            }
-            if k == "j" {
-                let (start, count) = self
-                    .insert_j
-                    .filter(|(s, n)| at == s + n)
-                    .unwrap_or((at, 0));
-                self.insert_j = Some((start, count + 1));
-                self.chord_timer = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(Duration::from_secs(1)).await;
-                    let _ = this.update(cx, |this, _| this.insert_j = None);
-                }));
-            } else {
-                self.insert_j = None;
-                self.chord_timer = None;
-            }
-            return false;
-        }
-        if self.vim.mode.is_visual() && matches!(k, "d" | "x" | "c" | "y" | ">" | "<") {
-            let range = self.input.read(cx).selected_range();
-            let op = if k == "x" {
-                'd'
-            } else {
-                k.chars().next().unwrap()
-            };
-            self.operate(op, range, self.vim.mode == Mode::VisualLine, window, cx);
-            return true;
-        }
-        if matches!(k, "v" | "V") {
-            let mode = if k == "v" {
-                Mode::Visual
-            } else {
-                Mode::VisualLine
-            };
-            if self.vim.mode == mode {
-                self.set_mode(Mode::Normal, cx);
-            } else {
-                if !self.vim.mode.is_visual() {
-                    self.vim.anchor = self.vim.cursor;
-                }
-                self.set_mode(mode, cx);
-            }
-            self.select(cx);
-            return true;
-        }
-        if k.len() > 1
-            && !matches!(
-                k,
-                "left" | "right" | "up" | "down" | "home" | "end" | "enter"
-            )
-        {
-            return false;
-        }
-        self.vim.pending.push_str(k);
-        let pending = self.vim.pending.clone();
-        let (count, command, explicit) = count_prefix(&pending);
-        if command.is_empty() || command == "g" || command == " " {
-            return true;
-        }
-        if command == " w" {
-            self.vim.pending.clear();
-            self.save(window, cx);
-            return true;
-        }
-        let text = self.buffer.read(cx).text.clone();
-        let at = self.vim.cursor;
-        if let Some(position) = motion(&text, at, command, count, &mut self.vim.column, explicit) {
-            self.vim.pending.clear();
-            self.vim.cursor = position;
-            self.select(cx);
-            return true;
-        }
-        if let Some(operator @ ('d' | 'c' | 'y' | '>' | '<')) = command.chars().next() {
-            let tail = &command[1..];
-            let (motion_count, motion_key, motion_explicit) = count_prefix(tail);
-            if motion_key.is_empty() || motion_key == "g" {
-                return true;
-            }
-            let total = count.saturating_mul(motion_count).min(100_000);
-            let repeated = motion_key.len() == 1 && motion_key.starts_with(operator);
-            let linewise = repeated || matches!(motion_key, "j" | "k" | "gg" | "G");
-            let destination = if repeated {
-                Some(line_at(&text, row(&text, at) + total - 1))
-            } else {
-                motion(
-                    &text,
-                    at,
-                    if operator == 'c'
-                        && motion_key == "w"
-                        && !text[at..].starts_with(char::is_whitespace)
-                    {
-                        "e"
-                    } else {
-                        motion_key
-                    },
-                    total,
-                    &mut self.vim.column,
-                    explicit || motion_explicit,
-                )
-            };
-            self.vim.pending.clear();
-            if let Some(destination) = destination {
-                let range = if linewise {
-                    line_range(&text, at, destination)
-                } else if motion_key == "w"
-                    && (operator != 'c' || text[at..].starts_with(char::is_whitespace))
-                {
-                    let mut to = word_forward(&text, at, total);
-                    if total == 1
-                        && !text[at..].starts_with(char::is_whitespace)
-                        && to > end(&text, at)
-                    {
-                        to = end(&text, at);
-                    }
-                    at..to
-                } else if motion_key == "l" {
-                    let mut to = at;
-                    for _ in 0..total {
-                        to = next(&text, to).min(end(&text, at));
-                    }
-                    at..to
-                } else {
-                    let inclusive = matches!(motion_key, "e" | "$")
-                        || (operator == 'c'
-                            && motion_key == "w"
-                            && !text[at..].starts_with(char::is_whitespace));
-                    let hi = at.max(destination);
-                    at.min(destination)..if inclusive {
-                        next(&text, hi).min(end(&text, hi))
-                    } else {
-                        hi
-                    }
-                };
-                self.operate(operator, range, linewise, window, cx);
-            }
-            return true;
-        }
-        self.vim.pending.clear();
-        match command {
-            "i" | "a" | "I" | "A" => {
-                self.vim.cursor = match command {
-                    "a" => next(&text, at).min(end(&text, at)),
-                    "I" => first_nonblank(&text, at),
-                    "A" => end(&text, at),
-                    _ => at,
-                };
-                self.set_mode(Mode::Insert, cx);
-                self.select(cx);
-            }
-            "o" | "O" => {
-                let indent = &text[start(&text, at)..first_nonblank(&text, at)];
-                let (position, replacement, cursor) = if command == "o" {
-                    let position = end(&text, at);
-                    (position, format!("\n{indent}"), position + 1 + indent.len())
-                } else {
-                    let position = start(&text, at);
-                    (position, format!("{indent}\n"), position + indent.len())
-                };
-                self.set_mode(Mode::Insert, cx);
-                self.replace(position..position, &replacement, cursor, true, window, cx);
-            }
-            "x" | "D" | "C" => {
-                let mut to = at;
-                for _ in 0..count {
-                    to = next(&text, to).min(end(&text, at));
-                }
-                if command != "x" {
-                    to = end(&text, at);
-                }
-                self.operate(
-                    if command == "C" { 'c' } else { 'd' },
-                    at..to,
-                    false,
-                    window,
-                    cx,
-                );
-            }
-            "p" | "P" => {
-                if let Some(clipboard) = cx.read_from_clipboard()
-                    && let Some(value) = clipboard.text()
-                {
-                    let linewise = clipboard
-                        .metadata()
-                        .is_some_and(|m| m == "rockstar-linewise");
-                    let mut value = value.repeat(count.min(10_000));
-                    let position = if linewise {
-                        if command == "P" {
-                            start(&text, at)
-                        } else {
-                            let e = end(&text, at);
-                            if e == text.len() && !text.is_empty() {
-                                value.insert(0, '\n');
-                            }
-                            next(&text, e)
-                        }
-                    } else if command == "P" {
-                        at
-                    } else {
-                        next(&text, at).min(end(&text, at))
-                    };
-                    let cursor = if linewise {
-                        position + usize::from(value.starts_with('\n'))
-                    } else {
-                        position
-                            + value
-                                .len()
-                                .saturating_sub(value.chars().next_back().map_or(0, char::len_utf8))
-                    };
-                    self.replace(position..position, &value, cursor, false, window, cx);
-                }
-            }
-            "u" => {
-                for _ in 0..count {
-                    self.undo(false, window, cx);
-                }
-            }
-            "/" => {
-                self.search_origin = at;
-                self.search_open = true;
-                self.search
-                    .update(cx, |search, cx| search.set_value("", window, cx));
-                cx.set_global(Mode::Search);
-                self.search.focus_handle(cx).focus(window, cx);
-            }
-            "n" | "N" => {
-                for _ in 0..count {
-                    self.search_next(command == "n", cx);
-                }
-            }
-            "enter" => {
-                self.vim.cursor = first_nonblank(&text, line_at(&text, row(&text, at) + count));
-                self.select(cx);
-            }
-            _ => {}
-        }
-        true
-    }
 }
-
 impl Focusable for FileView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.input.focus_handle(cx)
@@ -862,8 +483,7 @@ impl Render for FileView {
                                 let Some(height) = state.line_height() else {
                                     return;
                                 };
-                                let current = state.cursor_position().line as usize;
-                                // text_bounds already includes the editor's scroll offset.
+                                let current = row(&state.value(), cursor);
                                 let top = state.text_bounds().map_or(bounds.top(), |b| b.top());
                                 let rows = rows
                                     .map(|line| {
@@ -919,14 +539,16 @@ impl Render for FileView {
                             .w_full()
                             .appearance(false)
                             .bordered(false)
-                            .readonly(mode != Mode::Insert)
+                            .readonly(!mode.is_insert())
                             .aria_label("Source code"),
                     )
                     .child(
                         canvas(
                             |_, _, _| {},
                             move |_, _, window, cx| {
-                                if mode == Mode::Normal && input.focus_handle(cx).is_focused(window)
+                                if (mode == Mode::Normal
+                                    || matches!(mode, Mode::Replace | Mode::VirtualReplace))
+                                    && input.focus_handle(cx).is_focused(window)
                                 {
                                     let state = input.read(cx);
                                     let text = state.value();
@@ -980,29 +602,15 @@ impl Render for FileView {
 }
 
 fn map_offset(old: &str, new: &str, offset: usize) -> usize {
-    let common = old
-        .chars()
-        .zip(new.chars())
-        .take_while(|(a, b)| a == b)
-        .map(|(c, _)| c.len_utf8())
-        .sum::<usize>();
-    let suffix = old[common..]
-        .chars()
-        .rev()
-        .zip(new[common..].chars().rev())
-        .take_while(|(a, b)| a == b)
-        .map(|(c, _)| c.len_utf8())
-        .sum::<usize>();
-    let old_end = old.len() - suffix;
-    let new_end = new.len() - suffix;
+    let edit = editing::difference(old, new);
     boundary(
         new,
-        if offset < common {
+        if offset < edit.range.start {
             offset
-        } else if offset >= old_end {
-            new_end + offset - old_end
+        } else if offset >= edit.range.end {
+            edit.range.start + edit.replacement.len() + offset - edit.range.end
         } else {
-            new_end
+            edit.range.start + edit.replacement.len()
         },
     )
 }
