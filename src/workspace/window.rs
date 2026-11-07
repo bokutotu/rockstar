@@ -135,12 +135,27 @@ impl WorkspaceWindow {
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let root = resolve_root(argument, &self.workspaces[self.active].root)?;
-        self.leave_tab(cx);
-        if let Some(index) = self
+        self.open_workspace_root(root, window, cx)
+    }
+
+    pub(crate) fn open_workspace_root(
+        &mut self,
+        root: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let root = root.canonicalize()?;
+        anyhow::ensure!(root.is_dir(), "Not a directory: {}", root.display());
+        let existing = self
             .workspaces
             .iter()
-            .position(|workspace| workspace.root == root)
-        {
+            .position(|workspace| workspace.root == root);
+        if existing == Some(self.active) {
+            // Repeated CLI launches must not reset the current tab or input mode.
+            return Ok(());
+        }
+        self.leave_tab(cx);
+        if let Some(index) = existing {
             self.active = index;
         } else {
             let tab = self.create_tab(root.clone(), window, cx);

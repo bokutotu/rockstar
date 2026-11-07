@@ -6464,6 +6464,7 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "socket2",
  "url",
 ]
 

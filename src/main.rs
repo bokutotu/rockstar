@@ -9,6 +9,8 @@ mod file_search;
 mod file_view;
 mod file_watch;
 mod input_shortcuts;
+mod instance;
+mod launch;
 mod lsp;
 mod markdown;
 mod math;
@@ -21,7 +23,9 @@ mod syntax;
 mod terminal;
 mod workspace;
 
-use std::{env, process::ExitCode, sync::Arc};
+use std::{env, os::unix::net::UnixStream, process::ExitCode, sync::Arc};
+
+use anyhow::Context as _;
 
 use gpui_kit::{
     App, TitlebarOptions, WindowBounds, WindowOptions,
@@ -29,9 +33,11 @@ use gpui_kit::{
     px, size,
 };
 
-use app::open_dock_window;
+use app::{dispatch_requests, open_dock_window};
+use instance::{InstanceServer, OpenWorkspaceRequest};
+use launch::{LaunchMode, StartupStatus};
 
-const USAGE: &str = "Usage: rockstar\n\nOpen a workspace in the current directory. Use :wsnew <directory> for another workspace, :tabnew for a tab, :chat for pi, :resume for saved chats, :term for a terminal, or \\ff to open files.";
+const USAGE: &str = "Usage: rockstar\n\nOpen the current directory in Rockstar's single window, reusing its workspace if already open. Return after startup; Rockstar keeps running when the terminal closes. Use :wsnew <directory> for another workspace, :tabnew for a tab, :chat for pi, :resume for saved chats, :term for a terminal, or \\ff to open files.";
 
 fn init_key_handling(cx: &mut App) {
     mode::init(cx);
@@ -41,8 +47,9 @@ fn init_key_handling(cx: &mut App) {
 
 fn main() -> ExitCode {
     let args: Vec<_> = env::args_os().skip(1).collect();
-    match args.as_slice() {
-        [] => {}
+    let mode = match args.as_slice() {
+        [] => LaunchMode::Cli,
+        [arg, _, _] if arg == launch::GUI_ARGUMENT => LaunchMode::Gui,
         [arg] if arg == "--help" || arg == "-h" => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -51,14 +58,41 @@ fn main() -> ExitCode {
             eprintln!("{USAGE}");
             return ExitCode::FAILURE;
         }
-    }
+    };
 
-    let current_dir = env::current_dir().unwrap();
+    let result = match mode {
+        LaunchMode::Cli => run_cli(),
+        LaunchMode::Gui => launch::run_gui_process(&args[1], &args[2]),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("rockstar: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_cli() -> anyhow::Result<()> {
+    let request = OpenWorkspaceRequest::new(
+        &env::current_dir().context("Cannot determine the current directory")?,
+    )?;
+    launch::run_cli(request)
+}
+
+fn run_gui(
+    request: OpenWorkspaceRequest,
+    server: InstanceServer,
+    mut startup: UnixStream,
+) -> anyhow::Result<()> {
+    let requests = server.requests()?;
 
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
-            cx.set_http_client(media::http::MediaHttpClient::new(cx.background_executor().clone()));
+            cx.set_http_client(media::http::MediaHttpClient::new(
+                cx.background_executor().clone(),
+            ));
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
@@ -85,10 +119,26 @@ fn main() -> ExitCode {
                 app_id: Some("rockstar".into()),
                 ..Default::default()
             };
-            open_dock_window(options, current_dir, Arc::new(pi::connect), cx)
-                .expect("failed to open the app window");
-            cx.activate(true);
+            let result = (|| {
+                let (window, workspace) =
+                    open_dock_window(options, request.root, Arc::new(pi::connect), cx)
+                        .context("Cannot open the Rockstar window")?;
+                dispatch_requests(requests, workspace, window, cx);
+                cx.activate(true);
+                launch::send_startup_status(&mut startup, StartupStatus::Ready)
+            })();
+            if let Err(error) = result {
+                eprintln!("rockstar: {error:#}");
+                let _ = launch::send_startup_status(
+                    &mut startup,
+                    StartupStatus::Failed(format!("{error:#}")),
+                );
+                cx.quit();
+            }
         });
 
-    ExitCode::SUCCESS
+    // Retain the exclusive reservation for the entire GUI lifetime, not just
+    // until startup finishes or the request worker stops.
+    drop(server);
+    Ok(())
 }
