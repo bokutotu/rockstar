@@ -4,14 +4,17 @@ mod model;
 mod presentation;
 mod tree;
 mod view;
+mod watch;
 
+pub(crate) use git::resolve_watch_target;
 pub(crate) use model::DiffSnapshot;
 pub(crate) use model::{DiffRequest, IndexAction, LocalFilter};
 pub(crate) use view::DiffView;
+pub(crate) use watch::DiffWatches;
 
 use anyhow::{Result, ensure};
 use gpui_kit::{AppContext as _, Context, EntityId};
-use model::{DiffEntry, DiffSource};
+use model::DiffEntry;
 use std::{collections::HashSet, path::Path, sync::Arc};
 
 pub(crate) fn load(directory: &Path, request: DiffRequest) -> Result<DiffSnapshot> {
@@ -48,17 +51,22 @@ impl DiffSession {
             let first = self.visible_views.is_empty();
             self.visible_views.insert(view);
             if first && self.needs_refresh {
-                self.needs_refresh = false;
-                if matches!(self.snapshot.source, DiffSource::Local(_)) {
-                    self.refresh(cx);
-                }
+                self.refresh(cx);
             }
         } else if self.visible_views.remove(&view) && self.visible_views.is_empty() {
             self.needs_refresh = true;
         }
     }
 
+    fn invalidate(&mut self, cx: &mut Context<Self>) {
+        self.needs_refresh = true;
+        if !self.visible_views.is_empty() && self.pending.is_none() {
+            self.run(None, cx);
+        }
+    }
+
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.needs_refresh = true;
         if self.pending.is_none() {
             self.run(None, cx);
         }
@@ -80,6 +88,9 @@ impl DiffSession {
     }
 
     fn run(&mut self, operation: Option<(DiffEntry, IndexAction)>, cx: &mut Context<Self>) {
+        // Only the operation consuming this flag clears it. Notifications received
+        // during a read/index write must schedule another read after completion.
+        self.needs_refresh = false;
         let snapshot = self.snapshot.clone();
         self.pending = Some(
             operation
@@ -120,6 +131,9 @@ impl DiffSession {
                             |previous| format!("{previous}\n{message}"),
                         ));
                     }
+                }
+                if this.needs_refresh && !this.visible_views.is_empty() {
+                    this.run(None, cx);
                 }
                 cx.notify();
             });

@@ -1,7 +1,7 @@
 //! Window-level navigation. Each tab retains its own editing and process state.
 use super::picker::{self, Candidate, PickerKind};
 use super::*;
-use crate::file_watch::FileWatches;
+use crate::{diff::DiffWatches, file_watch::FileWatches};
 
 struct Workspace {
     id: EntityId,
@@ -22,6 +22,7 @@ pub(crate) struct WorkspaceWindow {
     active: usize,
     connect: AgentConnector,
     watches: Entity<FileWatches>,
+    diff_watches: Entity<DiffWatches>,
     opening_diffs: Vec<(EntityId, DiffRequest)>,
 }
 
@@ -33,11 +34,13 @@ impl WorkspaceWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let watches = cx.new(|cx| FileWatches::new(window, cx));
+        let diff_watches = cx.new(|cx| DiffWatches::new(window, cx));
         let mut this = Self {
             workspaces: Vec::new(),
             active: 0,
             connect,
             watches,
+            diff_watches,
             opening_diffs: Vec::new(),
         };
         let root = root.canonicalize().unwrap_or(root);
@@ -189,15 +192,19 @@ impl WorkspaceWindow {
         anyhow::ensure!(!self.opening_diffs.contains(&key), "This diff is already loading");
         self.opening_diffs.push(key);
         window.push_notification(Notification::info("Loading diff…"), cx);
-        let loading = cx.background_spawn(async move { crate::diff::load(&root, request) });
+        let loading = cx.background_spawn(async move {
+            let snapshot = crate::diff::load(&root, request)?;
+            let target = crate::diff::resolve_watch_target(&snapshot.root)?;
+            Ok::<_, anyhow::Error>((snapshot, target))
+        });
         cx.spawn_in(window, async move |this, cx| {
             let result = loading.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.opening_diffs.retain(|pending| *pending != key);
                 let Some(index) = this.workspaces.iter().position(|workspace| workspace.id == owner
                     && workspace.tabs.iter().any(|tab| tab.entity_id() == origin)) else { return; };
-                let snapshot = match result {
-                    Ok(snapshot) => snapshot,
+                let (snapshot, target) = match result {
+                    Ok(loaded) => loaded,
                     Err(error) => {
                         window.push_notification(Notification::error(format!("Diff: {error:#}")).autohide(false), cx);
                         return;
@@ -210,6 +217,7 @@ impl WorkspaceWindow {
                 let tab = this.create_tab(this.workspaces[index].root.clone(), window, cx);
                 tab.update(cx, |tab, cx| {
                     let session = cx.new(|_| crate::diff::DiffSession::new(snapshot));
+                    this.diff_watches.update(cx, |watches, cx| watches.attach(target, &session, cx));
                     let id = tab.register_item(OpenItem::Diff(session), cx);
                     tab.show_item(tab.panes[tab.active].entity_id(), id, window, cx);
                 });

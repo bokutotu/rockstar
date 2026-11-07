@@ -367,13 +367,9 @@ impl DiffView {
         let section = self.selected_entry.as_ref().map(|e| e.section);
         let state = self.session.read(cx);
         let (before_label, after_label) = match &state.snapshot.source {
-            DiffSource::PullRequest {
-                head_oid,
-                merge_base_oid,
-                ..
-            } => (
+            DiffSource::PullRequest { merge_base_oid, .. } => (
                 format!("Merge base {}", &merge_base_oid[..8]),
-                format!("PR head {}", &head_oid[..8]),
+                "Working tree (saved)".into(),
             ),
             _ if section == Some(DiffSection::Staged) => ("HEAD".into(), "Index".into()),
             _ => ("Index".into(), "Working tree (saved)".into()),
@@ -545,13 +541,10 @@ impl Render for DiffView {
         let error = state.error.clone();
         let source = match &state.snapshot.source {
             DiffSource::Local(_) => format!("{} · saved files only", state.snapshot.root.display()),
-            DiffSource::PullRequest {
-                base_oid, head_oid, ..
-            } => format!(
-                "{} · base {} · head {}",
+            DiffSource::PullRequest { merge_base_oid, .. } => format!(
+                "{} · merge base {} · working tree (saved)",
                 state.snapshot.root.display(),
-                &base_oid[..8],
-                &head_oid[..8]
+                &merge_base_oid[..8]
             ),
         };
         let path = self

@@ -1,4 +1,4 @@
-//! The only module that runs Git/gh or reads working-tree files.
+//! Git/gh commands and diff file reads. Repository watch discovery also uses these helpers.
 use super::model::*;
 use anyhow::{Context as _, Result, bail, ensure};
 use std::{
@@ -89,6 +89,27 @@ pub(super) fn repository_root(directory: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(OsString::from_vec(bytes.to_vec())).canonicalize()?)
 }
 
+pub(crate) fn resolve_watch_target(root: &Path) -> Result<RepositoryWatchTarget> {
+    let resolve = |argument: &str| -> Result<PathBuf> {
+        let bytes = checked(git(root).args(["rev-parse", "--path-format=absolute", argument]))?;
+        let bytes = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+        Ok(PathBuf::from(OsString::from_vec(bytes.to_vec())).canonicalize()?)
+    };
+    Ok(RepositoryWatchTarget {
+        worktree: root.to_path_buf(),
+        git_dir: resolve("--git-dir")?,
+        common_dir: resolve("--git-common-dir")?,
+    })
+}
+
+pub(super) fn tracked_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    let data = checked(git(root).args(["ls-files", "--cached", "-z"]))?;
+    data.split(|byte| *byte == 0)
+        .filter(|item| !item.is_empty())
+        .map(path)
+        .collect()
+}
+
 pub(super) fn load(directory: &Path, request: DiffRequest) -> Result<DiffSnapshot> {
     let root = repository_root(directory)?;
     match request {
@@ -168,21 +189,7 @@ pub(super) fn load_local_diff(root: &Path, filter: LocalFilter) -> Result<DiffSn
     }
     if filter != LocalFilter::Staged {
         entries.extend(changes(root, &[], DiffSection::Unstaged)?);
-        let data = checked(git(root).args(["ls-files", "--others", "--exclude-standard", "-z"]))?;
-        for item in data
-            .split(|byte| *byte == 0)
-            .filter(|item| !item.is_empty())
-        {
-            // An untracked embedded repository is reported with a trailing '/'.
-            // Keep it a file-level entry; Git itself decides how to add it.
-            let item = item.strip_suffix(b"/").unwrap_or(item);
-            entries.push(DiffEntry {
-                section: DiffSection::Unstaged,
-                old_path: None,
-                new_path: Some(path(item)?),
-                kind: ChangeKind::Untracked,
-            });
-        }
+        entries.extend(untracked_entries(root, DiffSection::Unstaged)?);
     }
     entries.sort_by(|a, b| {
         a.section
@@ -194,6 +201,23 @@ pub(super) fn load_local_diff(root: &Path, filter: LocalFilter) -> Result<DiffSn
         source: DiffSource::Local(filter),
         entries,
     })
+}
+
+fn untracked_entries(root: &Path, section: DiffSection) -> Result<Vec<DiffEntry>> {
+    let data = checked(git(root).args(["ls-files", "--others", "--exclude-standard", "-z"]))?;
+    data.split(|byte| *byte == 0)
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            // Git reports an untracked embedded repository with a trailing '/'.
+            let item = item.strip_suffix(b"/").unwrap_or(item);
+            Ok(DiffEntry {
+                section,
+                old_path: None,
+                new_path: Some(path(item)?),
+                kind: ChangeKind::Untracked,
+            })
+        })
+        .collect()
 }
 
 #[derive(serde::Deserialize)]
@@ -265,8 +289,6 @@ fn load_pr_diff(root: &Path) -> Result<DiffSnapshot> {
         root: root.to_path_buf(),
         source: DiffSource::PullRequest {
             number: pr.number,
-            base_oid: pr.base,
-            head_oid: pr.head,
             merge_base_oid: merge_base,
         },
         entries: Vec::new(),
@@ -276,19 +298,48 @@ fn load_pr_diff(root: &Path) -> Result<DiffSnapshot> {
 pub(super) fn refresh_diff(snapshot: &DiffSnapshot) -> Result<DiffSnapshot> {
     match &snapshot.source {
         DiffSource::Local(filter) => load_local_diff(&snapshot.root, *filter),
-        DiffSource::PullRequest {
-            head_oid,
-            merge_base_oid,
-            ..
-        } => Ok(DiffSnapshot {
-            root: snapshot.root.clone(),
-            source: snapshot.source.clone(),
-            entries: changes(
-                &snapshot.root,
-                &[merge_base_oid, head_oid],
-                DiffSection::PullRequest,
-            )?,
-        }),
+        DiffSource::PullRequest { merge_base_oid, .. } => {
+            let root = &snapshot.root;
+            let mut entries = changes(root, &[merge_base_oid], DiffSection::PullRequest)?;
+            for untracked in untracked_entries(root, DiffSection::PullRequest)? {
+                // A staged/committed deletion can have an untracked replacement on
+                // disk. Show one before/after comparison, not D and ? for one path.
+                if let Some(index) = entries.iter().position(|entry| {
+                    entry.kind == ChangeKind::Deleted && entry.old_path == untracked.new_path
+                }) {
+                    let entry = &mut entries[index];
+                    entry.new_path = untracked.new_path;
+                    entry.kind = ChangeKind::Modified;
+                    if let (Ok(before), Ok(after)) = (
+                        tree_file(root, merge_base_oid, entry.path()),
+                        worktree_file(root, entry.path()),
+                    ) {
+                        // Binary is only a display marker, not an equality check
+                        // for the underlying bytes.
+                        let same_content = match (&before.content, &after.content) {
+                            (FileContent::Text(before), FileContent::Text(after))
+                            | (FileContent::Gitlink(before), FileContent::Gitlink(after)) => before == after,
+                            _ => false,
+                        };
+                        if before.mode == after.mode && same_content {
+                            entries.remove(index);
+                        } else if before.mode.map(|mode| mode & 0o170000)
+                            != after.mode.map(|mode| mode & 0o170000)
+                        {
+                            entry.kind = ChangeKind::TypeChanged;
+                        }
+                    }
+                } else {
+                    entries.push(untracked);
+                }
+            }
+            entries.sort_by(|a, b| a.path().cmp(b.path()));
+            Ok(DiffSnapshot {
+                root: root.clone(),
+                source: snapshot.source.clone(),
+                entries,
+            })
+        }
     }
 }
 
@@ -453,8 +504,8 @@ pub(super) fn load_document(snapshot: &DiffSnapshot, entry: &DiffEntry) -> Resul
         (_, _, None) => FileVersion::missing(),
         (DiffSource::Local(_), DiffSection::Staged, Some(file)) => index_file(root, file)?,
         (DiffSource::Local(_), DiffSection::Unstaged, Some(file)) => worktree_file(root, file)?,
-        (DiffSource::PullRequest { head_oid, .. }, DiffSection::PullRequest, Some(file)) => {
-            tree_file(root, head_oid, file)?
+        (DiffSource::PullRequest { .. }, DiffSection::PullRequest, Some(file)) => {
+            worktree_file(root, file)?
         }
         _ => bail!("Invalid diff comparison"),
     };

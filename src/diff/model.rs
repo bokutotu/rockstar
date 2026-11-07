@@ -19,12 +19,18 @@ pub(crate) enum DiffRequest {
 #[derive(Clone, Debug)]
 pub(crate) enum DiffSource {
     Local(LocalFilter),
+    /// The opening PR's merge base stays fixed; the other side is the saved worktree.
     PullRequest {
         number: u64,
-        base_oid: String,
-        head_oid: String,
         merge_base_oid: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RepositoryWatchTarget {
+    pub worktree: PathBuf,
+    pub git_dir: PathBuf,
+    pub common_dir: PathBuf,
 }
 
 impl DiffSource {
