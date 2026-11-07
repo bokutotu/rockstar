@@ -10,7 +10,9 @@ use gpui_kit::{
         input::{Enter, IndentInline, Input, InputEvent, InputState, OutdentInline},
         notification::Notification,
     },
-    div, px,
+    div,
+    prelude::FluentBuilder as _,
+    px,
 };
 
 use crate::{
@@ -20,8 +22,12 @@ use crate::{
     workspace::{WipeMode, WorkspaceWindow},
 };
 
+mod completion;
 mod path_completion;
-use path_completion::{PathCompletion, wsnew_argument, wsnew_candidates};
+use completion::{Completion, command_candidates};
+use path_completion::{wsnew_argument, wsnew_candidates};
+
+const VISIBLE_COMPLETIONS: usize = 10;
 
 pub(crate) fn bind_mode(workspace: &Entity<WorkspaceWindow>, window: &mut Window, cx: &mut App) {
     workspace.update(cx, |workspace, cx| workspace.focus_active(window, cx));
@@ -93,7 +99,7 @@ fn open(workspace: WeakEntity<WorkspaceWindow>, window: &mut Window, cx: &mut Ap
 struct CommandPaletteView {
     input: Entity<InputState>,
     workspace: WeakEntity<WorkspaceWindow>,
-    completion: Option<PathCompletion>,
+    completion: Option<Completion>,
     completion_task: Option<Task<()>>,
 }
 
@@ -114,6 +120,7 @@ impl CommandPaletteView {
             if edited || matches!(event, InputEvent::Blur) {
                 this.completion = None;
                 this.completion_task = None;
+                cx.notify();
             }
         })
         .detach();
@@ -125,22 +132,15 @@ impl CommandPaletteView {
         }
     }
 
-    fn complete_path(
-        &mut self,
-        forward: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    fn complete(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let input = self.input.read(cx);
         let command = input.value();
-        let Some(argument) = wsnew_argument(&command) else {
-            return false;
-        };
         if input.is_composing() {
             return false;
         }
+        let argument = wsnew_argument(&command);
         let selection = input.selected_range();
-        let before_closing_quote = argument.starts_with('"')
+        let before_closing_quote = argument.is_some_and(|argument| argument.starts_with('"'))
             && command.trim_end().ends_with('"')
             && input.cursor() + 1 == command.trim_end().len();
         if !selection.is_empty() || (input.cursor() != command.len() && !before_closing_quote) {
@@ -155,9 +155,17 @@ impl CommandPaletteView {
             return true;
         }
 
-        // A unique candidate already ends in '/', so the next request searches
-        // inside it instead of cycling over that same candidate forever.
         self.completion = None;
+        self.completion_task = None;
+        cx.notify();
+        if argument.is_none() {
+            self.completion = Completion::start(command_candidates(&command), forward);
+            self.apply_completion(window, cx);
+            return true;
+        }
+
+        // A unique path candidate already ends in '/', so the next request
+        // searches inside it instead of cycling over that candidate forever.
         let Some(workspace) = self.workspace.upgrade() else {
             return true;
         };
@@ -181,7 +189,7 @@ impl CommandPaletteView {
                 }
                 match result {
                     Ok(candidates) => {
-                        this.completion = PathCompletion::start(candidates, forward);
+                        this.completion = Completion::start(candidates, forward);
                         this.apply_completion(window, cx);
                     }
                     Err(error) => window.push_notification(
@@ -195,6 +203,7 @@ impl CommandPaletteView {
     }
 
     fn apply_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.notify();
         let Some(completion) = &self.completion else {
             return;
         };
@@ -204,6 +213,69 @@ impl CommandPaletteView {
             input.replace_all(command, window, cx);
             input.set_selected_range(cursor..cursor, cx);
         });
+    }
+
+    fn render_completion(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
+        let completion = self.completion.as_ref().filter(|c| !c.is_unique())?;
+        let first = completion
+            .selected
+            .saturating_sub(VISIBLE_COMPLETIONS - 1)
+            .min(
+                completion
+                    .candidates
+                    .len()
+                    .saturating_sub(VISIBLE_COMPLETIONS),
+            );
+        let theme = cx.theme();
+        let rows = completion
+            .candidates
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(VISIBLE_COMPLETIONS)
+            .map(|(index, candidate)| {
+                let selected = index == completion.selected;
+                div()
+                    .id(("command-completion", index))
+                    .role(Role::ListBoxOption)
+                    .aria_label(candidate.clone())
+                    .aria_selected(selected)
+                    .px_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .truncate()
+                    .when(selected, |row| {
+                        row.bg(theme.accent).text_color(theme.accent_foreground)
+                    })
+                    .child(candidate.clone())
+            });
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .id("command-completions")
+                        .role(Role::ListBox)
+                        .aria_label("Command completions")
+                        .p_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme.border)
+                        .children(rows),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!(
+                            "{} / {} · Tab / Shift+Tab to select · Enter to run",
+                            completion.selected + 1,
+                            completion.candidates.len(),
+                        )),
+                ),
+        )
     }
 
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -252,7 +324,9 @@ impl CommandPaletteView {
                 workspace.update(cx, |workspace, cx| workspace.open_diff(request, window, cx))
             }
             "stage" => tab.update(cx, |tab, cx| tab.update_diff_index(IndexAction::Stage, cx)),
-            "unstage" => tab.update(cx, |tab, cx| tab.update_diff_index(IndexAction::Unstage, cx)),
+            "unstage" => tab.update(cx, |tab, cx| {
+                tab.update_diff_index(IndexAction::Unstage, cx)
+            }),
             "e!" => tab.update(cx, |tab, cx| tab.reload_active_file(window, cx)),
             "chat" => {
                 tab.update(cx, |workspace, cx| workspace.show_chat(false, window, cx));
@@ -322,13 +396,16 @@ impl Render for CommandPaletteView {
             .role(Role::Group)
             .aria_label("Commands")
             .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
             .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
-                if this.complete_path(true, window, cx) {
+                if this.complete(true, window, cx) {
                     cx.stop_propagation();
                 }
             }))
             .capture_action(cx.listener(|this, _: &OutdentInline, window, cx| {
-                if this.complete_path(false, window, cx) {
+                if this.complete(false, window, cx) {
                     cx.stop_propagation();
                 }
             }))
@@ -343,5 +420,6 @@ impl Render for CommandPaletteView {
                     .prefix(div().child(":"))
                     .aria_label("Command"),
             )
+            .children(self.render_completion(cx))
     }
 }

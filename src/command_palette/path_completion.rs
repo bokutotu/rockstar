@@ -2,43 +2,6 @@ use std::{fs, path::Path};
 
 use anyhow::Context as _;
 
-/// One cycle of completed commands, retained until the user edits the input.
-pub(super) struct PathCompletion {
-    candidates: Vec<String>,
-    selected: usize,
-}
-
-impl PathCompletion {
-    pub(super) fn start(candidates: Vec<String>, forward: bool) -> Option<Self> {
-        if candidates.is_empty() {
-            return None;
-        }
-        let selected = if forward { 0 } else { candidates.len() - 1 };
-        Some(Self {
-            candidates,
-            selected,
-        })
-    }
-
-    pub(super) fn current(&self) -> &str {
-        &self.candidates[self.selected]
-    }
-
-    pub(super) fn is_unique(&self) -> bool {
-        self.candidates.len() == 1
-    }
-
-    pub(super) fn advance(&mut self, forward: bool) -> &str {
-        let count = self.candidates.len();
-        self.selected = if forward {
-            (self.selected + 1) % count
-        } else {
-            (self.selected + count - 1) % count
-        };
-        self.current()
-    }
-}
-
 pub(super) fn wsnew_argument(command: &str) -> Option<&str> {
     let text = command.trim_start();
     let (name, argument) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
