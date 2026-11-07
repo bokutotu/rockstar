@@ -72,6 +72,7 @@ impl Tab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
+        let active_pane = self.panes[self.active].entity_id();
         let current = self.panes[self.active].read(cx).item_id(cx);
         let Some(index) = self.items.iter().position(|item| Some(item.id()) == current) else {
             anyhow::bail!("This pane has no item to wipe.");
@@ -92,12 +93,18 @@ impl Tab {
         if let OpenItem::Media(session) = &item {
             session.update(cx, |session, cx| session.shutdown(cx));
         }
+        // Only other panes get a replacement; the last pane must stay Plain.
         if let Some(replacement) = replacement {
             for pane_id in affected {
-                self.show_item(pane_id, replacement, window, cx);
+                if pane_id != active_pane {
+                    self.show_item(pane_id, replacement, window, cx);
+                }
             }
         }
         self.pending.clear();
+        if self.panes.len() > 1 {
+            return self.close_active_pane(window, cx);
+        }
         self.reveal_active_item(cx);
         if !cx.global::<Mode>().is_overlay() {
             self.focus_active(window, cx);
