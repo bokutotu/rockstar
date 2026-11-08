@@ -46,7 +46,11 @@ impl OpenItem {
             Self::Terminal(session) => session.read(cx).label(),
             Self::Diff(session) => session.read(cx).label(),
             Self::Media(session) => match &session.read(cx).source {
-                crate::media::MediaSource::File(path) => path.strip_prefix(root).unwrap_or(path).display().to_string(),
+                crate::media::MediaSource::File(path) => path
+                    .strip_prefix(root)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string(),
                 source => source.label(),
             },
             Self::File(buffer) => {
@@ -74,11 +78,17 @@ impl Tab {
     ) -> anyhow::Result<()> {
         let active_pane = self.panes[self.active].entity_id();
         let current = self.panes[self.active].read(cx).item_id(cx);
-        let Some(index) = self.items.iter().position(|item| Some(item.id()) == current) else {
+        let Some(index) = self
+            .items
+            .iter()
+            .position(|item| Some(item.id()) == current)
+        else {
             anyhow::bail!("This pane has no item to wipe.");
         };
         self.items[index].check_wipe(mode, cx)?;
-        let replacement = self.next_item(current, true).filter(|id| Some(*id) != current);
+        let replacement = self
+            .next_item(current, true)
+            .filter(|id| Some(*id) != current);
         let item = self.items.remove(index);
         let id = item.id();
         let mut affected = Vec::new();
@@ -116,7 +126,9 @@ impl Tab {
     pub(super) fn buffers(&self) -> impl Iterator<Item = &Entity<FileBuffer>> {
         self.items.iter().filter_map(|item| match item {
             OpenItem::File(buffer) => Some(buffer),
-            OpenItem::Chat(_) | OpenItem::Terminal(_) | OpenItem::Media(_) | OpenItem::Diff(_) => None,
+            OpenItem::Chat(_) | OpenItem::Terminal(_) | OpenItem::Media(_) | OpenItem::Diff(_) => {
+                None
+            }
         })
     }
 
@@ -131,8 +143,23 @@ impl Tab {
         if !self.items.iter().any(|entry| entry.id() == id) {
             if let OpenItem::File(buffer) = &item {
                 // The item bar must update even when no pane displays this buffer.
-                cx.observe(buffer, |_, _, cx| cx.notify()).detach();
-                self.watches.update(cx, |watches, cx| watches.attach(buffer, cx));
+                let mut before = buffer.read(cx).text.clone();
+                let id = buffer.entity_id();
+                cx.observe(buffer, move |this, buffer, cx| {
+                    let after = buffer.read(cx).text.clone();
+                    if before != after {
+                        this.vim.update(cx, |vim, _| {
+                            for location in vim.marks.values_mut() {
+                                location.remap(id, &before, &after);
+                            }
+                        });
+                        before = after;
+                    }
+                    cx.notify();
+                })
+                .detach();
+                self.watches
+                    .update(cx, |watches, cx| watches.attach(buffer, cx));
             }
             if let OpenItem::Terminal(session) = &item {
                 let mut label = session.read(cx).label();
@@ -142,7 +169,8 @@ impl Tab {
                         label = next;
                         cx.notify();
                     }
-                }).detach();
+                })
+                .detach();
             }
             self.items.push(item);
             cx.notify();
@@ -267,13 +295,20 @@ impl Tab {
                         theme.muted_foreground
                     })
                     .border_b_1()
-                    .border_color(if selected { theme.primary } else { theme.border })
+                    .border_color(if selected {
+                        theme.primary
+                    } else {
+                        theme.border
+                    })
                     .hover(|style| style.bg(theme.accent))
                     .child(label)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if matches!(
                             *cx.global::<Mode>(),
-                            Mode::CommandPalette | Mode::FileFinder | Mode::Switcher | Mode::Confirm
+                            Mode::CommandPalette
+                                | Mode::FileFinder
+                                | Mode::Switcher
+                                | Mode::Confirm
                         ) {
                             return;
                         }

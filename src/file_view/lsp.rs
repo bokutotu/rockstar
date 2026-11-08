@@ -39,6 +39,7 @@ pub(super) struct LspViewState {
     call_tasks: Vec<Task<()>>,
     popup: Option<Popup>,
     generation: u64,
+    tag_origin: Option<BufferLocation>,
     lens_snapshot: Option<DocumentSnapshot>,
     lenses: Vec<CodeLens>,
 }
@@ -58,6 +59,7 @@ impl LspViewState {
             call_tasks: Vec::new(),
             popup: None,
             generation: 0,
+            tag_origin: None,
             lens_snapshot: None,
             lenses: Vec::new(),
         }
@@ -200,6 +202,7 @@ impl FileView {
     fn cancel_lsp_request(&mut self) {
         self.lsp_ui.generation += 1;
         self.lsp_ui.task = None;
+        self.lsp_ui.tag_origin = None;
     }
     pub(super) fn init_lsp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(doc) = self.buffer.read(cx).lsp.clone() else {
@@ -475,7 +478,9 @@ impl FileView {
         self.lsp_ui.cursor_task = None;
         self.lsp_ui.call_tasks.clear();
         self.lsp_ui.popup = None;
-        if let Some(panel) = self.lsp_ui.documentation.take() { panel.content.shutdown(cx); }
+        if let Some(panel) = self.lsp_ui.documentation.take() {
+            panel.content.shutdown(cx);
+        }
         self.vim.pending.clear();
         self.insert = None;
         self.buffer.update(cx, |buffer, _| buffer.end_insert());
@@ -486,31 +491,40 @@ impl FileView {
         &mut self,
         position: Position,
         encoding: Encoding,
+        linewise: bool,
         activate: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match encoding.offset(&self.buffer.read(cx).text, position) {
             Ok(offset) => {
+                let offset = if linewise {
+                    first_nonblank(&self.buffer.read(cx).text, offset)
+                } else {
+                    normal_cursor(&self.buffer.read(cx).text, offset)
+                };
                 self.vim.cursor = offset;
                 self.vim.mode = Mode::Normal;
                 self.vim.pending.clear();
                 self.insert = None;
+                self.change = None;
                 self.buffer.update(cx, |buffer, _| buffer.end_insert());
-                self.input.update(cx, |input, cx| input.set_readonly(true, cx));
+                self.input
+                    .update(cx, |input, cx| input.set_readonly(true, cx));
+                self.reveal_folds(offset, false, cx);
                 self.select(cx);
                 if activate {
                     self.set_mode(Mode::Normal, cx);
                     self.focus(window, cx);
                 }
             }
-            Err(error) => Self::lsp_error(error, window, cx),
+            Err(error) => self.vim_error(error, window, cx),
         }
     }
     fn lsp_error(error: impl std::fmt::Display, window: &mut Window, cx: &mut App) {
         window.push_notification(Notification::error(format!("LSP: {error}")), cx);
     }
-    fn start_lsp_request(
+    pub(super) fn start_lsp_request(
         &mut self,
         method: &'static str,
         capability: &str,
@@ -518,12 +532,12 @@ impl FileView {
         cx: &mut Context<Self>,
     ) {
         let Some(doc) = self.buffer.read(cx).lsp.clone() else {
-            Self::lsp_error("No language server for this file", window, cx);
+            self.vim_error("No language server for this file", window, cx);
             return;
         };
         let session = doc.read(cx).session.clone();
         if !session.supports(capability) {
-            Self::lsp_error(
+            self.vim_error(
                 match session.state() {
                     ServerState::Failed(e) => e,
                     ServerState::Starting => "Language server is starting".into(),
@@ -538,14 +552,29 @@ impl FileView {
             return;
         };
         let pos = self.vim.cursor;
-        let response = doc.update(cx, |doc, cx| doc.request_at(method, &snap, pos, cx));
+        let response = doc.update(cx, |doc, cx| {
+            if method == "textDocument/references" {
+                let position = doc.session.encoding().position(&snap.text, pos)?;
+                doc.request(
+                    method,
+                    &snap,
+                    json!({"position":position,"context":{"includeDeclaration":true}}),
+                    cx,
+                )
+            } else if method == "textDocument/documentSymbol" {
+                doc.request(method, &snap, json!({}), cx)
+            } else {
+                doc.request_at(method, &snap, pos, cx)
+            }
+        });
         let Ok(response) = response else {
-            Self::lsp_error(response.err().unwrap(), window, cx);
+            self.vim_error(response.err().unwrap(), window, cx);
             return;
         };
         self.lsp_ui.generation += 1;
         let generation = self.lsp_ui.generation;
         let encoding = session.encoding();
+        self.lsp_ui.tag_origin = (method == "textDocument/definition").then(|| self.location(cx));
         if method == "textDocument/prepareCallHierarchy" {
             self.show_popup(
                 Popup {
@@ -563,9 +592,15 @@ impl FileView {
                 cx,
             );
         }
+        self.shared.update(cx, |vim, _| {
+            if vim.macros.running {
+                vim.macros.waiting = true;
+            }
+        });
         self.lsp_ui.task = Some(cx.spawn_in(window, async move |this, cx| {
             let result = response.recv().await;
             let _ = this.update_in(cx, |this, window, cx| {
+                this.shared.update(cx, |vim, _| vim.macros.waiting = false);
                 if this.lsp_ui.generation != generation
                     || !doc.read(cx).is_current(&snap, cx)
                     || this.vim.cursor != pos
@@ -578,7 +613,7 @@ impl FileView {
                 let value = match result {
                     Ok(v) => v,
                     Err(e) => {
-                        Self::lsp_error(e, window, cx);
+                        this.vim_error(e, window, cx);
                         if let Some(p) = &mut this.lsp_ui.popup {
                             p.message = "Request failed".into();
                         }
@@ -587,7 +622,10 @@ impl FileView {
                     }
                 };
                 match method {
-                    "textDocument/definition" => match providers::locations(value) {
+                    "textDocument/definition"
+                    | "textDocument/typeDefinition"
+                    | "textDocument/implementation"
+                    | "textDocument/references" => match providers::locations(value) {
                         Ok(locations) => this.show_locations(
                             locations
                                 .into_iter()
@@ -595,12 +633,71 @@ impl FileView {
                                 .collect(),
                             snap,
                             encoding,
-                            "Definitions",
+                            match method {
+                                "textDocument/references" => "References",
+                                "textDocument/implementation" => "Implementations",
+                                "textDocument/typeDefinition" => "Type definitions",
+                                _ => "Definitions",
+                            },
                             window,
                             cx,
                         ),
                         Err(e) => Self::lsp_error(e, window, cx),
                     },
+                    "textDocument/documentSymbol" => {
+                        let result = serde_json::from_value::<
+                            Option<lsp_types::DocumentSymbolResponse>,
+                        >(value);
+                        match result {
+                            Ok(symbols) => {
+                                fn add(
+                                    symbol: lsp_types::DocumentSymbol,
+                                    uri: &Uri,
+                                    out: &mut Vec<Location>,
+                                ) {
+                                    out.push(Location::new(uri.clone(), symbol.selection_range));
+                                    for child in symbol.children.unwrap_or_default() {
+                                        add(child, uri, out);
+                                    }
+                                }
+                                let mut locations = Vec::new();
+                                match symbols {
+                                    Some(lsp_types::DocumentSymbolResponse::Nested(symbols)) => {
+                                        for symbol in symbols {
+                                            add(symbol, &snap.uri, &mut locations);
+                                        }
+                                    }
+                                    Some(lsp_types::DocumentSymbolResponse::Flat(symbols)) => {
+                                        locations.extend(symbols.into_iter().map(|s| s.location))
+                                    }
+                                    None => {}
+                                }
+                                this.show_locations(
+                                    locations, snap, encoding, "Symbols", window, cx,
+                                );
+                            }
+                            Err(error) => Self::lsp_error(error, window, cx),
+                        }
+                    }
+                    "textDocument/signatureHelp" => {
+                        match serde_json::from_value::<Option<lsp_types::SignatureHelp>>(value) {
+                            Ok(Some(help)) if !help.signatures.is_empty() => {
+                                let signature = &help.signatures
+                                    [(help.active_signature.unwrap_or(0) as usize)
+                                        .min(help.signatures.len() - 1)];
+                                this.show_documentation(
+                                    format!("```\n{}\n```", signature.label),
+                                    snap.version,
+                                    pos,
+                                    window,
+                                    cx,
+                                );
+                            }
+                            Ok(_) => window
+                                .push_notification(Notification::info("No signature help"), cx),
+                            Err(error) => Self::lsp_error(error, window, cx),
+                        }
+                    }
                     "textDocument/hover" => match serde_json::from_value::<Option<Hover>>(value) {
                         Ok(hover) => {
                             match hover.and_then(|hover| hover_markdown(&hover.contents)) {
@@ -652,6 +749,10 @@ impl FileView {
         cx: &mut Context<Self>,
     ) {
         if locations.len() == 1 {
+            if let Some(origin) = self.lsp_ui.tag_origin.take() {
+                self.jumps.update(cx, |jumps, _| jumps.push_tag(origin));
+            }
+            self.remember_jump(cx);
             let l = &locations[0];
             cx.emit(Navigate {
                 uri: l.uri.clone(),
@@ -659,7 +760,7 @@ impl FileView {
                 encoding,
             });
         } else if locations.is_empty() {
-            window.push_notification(Notification::info(format!("{title}: no results")), cx);
+            self.vim_error(format!("{title}: no results"), window, cx);
         } else {
             self.show_popup(
                 Popup {
@@ -686,7 +787,9 @@ impl FileView {
     }
     pub(super) fn close_lsp_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let documentation = self.lsp_ui.documentation.take();
-        if let Some(panel) = &documentation { panel.content.shutdown(cx); }
+        if let Some(panel) = &documentation {
+            panel.content.shutdown(cx);
+        }
         let focused = self.lsp_ui.focus.contains_focused(window, cx)
             || documentation
                 .as_ref()
@@ -834,6 +937,10 @@ impl FileView {
             return;
         };
         let encoding = p.encoding;
+        if let Some(origin) = self.lsp_ui.tag_origin.take() {
+            self.jumps.update(cx, |jumps, _| jumps.push_tag(origin));
+        }
+        self.remember_jump(cx);
         self.close_lsp_popup(window, cx);
         cx.emit(Navigate {
             uri: row.location.uri,

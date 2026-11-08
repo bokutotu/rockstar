@@ -642,6 +642,28 @@ pub(crate) fn resolve_target(
     {
         return None;
     }
+    Some(motion_target(
+        text,
+        at,
+        to,
+        linewise,
+        inclusive,
+        operator,
+        forced,
+        geometry.tab,
+    ))
+}
+
+pub(crate) fn motion_target(
+    text: &str,
+    at: usize,
+    to: usize,
+    mut linewise: bool,
+    mut inclusive: bool,
+    operator: Option<Operator>,
+    forced: Option<SelectionKind>,
+    tab: usize,
+) -> ResolvedTarget {
     if let Some(kind) = forced {
         match kind {
             SelectionKind::Line => linewise = true,
@@ -650,16 +672,13 @@ pub(crate) fn resolve_target(
                 linewise = false;
             }
             SelectionKind::Block => {
-                return Some(block_target(
+                return block_target(
                     text,
                     at,
                     to,
-                    (
-                        display_column(text, at, geometry.tab),
-                        display_column(text, to, geometry.tab),
-                    ),
-                    geometry.tab,
-                ));
+                    (display_column(text, at, tab), display_column(text, to, tab)),
+                    tab,
+                );
             }
         }
     }
@@ -692,7 +711,7 @@ pub(crate) fn resolve_target(
             vec![lo..hi]
         }
     };
-    Some(ResolvedTarget {
+    ResolvedTarget {
         destination: normal_cursor(text, to),
         ranges,
         kind: if linewise {
@@ -701,5 +720,5 @@ pub(crate) fn resolve_target(
             SelectionKind::Character
         },
         block_columns: None,
-    })
+    }
 }

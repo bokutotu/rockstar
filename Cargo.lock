@@ -6445,6 +6445,7 @@ dependencies = [
  "async-channel",
  "chrono",
  "data-url",
+ "fancy-regex",
  "futures-lite",
  "gpui-kit",
  "gpui-pre-reqwest",

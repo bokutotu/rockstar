@@ -8,8 +8,8 @@ use crate::{
     pane::{Pane, PaneActivated, PaneContent},
 };
 use gpui_kit::{
-    App, AppContext as _, Bounds, Context, Entity, EntityId, Focusable as _,
-    EventEmitter, InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, Pixels, Render, Role,
+    App, AppContext as _, Bounds, Context, Entity, EntityId, EventEmitter, Focusable as _,
+    InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, Pixels, Render, Role,
     ScrollHandle, StatefulInteractiveElement as _, Styled as _, Window,
     base::Placement,
     canvas,
@@ -17,9 +17,7 @@ use gpui_kit::{
         ActiveTheme as _, WindowExt as _,
         button::Button,
         dialog::DialogEntrance,
-        dock::{
-            DockArea, DockLayout, DockPlacement, InsertTarget, PanelId, panel_handle,
-        },
+        dock::{DockArea, DockLayout, DockPlacement, InsertTarget, PanelId, panel_handle},
         notification::Notification,
     },
     div, outline,
@@ -31,16 +29,18 @@ use std::{
     sync::Arc,
 };
 mod dock;
+mod edits;
 mod focus;
 mod items;
-mod terminal;
-mod window;
 mod picker;
 mod resume;
-pub(crate) use window::WorkspaceWindow;
+mod terminal;
+mod vim;
+mod window;
 use focus::FocusTarget;
 use items::OpenItem;
 pub(crate) use items::WipeMode;
+pub(crate) use window::WorkspaceWindow;
 
 pub(crate) type AgentConnector =
     Arc<dyn Fn(&Path, ChatStart) -> Result<OpenedChat, AgentError> + Send + Sync>;
@@ -61,15 +61,17 @@ pub(crate) struct Tab {
     tree: Option<Entity<FileTree>>,
     tree_visible: bool,
     pending: String,
+    previous_pane: Option<EntityId>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum TabAction {
     Workspaces,
     Tabs,
     CloseWorkspace,
     CloseTab,
     OpenDiff(DiffRequest),
+    Vim(crate::file_view::VimEvent),
 }
 impl EventEmitter<TabAction> for Tab {}
 
@@ -86,7 +88,8 @@ impl Tab {
             if *cx.global::<Mode>() != Mode::Normal {
                 this.pending.clear();
             }
-        }).detach();
+        })
+        .detach();
         let dock = dock::new(window, cx);
         let lsp = cx.new(|cx| crate::lsp::LspWorkspace::new(root.clone(), window, cx));
         let mut workspace = Self {
@@ -104,6 +107,7 @@ impl Tab {
             tree: None,
             tree_visible: false,
             pending: String::new(),
+            previous_pane: None,
         };
         let pane = workspace.add_pane(window, cx);
         workspace.dock.update(cx, |dock, cx| {
@@ -138,13 +142,23 @@ impl Tab {
                     Ok(path) => this.open_file_at(
                         pane.entity_id(),
                         path,
-                        Some((event.position, event.encoding)),
+                        Some((event.position, event.encoding, false)),
+                        true,
                         window,
                         cx,
                     ),
                     Err(error) => {
                         window.push_notification(Notification::error(format!("LSP: {error:#}")), cx)
                     }
+                }
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &pane,
+            |this, pane, event: &crate::file_view::VimEvent, cx| {
+                if this.visible && this.panes.get(this.active) == Some(&pane) {
+                    cx.emit(TabAction::Vim(event.clone()));
                 }
             },
         )
@@ -160,6 +174,7 @@ impl Tab {
         if let Some(index) = self.panes.iter().position(|pane| pane.entity_id() == id) {
             self.pending.clear();
             if self.active != index {
+                self.previous_pane = Some(self.panes[self.active].entity_id());
                 self.active = index;
                 if !cx.global::<Mode>().is_overlay() {
                     let mode = match &self.panes[index].read(cx).content {
@@ -230,6 +245,7 @@ impl Tab {
                 cx,
             );
         });
+        self.previous_pane = Some(self.panes[self.active].entity_id());
         self.active = self.panes.len() - 1;
         cx.set_global(Mode::Normal);
         self.focus_active(window, cx);
@@ -240,7 +256,12 @@ impl Tab {
         if !fresh && self.panes[self.active].read(cx).session(cx).is_some() {
             return;
         }
-        self.start_chat(self.panes[self.active].entity_id(), ChatStart::New, window, cx);
+        self.start_chat(
+            self.panes[self.active].entity_id(),
+            ChatStart::New,
+            window,
+            cx,
+        );
     }
 
     fn start_chat(
@@ -250,7 +271,12 @@ impl Tab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(pane) = self.panes.iter().find(|pane| pane.entity_id() == pane_id).cloned() else {
+        let Some(pane) = self
+            .panes
+            .iter()
+            .find(|pane| pane.entity_id() == pane_id)
+            .cloned()
+        else {
             return;
         };
         // A pending replacement must not keep a wiped session and its connection alive.
@@ -311,14 +337,15 @@ impl Tab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_file_at(pane_id, path, None, window, cx);
+        self.open_file_at(pane_id, path, None, true, window, cx);
     }
 
     fn open_file_at(
         &mut self,
         pane_id: EntityId,
         path: PathBuf,
-        location: Option<(lsp_types::Position, crate::lsp::language::Encoding)>,
+        location: Option<(lsp_types::Position, crate::lsp::language::Encoding, bool)>,
+        record_jump: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -330,14 +357,21 @@ impl Tab {
         else {
             return;
         };
+        if record_jump && let Some(file) = pane.read(cx).file() {
+            file.update(cx, |file, cx| file.remember_jump(cx));
+        }
         let request = pane.update(cx, |pane, _| {
             pane.request += 1;
             pane.request
         });
+        if self.vim.read(cx).macros.running {
+            self.vim.update(cx, |vim, _| vim.macros.waiting = true);
+        }
         // Resolve aliases before looking up unsaved documents. Never reload an existing buffer.
         let canonical = match path.canonicalize() {
             Ok(path) => path,
             Err(error) => {
+                self.vim.update(cx, |vim, _| vim.macros.stop());
                 window.push_notification(
                     Notification::error(format!("Cannot open {}: {error}", path.display()))
                         .autohide(false),
@@ -347,23 +381,31 @@ impl Tab {
             }
         };
         if let Some(buffer) = self.find_buffer(&canonical, cx) {
+            self.vim.update(cx, |vim, _| vim.macros.waiting = false);
             self.show_item(pane_id, buffer.entity_id(), window, cx);
-            let activate = self.visible && self.panes[self.active] == pane && !cx.global::<Mode>().is_overlay();
+            let activate = self.visible
+                && self.panes[self.active] == pane
+                && !cx.global::<Mode>().is_overlay();
             pane.update(cx, |pane, cx| {
-                if let Some((position, encoding)) = location
+                if let Some((position, encoding, linewise)) = location
                     && let Some(file) = pane.file()
                 {
-                    file.update(cx, |file, cx| file.jump_to(position, encoding, activate, window, cx));
+                    file.update(cx, |file, cx| {
+                        file.jump_to(position, encoding, linewise, activate, window, cx)
+                    });
                 }
             });
             return;
         }
         if location.is_none()
-            && let Some(kind) = crate::media::classify_file(&path).or_else(|| crate::media::classify_file(&canonical))
+            && let Some(kind) = crate::media::classify_file(&path)
+                .or_else(|| crate::media::classify_file(&canonical))
         {
             let source = crate::media::MediaSource::File(canonical);
             let existing = self.items.iter().find_map(|item| match item {
-                OpenItem::Media(session) if session.read(cx).source == source => Some(session.clone()),
+                OpenItem::Media(session) if session.read(cx).source == source => {
+                    Some(session.clone())
+                }
                 _ => None,
             });
             let session = existing.unwrap_or_else(|| {
@@ -378,6 +420,7 @@ impl Tab {
         cx.spawn_in(window, async move |this, cx| {
             let result = loading.await;
             let _ = this.update_in(cx, |this, window, cx| {
+                this.vim.update(cx, |vim, _| vim.macros.waiting = false);
                 let Some(pane) = this
                     .panes
                     .iter()
@@ -401,30 +444,40 @@ impl Tab {
                             buffer
                         });
                         this.show_item(pane_id, buffer.entity_id(), window, cx);
-                        let activate = this.visible && this.panes[this.active] == pane && !cx.global::<Mode>().is_overlay();
+                        let activate = this.visible
+                            && this.panes[this.active] == pane
+                            && !cx.global::<Mode>().is_overlay();
                         pane.update(cx, |pane, cx| {
-                            if let Some((position, encoding)) = location
+                            if let Some((position, encoding, linewise)) = location
                                 && let Some(file) = pane.file()
                             {
                                 file.update(cx, |file, cx| {
-                                    file.jump_to(position, encoding, activate, window, cx)
+                                    file.jump_to(position, encoding, linewise, activate, window, cx)
                                 });
                             }
                         });
                     }
-                    Err(error) => window.push_notification(
-                        Notification::error(format!("{error:#}")).autohide(false),
-                        cx,
-                    ),
+                    Err(error) => {
+                        this.vim.update(cx, |vim, _| vim.macros.stop());
+                        window.push_notification(
+                            Notification::error(format!("{error:#}")).autohide(false),
+                            cx,
+                        );
+                    }
                 }
             });
         })
         .detach();
     }
 
-    pub(crate) fn update_diff_index(&mut self, action: IndexAction, cx: &mut Context<Self>) -> anyhow::Result<()> {
-        let view = self.panes[self.active].read(cx).diff()
-            .ok_or_else(|| anyhow::anyhow!("This pane has no diff; open :diff and select a file first"))?;
+    pub(crate) fn update_diff_index(
+        &mut self,
+        action: IndexAction,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let view = self.panes[self.active].read(cx).diff().ok_or_else(|| {
+            anyhow::anyhow!("This pane has no diff; open :diff and select a file first")
+        })?;
         view.update(cx, |view, cx| view.update_index(action, cx))
     }
 
@@ -494,7 +547,10 @@ impl Tab {
         if mode == Mode::Confirm {
             return false;
         }
-        if matches!(mode, Mode::CommandPalette | Mode::FileFinder | Mode::Switcher) {
+        if matches!(
+            mode,
+            Mode::CommandPalette | Mode::FileFinder | Mode::Switcher
+        ) {
             if key.key == "escape" {
                 cx.set_global(Mode::Normal);
                 return true;
@@ -512,7 +568,9 @@ impl Tab {
         if matches!(mode, Mode::Search | Mode::LspPopup) {
             return file.is_some_and(|file| file.update(cx, |file, cx| file.key(key, window, cx)));
         }
-        if mode == Mode::Normal && key.modifiers.control && key.key == "b"
+        if mode == Mode::Normal
+            && key.modifiers.control
+            && key.key == "b"
             && (file.is_none() || self.focused_target(window, cx) == Some(FocusTarget::FileTree))
         {
             self.pending.clear();
@@ -575,9 +633,15 @@ impl Tab {
                     "\\gd" => cx.emit(TabAction::OpenDiff(DiffRequest::Local(LocalFilter::All))),
                     "\\gp" => cx.emit(TabAction::OpenDiff(DiffRequest::PullRequest)),
                     "\\gi" => cx.emit(TabAction::OpenDiff(DiffRequest::Local(LocalFilter::Staged))),
-                    "\\gw" => cx.emit(TabAction::OpenDiff(DiffRequest::Local(LocalFilter::Unstaged))),
+                    "\\gw" => cx.emit(TabAction::OpenDiff(DiffRequest::Local(
+                        LocalFilter::Unstaged,
+                    ))),
                     "\\gs" | "\\gu" => {
-                        let action = if pending == "\\gs" { IndexAction::Stage } else { IndexAction::Unstage };
+                        let action = if pending == "\\gs" {
+                            IndexAction::Stage
+                        } else {
+                            IndexAction::Unstage
+                        };
                         if let Err(error) = self.update_diff_index(action, cx) {
                             window.push_notification(Notification::error(format!("{error:#}")), cx);
                         }
@@ -661,7 +725,9 @@ impl Tab {
         let ids = self.items.iter().map(OpenItem::id).collect::<Vec<_>>();
         for id in ids {
             for pane in &self.panes {
-                pane.update(cx, |pane, cx| { pane.forget_item(id, cx); });
+                pane.update(cx, |pane, cx| {
+                    pane.forget_item(id, cx);
+                });
             }
         }
         for item in &self.items {
@@ -673,11 +739,21 @@ impl Tab {
         self.lsp.update(cx, |lsp, cx| lsp.stop(cx));
     }
 
-    pub(crate) fn reload_active_file(&self, window: &mut Window, cx: &mut Context<Self>) -> anyhow::Result<()> {
-        let file = self.panes[self.active].read(cx).file().ok_or_else(|| anyhow::anyhow!("This pane has no file to reload."))?;
+    pub(crate) fn reload_active_file(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let file = self.panes[self.active]
+            .read(cx)
+            .file()
+            .ok_or_else(|| anyhow::anyhow!("This pane has no file to reload."))?;
         let buffer = file.read(cx).buffer.clone();
         let state = buffer.read(cx);
-        anyhow::ensure!(!state.saving, "File is being saved. Please wait before reloading.");
+        anyhow::ensure!(
+            !state.saving,
+            "File is being saved. Please wait before reloading."
+        );
         let stamp = (state.version, state.disk_epoch);
         let path = state.path.clone();
         let buffer = buffer.downgrade();
@@ -685,18 +761,28 @@ impl Tab {
         cx.spawn_in(window, async move |_, cx| {
             let result = reading.await;
             let _ = cx.update(|window, cx| {
-                let Some(buffer) = buffer.upgrade() else { return; };
+                let Some(buffer) = buffer.upgrade() else {
+                    return;
+                };
                 let state = buffer.read(cx);
                 if state.saving || (state.version, state.disk_epoch) != stamp {
-                    window.push_notification(Notification::error("File changed while reloading; reload cancelled."), cx);
+                    window.push_notification(
+                        Notification::error("File changed while reloading; reload cancelled."),
+                        cx,
+                    );
                     return;
                 }
                 match result {
-                    Ok(contents) => buffer.update(cx, |buffer, cx| buffer.replace_from_disk(contents, cx)),
-                    Err(error) => window.push_notification(Notification::error(format!("{error:#}")), cx),
+                    Ok(contents) => {
+                        buffer.update(cx, |buffer, cx| buffer.replace_from_disk(contents, cx))
+                    }
+                    Err(error) => {
+                        window.push_notification(Notification::error(format!("{error:#}")), cx)
+                    }
                 }
             });
-        }).detach();
+        })
+        .detach();
         Ok(())
     }
 }

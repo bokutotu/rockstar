@@ -25,6 +25,7 @@ pub(crate) struct WorkspaceWindow {
     diff_watches: Entity<DiffWatches>,
     vim: Entity<crate::file_view::VimSharedState>,
     opening_diffs: Vec<(EntityId, DiffRequest)>,
+    replay_task: Option<gpui_kit::Task<()>>,
 }
 
 impl WorkspaceWindow {
@@ -36,14 +37,20 @@ impl WorkspaceWindow {
     ) -> Self {
         let watches = cx.new(|cx| FileWatches::new(window, cx));
         let diff_watches = cx.new(|cx| DiffWatches::new(window, cx));
+        let vim = cx.new(|_| crate::file_view::VimSharedState::default());
+        cx.observe_in(&vim, window, |this, _, window, cx| {
+            this.schedule_replay(window, cx)
+        })
+        .detach();
         let mut this = Self {
             workspaces: Vec::new(),
             active: 0,
             connect,
             watches,
             diff_watches,
-            vim: cx.new(|_| crate::file_view::VimSharedState::default()),
+            vim,
             opening_diffs: Vec::new(),
+            replay_task: None,
         };
         let root = root.canonicalize().unwrap_or(root);
         let tab = this.create_tab(root.clone(), window, cx);
@@ -63,14 +70,23 @@ impl WorkspaceWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<Tab> {
-        let tab =
-            cx.new(|cx| Tab::new(root, self.connect.clone(), self.watches.clone(), self.vim.clone(), window, cx));
+        let tab = cx.new(|cx| {
+            Tab::new(
+                root,
+                self.connect.clone(),
+                self.watches.clone(),
+                self.vim.clone(),
+                window,
+                cx,
+            )
+        });
         cx.observe(&tab, |_, _, cx| cx.notify()).detach();
         cx.subscribe_in(&tab, window, |this, tab, action: &TabAction, window, cx| {
             if this.active_tab() != *tab {
                 return;
             }
             match action {
+                TabAction::Vim(event) => this.vim_event(event.clone(), window, cx),
                 TabAction::Workspaces => this.open_picker(PickerKind::Workspaces, window, cx),
                 TabAction::Tabs => this.open_picker(PickerKind::Tabs, window, cx),
                 TabAction::CloseWorkspace => this.request_close_workspace(window, cx),
@@ -111,8 +127,230 @@ impl WorkspaceWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.active_tab()
-            .update(cx, |tab, cx| tab.key(key, window, cx))
+        if self.vim.read(cx).macros.running {
+            if key.modifiers.control && key.key == "c" {
+                self.vim.update(cx, |vim, _| vim.macros.stop());
+                self.replay_task = None;
+            } else {
+                return true;
+            }
+        }
+        let file = self.active_file(cx);
+        let mode = *cx.global::<Mode>();
+        let recording = self.vim.read(cx).macros.recording.is_some();
+        let composing = file
+            .as_ref()
+            .is_some_and(|file| file.read(cx).is_composing(cx));
+        let handled = self
+            .active_tab()
+            .update(cx, |tab, cx| tab.key(key, window, cx));
+        let navigation = mode.is_insert()
+            && matches!(
+                key.key.as_str(),
+                "left" | "right" | "up" | "down" | "home" | "end" | "pageup" | "pagedown"
+            );
+        if recording
+            && file.is_some()
+            && !composing
+            && (mode == Mode::Normal || mode.is_visual() || handled || navigation)
+        {
+            self.vim.update(cx, |vim, _| {
+                if let Some((_, input)) = &mut vim.macros.recording {
+                    input.push(crate::file_view::key_input(key));
+                }
+            });
+        }
+        handled
+    }
+
+    fn active_file(&self, cx: &App) -> Option<Entity<crate::file_view::FileView>> {
+        let tab = self.active_tab();
+        let tab = tab.read(cx);
+        tab.panes[tab.active].read(cx).file()
+    }
+    fn schedule_replay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.replay_task.is_some() && !self.vim.read(cx).macros.running {
+            self.replay_task = None;
+        }
+        if self.replay_task.is_some() || self.vim.read(cx).macros.frames.is_empty() {
+            return;
+        }
+        self.vim.update(cx, |vim, _| vim.macros.running = true);
+        self.replay_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let mut waiting = 0usize;
+            loop {
+                let keep = this
+                    .update_in(cx, |this, window, cx| {
+                        if !this.vim.read(cx).macros.running {
+                            this.replay_task = None;
+                            return false;
+                        }
+                        if this.vim.read(cx).macros.waiting {
+                            waiting += 1;
+                            if waiting < 30_000 {
+                                return true;
+                            }
+                        } else {
+                            waiting = 0;
+                        }
+                        if waiting >= 30_000 || this.vim.read(cx).macros.steps > 100_000 {
+                            this.vim.update(cx, |vim, _| vim.macros.stop());
+                            window.push_notification(
+                                Notification::error("Replay stopped: execution limit reached"),
+                                cx,
+                            );
+                            this.replay_task = None;
+                            return false;
+                        }
+                        let Some(file) = this
+                            .active_file(cx)
+                            .filter(|file| file.read(cx).accepts_replay(window, cx))
+                        else {
+                            this.vim.update(cx, |vim, _| vim.macros.stop());
+                            window.push_notification(
+                                Notification::error("Replay stopped outside the file editor"),
+                                cx,
+                            );
+                            this.replay_task = None;
+                            return false;
+                        };
+                        let input = this.vim.update(cx, |vim, _| vim.macros.next());
+                        let location = this.vim.update(cx, |vim, _| vim.macros.location.take());
+                        if let Some(location) = location {
+                            file.update(cx, |file, cx| {
+                                file.replay_input(
+                                    crate::file_view::ReplayInput::Key("escape".into()),
+                                    false,
+                                    window,
+                                    cx,
+                                )
+                            });
+                            this.vim_event(
+                                crate::file_view::VimEvent::Navigate(location, false),
+                                window,
+                                cx,
+                            );
+                            return true;
+                        }
+                        let Some(input) = input else {
+                            this.vim.update(cx, |vim, _| vim.macros.running = false);
+                            this.replay_task = None;
+                            return false;
+                        };
+                        if let crate::file_view::ReplayInput::Key(name) = &input {
+                            if let Ok(key) = Keystroke::parse_with_os(name, cx.platform_info().os) {
+                                if this
+                                    .active_tab()
+                                    .update(cx, |tab, cx| tab.key(&key, window, cx))
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                        let dispatched = matches!(input, crate::file_view::ReplayInput::Key(_));
+                        file.update(cx, |file, cx| {
+                            file.replay_input(input, dispatched, window, cx)
+                        });
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1))
+                    .await;
+            }
+        }));
+    }
+    fn vim_event(
+        &mut self,
+        event: crate::file_view::VimEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            crate::file_view::VimEvent::ApplyEdit(edit, encoding) => {
+                self.active_tab().update(cx, |tab, cx| {
+                    tab.apply_workspace_edit(edit, encoding, window, cx)
+                });
+            }
+            crate::file_view::VimEvent::Workspace(command, count, explicit) => {
+                if matches!(command.as_str(), "gt" | "gT") {
+                    self.leave_tab(cx);
+                    let workspace = &mut self.workspaces[self.active];
+                    workspace.active = if command == "gt" && explicit {
+                        (count - 1).min(workspace.tabs.len() - 1)
+                    } else {
+                        (workspace.active
+                            + workspace.tabs.len()
+                            + if command == "gt" {
+                                1
+                            } else {
+                                workspace.tabs.len() - count % workspace.tabs.len()
+                            })
+                            % workspace.tabs.len()
+                    };
+                    self.enter_tab(window, cx);
+                } else if command == "ctrl-wq" && self.active_tab().read(cx).panes.len() == 1 {
+                    if self.workspaces[self.active].tabs.len() > 1 {
+                        self.request_close_tab(window, cx);
+                    } else if self.workspaces.len() > 1 {
+                        self.request_close_workspace(window, cx);
+                    } else if self.request_close(window, cx) {
+                        window.remove_window();
+                    }
+                } else {
+                    self.active_tab().update(cx, |tab, cx| {
+                        tab.vim_workspace_command(&command, count, explicit, window, cx)
+                    });
+                }
+            }
+            crate::file_view::VimEvent::Navigate(location, linewise) => {
+                let mut found = None;
+                for (wi, workspace) in self.workspaces.iter().enumerate() {
+                    for (ti, tab) in workspace.tabs.iter().enumerate() {
+                        if tab
+                            .read(cx)
+                            .buffers()
+                            .any(|buffer| buffer.entity_id() == location.buffer)
+                        {
+                            found = Some((wi, ti));
+                        }
+                    }
+                }
+                if let Some((wi, ti)) = found {
+                    if wi != self.active || ti != self.workspaces[wi].active {
+                        let source = self.active_file(cx).map(|file| file.read(cx).location(cx));
+                        self.leave_tab(cx);
+                        self.active = wi;
+                        self.workspaces[wi].active = ti;
+                        self.enter_tab(window, cx);
+                        if let Some(source) = source {
+                            let tab = self.active_tab();
+                            let tab = tab.read(cx);
+                            let jumps = tab.panes[tab.active].read(cx).jumps.clone();
+                            jumps.update(cx, |jumps, _| jumps.push(source));
+                        }
+                    }
+                }
+                self.active_tab().update(cx, |tab, cx| {
+                    let pane = tab.panes[tab.active].entity_id();
+                    tab.open_file_at(
+                        pane,
+                        location.path,
+                        Some((
+                            lsp_types::Position::new(location.line as u32, location.column as u32),
+                            crate::lsp::language::Encoding::Utf8,
+                            linewise,
+                        )),
+                        false,
+                        window,
+                        cx,
+                    );
+                });
+            }
+        }
     }
 
     pub(crate) fn open_finder(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -185,13 +423,21 @@ impl WorkspaceWindow {
         self.enter_tab(window, cx);
     }
 
-    pub(crate) fn open_diff(&mut self, request: DiffRequest, window: &mut Window, cx: &mut Context<Self>) -> anyhow::Result<()> {
+    pub(crate) fn open_diff(
+        &mut self,
+        request: DiffRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
         let workspace = &self.workspaces[self.active];
         let owner = workspace.id;
         let origin = self.active_tab().entity_id();
         let root = workspace.root.clone();
         let key = (owner, request);
-        anyhow::ensure!(!self.opening_diffs.contains(&key), "This diff is already loading");
+        anyhow::ensure!(
+            !self.opening_diffs.contains(&key),
+            "This diff is already loading"
+        );
         self.opening_diffs.push(key);
         window.push_notification(Notification::info("Loading diff…"), cx);
         let loading = cx.background_spawn(async move {
@@ -203,23 +449,34 @@ impl WorkspaceWindow {
             let result = loading.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.opening_diffs.retain(|pending| *pending != key);
-                let Some(index) = this.workspaces.iter().position(|workspace| workspace.id == owner
-                    && workspace.tabs.iter().any(|tab| tab.entity_id() == origin)) else { return; };
+                let Some(index) = this.workspaces.iter().position(|workspace| {
+                    workspace.id == owner
+                        && workspace.tabs.iter().any(|tab| tab.entity_id() == origin)
+                }) else {
+                    return;
+                };
                 let (snapshot, target) = match result {
                     Ok(loaded) => loaded,
                     Err(error) => {
-                        window.push_notification(Notification::error(format!("Diff: {error:#}")).autohide(false), cx);
+                        window.push_notification(
+                            Notification::error(format!("Diff: {error:#}")).autohide(false),
+                            cx,
+                        );
                         return;
                     }
                 };
                 // A slow PR fetch must not take focus from another tab or a dialog.
-                let activate = this.active == index && this.active_tab().entity_id() == origin
+                let activate = this.active == index
+                    && this.active_tab().entity_id() == origin
                     && !cx.global::<Mode>().is_overlay();
-                if activate { this.leave_tab(cx); }
+                if activate {
+                    this.leave_tab(cx);
+                }
                 let tab = this.create_tab(this.workspaces[index].root.clone(), window, cx);
                 tab.update(cx, |tab, cx| {
                     let session = cx.new(|_| crate::diff::DiffSession::new(snapshot));
-                    this.diff_watches.update(cx, |watches, cx| watches.attach(target, &session, cx));
+                    this.diff_watches
+                        .update(cx, |watches, cx| watches.attach(target, &session, cx));
                     let id = tab.register_item(OpenItem::Diff(session), cx);
                     tab.show_item(tab.panes[tab.active].entity_id(), id, window, cx);
                 });
@@ -230,11 +487,18 @@ impl WorkspaceWindow {
                     workspace.active = number - 1;
                     this.enter_tab(window, cx);
                 } else {
-                    window.push_notification(Notification::info(format!("Diff ready in {} · Tab {number}", workspace.root.display())), cx);
+                    window.push_notification(
+                        Notification::info(format!(
+                            "Diff ready in {} · Tab {number}",
+                            workspace.root.display()
+                        )),
+                        cx,
+                    );
                 }
                 cx.notify();
             });
-        }).detach();
+        })
+        .detach();
         Ok(())
     }
 
@@ -437,12 +701,7 @@ impl WorkspaceWindow {
         });
     }
 
-    fn close_target(
-        &mut self,
-        target: CloseTarget,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn close_target(&mut self, target: CloseTarget, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(error) = self.check_close(target, cx) {
             window.push_notification(Notification::error(error.to_string()), cx);
             return;

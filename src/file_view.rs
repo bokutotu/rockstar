@@ -21,14 +21,21 @@ use crate::{
 };
 mod documentation;
 mod editing;
+mod integrations;
 mod keys;
 mod lsp;
+mod lsp_actions;
+mod navigation;
+mod replay;
+mod searching;
 mod vim;
 use editing::InsertSession;
 use lsp::LspViewState;
 pub(crate) use lsp::Navigate;
-pub(crate) use vim::VimSharedState;
+pub(crate) use navigation::VimEvent;
+pub(crate) use replay::key_input;
 use vim::*;
+pub(crate) use vim::{BufferLocation, JumpList, ReplayInput, VimSharedState};
 
 pub(crate) struct FileView {
     pub(crate) buffer: Entity<FileBuffer>,
@@ -38,7 +45,15 @@ pub(crate) struct FileView {
     insert: Option<InsertSession>,
     search: Entity<InputState>,
     search_open: bool,
-    search_origin: usize,
+    search_session: Option<searching::SearchSession>,
+    search_highlights: gpui_kit::base::input::TextDecorationCollection,
+    jumps: Entity<JumpList>,
+    change: Option<RepeatableChange>,
+    change_dirty: bool,
+    change_index: Option<usize>,
+    command_error: Option<String>,
+    folds: Vec<(Range<usize>, bool)>,
+    fold_enabled: bool,
     indent: usize,
     lsp_ui: LspViewState,
 }
@@ -47,6 +62,7 @@ impl FileView {
     pub(crate) fn new(
         buffer: Entity<FileBuffer>,
         shared: Entity<VimSharedState>,
+        jumps: Entity<JumpList>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -56,6 +72,7 @@ impl FileView {
             }
         })
         .detach();
+        cx.observe(&shared, |_, _, cx| cx.notify()).detach();
         let document = buffer.read(cx);
         let (language, indent) = language_settings(&document.path);
         let text = document.text.clone();
@@ -77,20 +94,26 @@ impl FileView {
             // Pair insertion is not a Neovim default and also interferes with R.
             input.set_auto_close(false, window, cx);
         });
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search (smartcase)…"));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search…"));
+        let search_highlights = searching::decorations(&input, cx);
         cx.observe_in(&buffer, window, |this, _, window, cx| {
             let text = this.buffer.read(cx).text.clone();
             let old = this.input.read(cx).value();
             if old.as_ref() != text {
                 // An external edit invalidates insertion replay positions.
                 this.insert = None;
+                this.change = None;
                 this.vim.pending.clear();
+                let id = this.buffer.entity_id();
+                this.jumps
+                    .update(cx, |jumps, _| jumps.remap(id, &old, &text));
                 this.vim.cursor = map_offset(&old, &text, this.vim.cursor);
                 this.vim.anchor = map_offset(&old, &text, this.vim.anchor);
                 if !this.vim.mode.is_insert() {
                     this.vim.cursor = normal_cursor(&text, this.vim.cursor);
                 }
                 this.set_input(&text, this.vim.cursor..this.vim.cursor, true, window, cx);
+                this.remap_folds(&old, &text, cx);
                 this.select(cx);
             }
             cx.notify();
@@ -114,6 +137,11 @@ impl FileView {
         })
         .detach();
         cx.observe_in(&input, window, |this, _, window, cx| {
+            // Native Change and observation callbacks may be delivered in
+            // either order. Keep the pre-edit cursor until Change commits it.
+            if this.input.read(cx).value().as_ref() != this.buffer.read(cx).text {
+                return;
+            }
             if !this.vim.mode.is_visual()
                 && !this.search_open
                 && !this.input.read(cx).is_composing()
@@ -137,6 +165,12 @@ impl FileView {
                         this.vim.column = None;
                     }
                     this.vim.cursor = cursor;
+                    if let Some(session) = &mut this.insert {
+                        if session.restart_at_cursor {
+                            session.start = cursor;
+                            session.restart_at_cursor = false;
+                        }
+                    }
                 }
             } else if matches!(this.vim.mode, Mode::Visual | Mode::VisualLine)
                 && !this.search_open
@@ -183,7 +217,15 @@ impl FileView {
             insert: None,
             search,
             search_open: false,
-            search_origin: 0,
+            search_session: None,
+            search_highlights,
+            jumps,
+            change: None,
+            change_dirty: false,
+            change_index: None,
+            command_error: None,
+            folds: Vec::new(),
+            fold_enabled: true,
             indent,
             lsp_ui,
         };
@@ -339,74 +381,14 @@ impl FileView {
     }
     fn undo(&mut self, redo: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.insert = None;
+        self.change = None;
+        let before = self.buffer.read(cx).text.clone();
         let cursor = self
             .buffer
             .update(cx, |buffer, cx| buffer.undo(self.vim.cursor, redo, cx));
         if let Some(cursor) = cursor {
-            self.vim.cursor = normal_cursor(&self.buffer.read(cx).text, cursor);
-            let text = self.buffer.read(cx).text.clone();
-            self.set_input(&text, self.vim.cursor..self.vim.cursor, false, window, cx);
-            self.select(cx);
+            self.restore_view(&before, cursor, window, cx);
         }
-    }
-    fn update_search(&mut self, cx: &mut Context<Self>) {
-        let query = self.search.read(cx).value().to_string();
-        let insensitive = !query.chars().any(char::is_uppercase);
-        self.input.update(cx, |input, cx| {
-            input.set_search_query(query, insensitive, cx)
-        });
-        let ranges = self
-            .input
-            .read(cx)
-            .search_session()
-            .matcher
-            .matched_ranges();
-        if let Some(range) = ranges
-            .iter()
-            .find(|r| r.start >= self.search_origin)
-            .or_else(|| ranges.first())
-        {
-            self.vim.cursor = range.start;
-            self.select(cx);
-        }
-        cx.notify();
-    }
-    fn search_next(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let query = self.search.read(cx).value().to_string();
-        self.input.update(cx, |input, cx| {
-            input.set_search_query(query.clone(), !query.chars().any(char::is_uppercase), cx)
-        });
-        let ranges = self
-            .input
-            .read(cx)
-            .search_session()
-            .matcher
-            .matched_ranges();
-        let found = if forward {
-            ranges
-                .iter()
-                .find(|r| r.start > self.vim.cursor)
-                .or_else(|| ranges.first())
-        } else {
-            ranges
-                .iter()
-                .rev()
-                .find(|r| r.start < self.vim.cursor)
-                .or_else(|| ranges.last())
-        };
-        if let Some(range) = found {
-            self.vim.cursor = range.start;
-            self.select(cx);
-        }
-    }
-    pub(crate) fn end_search(&mut self, accept: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if !accept {
-            self.vim.cursor = self.search_origin;
-        }
-        self.search_open = false;
-        self.set_mode(Mode::Normal, cx);
-        self.select(cx);
-        self.input.focus_handle(cx).focus(window, cx);
     }
 }
 impl Focusable for FileView {
@@ -440,6 +422,11 @@ impl Render for FileView {
             },
             lsp_status
         );
+        let status = if let Some((register, _)) = &self.shared.read(cx).macros.recording {
+            format!("{status} · recording @{register}")
+        } else {
+            status
+        };
         let numbers = self.input.clone();
         let input = self.input.clone();
         let cursor = self.vim.cursor;
@@ -490,7 +477,14 @@ impl Render for FileView {
                                         (line, state.display_map().buffer_line_to_display_row(line))
                                     })
                                     .collect::<Vec<_>>();
+                                let folds = state.display_map().folded_ranges().to_vec();
                                 for (line, display_row) in rows {
+                                    if folds
+                                        .iter()
+                                        .any(|r| r.start_line < line && line < r.end_line)
+                                    {
+                                        continue;
+                                    }
                                     let value: SharedString = if line == current {
                                         (line + 1).to_string()
                                     } else {
@@ -582,7 +576,13 @@ impl Render for FileView {
                         }))
                         .child(
                             Input::new(&self.search)
-                                .prefix(div().child("/"))
+                                .prefix(div().child(
+                                    if self.search_session.as_ref().is_none_or(|s| s.forward) {
+                                        "/"
+                                    } else {
+                                        "?"
+                                    },
+                                ))
                                 .aria_label("Search source"),
                         ),
                 )

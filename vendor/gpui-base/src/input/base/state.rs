@@ -12347,6 +12347,17 @@ impl InputBaseState<crate::input::EditorMode> {
         cx.notify();
     }
 
+    /// Replace manual folds without enabling syntax-derived fold candidates.
+    /// The caller owns the open/closed state and supplies only closed ranges.
+    pub fn set_manual_folds(&mut self, folds: Vec<crate::input::FoldRange>, cx: &mut Context<Self>) {
+        self.display_map.clear_folds();
+        self.display_map.set_fold_candidates(folds.clone());
+        for fold in folds {
+            self.display_map.set_folded(fold.start_line, true);
+        }
+        cx.notify();
+    }
+
     /// Unfold any folded ranges that hide the given position.
     ///
     /// Use this to reveal a position before acting on it (e.g. before

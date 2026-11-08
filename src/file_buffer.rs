@@ -15,11 +15,9 @@ pub(crate) enum BufferEvent {
 
 impl EventEmitter<BufferEvent> for FileBuffer {}
 
-#[derive(Clone)]
-struct Snapshot {
-    text: String,
-    cursor: usize,
-}
+mod history;
+use history::UndoTree;
+pub(crate) use history::{BufferPositions, map_position};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DiskState {
@@ -35,9 +33,10 @@ pub(crate) struct FileBuffer {
     pub(crate) lsp: Option<Entity<crate::lsp::DocumentBinding>>,
     /// The exact bytes decoded from disk, including BOM and line endings.
     saved_text: String,
-    undo: Vec<Snapshot>,
-    redo: Vec<Snapshot>,
+    undo: UndoTree,
     insert_group: Option<EntityId>,
+    replay_group: Option<u64>,
+    pub(crate) positions: BufferPositions,
     pub(crate) saving: bool,
     pub(crate) disk_state: DiskState,
     /// Invalidates disk reads across saves/reloads even if the editor text did not change.
@@ -55,14 +54,15 @@ impl FileBuffer {
             .unwrap_or(&saved_text)
             .replace("\r\n", "\n");
         Ok(Self {
+            undo: UndoTree::new(&text),
             path,
             text,
             version: 0,
             lsp: None,
             saved_text,
-            undo: Vec::new(),
-            redo: Vec::new(),
             insert_group: None,
+            replay_group: None,
+            positions: BufferPositions::default(),
             saving: false,
             disk_state: DiskState::Current,
             disk_epoch: 0,
@@ -136,14 +136,16 @@ impl FileBuffer {
     }
 
     pub(crate) fn replace_from_disk(&mut self, contents: String, cx: &mut Context<Self>) {
+        let before = std::mem::take(&mut self.text);
         self.text = contents
             .strip_prefix('\u{feff}')
             .unwrap_or(&contents)
             .replace("\r\n", "\n");
         self.saved_text = contents;
-        self.undo.clear();
-        self.redo.clear();
+        self.undo = UndoTree::new(&self.text);
+        self.positions.remap(&before, &self.text);
         self.insert_group = None;
+        self.replay_group = None;
         self.version = self
             .version
             .checked_add(1)
@@ -153,6 +155,12 @@ impl FileBuffer {
         cx.notify();
     }
 
+    pub(crate) fn finish_insert(&mut self, source: EntityId, cursor: usize) {
+        if self.insert_group == Some(source) {
+            self.undo.finish_cursor(cursor);
+        }
+        self.insert_group = None;
+    }
     pub(crate) fn end_insert(&mut self) {
         self.insert_group = None;
     }
@@ -161,24 +169,24 @@ impl FileBuffer {
         &mut self,
         text: String,
         cursor: usize,
+        after: usize,
         source: EntityId,
         insert: bool,
+        replay: Option<u64>,
         cx: &mut Context<Self>,
     ) {
         if self.text == text {
             return;
         }
-        if !insert || self.insert_group != Some(source) {
-            self.undo.push(Snapshot {
-                text: self.text.clone(),
-                cursor,
-            });
-            if self.undo.len() > 256 {
-                self.undo.remove(0);
-            }
-        }
+        let join = replay.is_some_and(|id| self.replay_group == Some(id))
+            || (replay.is_none() && insert && self.insert_group == Some(source));
+        self.undo.record(&text, cursor, after, join);
+        let removed = self
+            .positions
+            .changed(&self.text, &text, cursor, after, join);
+        self.undo.remember_removed_marks(removed);
         self.insert_group = insert.then_some(source);
-        self.redo.clear();
+        self.replay_group = replay;
         self.text = text;
         self.version = self
             .version
@@ -189,27 +197,36 @@ impl FileBuffer {
 
     pub(crate) fn undo(
         &mut self,
-        cursor: usize,
+        _cursor: usize,
         redo: bool,
         cx: &mut Context<Self>,
     ) -> Option<usize> {
+        let state = self.undo.step(redo)?;
+        Some(self.restore(state, cx))
+    }
+    pub(crate) fn undo_time(
+        &mut self,
+        newer: bool,
+        count: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let state = self.undo.time(newer, count)?;
+        Some(self.restore(state, cx))
+    }
+    fn restore(&mut self, (text, cursor): (String, usize), cx: &mut Context<Self>) -> usize {
         self.insert_group = None;
-        let (from, to) = if redo {
-            (&mut self.redo, &mut self.undo)
-        } else {
-            (&mut self.undo, &mut self.redo)
-        };
-        let previous = from.pop()?;
-        to.push(Snapshot {
-            text: std::mem::replace(&mut self.text, previous.text),
-            cursor,
-        });
+        self.replay_group = None;
+        self.positions.remap(&self.text, &text);
+        for (name, at) in self.undo.take_restored_marks() {
+            self.positions.marks.entry(name).or_insert(at);
+        }
+        self.text = text;
         self.version = self
             .version
             .checked_add(1)
             .expect("document version exhausted");
         cx.notify();
-        Some(previous.cursor)
+        cursor
     }
 }
 

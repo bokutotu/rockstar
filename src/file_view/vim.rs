@@ -7,8 +7,12 @@ use unicode_width::UnicodeWidthStr;
 mod edit;
 mod motion;
 mod object;
+mod search;
+mod state;
 pub(super) use edit::*;
 pub(super) use motion::*;
+pub(crate) use search::*;
+pub(crate) use state::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SelectionKind {
@@ -25,6 +29,7 @@ pub(crate) struct VisualSelection {
     pub columns: (usize, usize),
 }
 
+#[derive(Clone)]
 pub(crate) struct VimViewState {
     pub mode: Mode,
     pub pending: PendingCommand,
@@ -53,16 +58,30 @@ pub(crate) enum RegisterValue {
     Character(String),
     Line(String),
     Block { rows: Vec<String>, width: usize },
+    Keys(Vec<ReplayInput>),
 }
 impl RegisterValue {
     pub fn text(&self) -> String {
         match self {
             Self::Character(s) | Self::Line(s) => s.clone(),
             Self::Block { rows, .. } => rows.join("\n"),
+            Self::Keys(keys) => keys.iter().map(ReplayInput::text).collect(),
         }
     }
-    fn append(&mut self, other: Self) {
+    pub fn append(&mut self, other: Self) {
         *self = match (&*self, &other) {
+            (Self::Keys(a), Self::Keys(b)) => Self::Keys(a.iter().chain(b).cloned().collect()),
+            (Self::Keys(a), _) => Self::Keys(
+                a.iter()
+                    .cloned()
+                    .chain([ReplayInput::Text(other.text())])
+                    .collect(),
+            ),
+            (_, Self::Keys(b)) => Self::Keys(
+                std::iter::once(ReplayInput::Text(self.text()))
+                    .chain(b.iter().cloned())
+                    .collect(),
+            ),
             (Self::Line(a), Self::Line(b)) => Self::Line(format!("{a}{b}")),
             (Self::Block { rows: a, width: aw }, Self::Block { rows: b, width: bw }) => {
                 let rows = (0..a.len().max(b.len()))
@@ -88,6 +107,12 @@ impl RegisterValue {
 pub(crate) struct VimSharedState {
     pub registers: HashMap<char, RegisterValue>,
     pub last_find: Option<CharFind>,
+    pub search: Option<SearchSpec>,
+    pub search_history: Vec<String>,
+    pub last_change: Option<RepeatableChange>,
+    pub last_insert: String,
+    pub macros: MacroState,
+    pub marks: HashMap<char, BufferLocation>,
 }
 impl VimSharedState {
     /// The unnamed register aliases the result, not the system clipboard.
@@ -143,6 +168,11 @@ pub(crate) enum Operator {
     Upper,
     Swap,
     Rot13,
+    Reindent,
+    Format,
+    FormatKeep,
+    Comment,
+    Fold,
 }
 impl Operator {
     fn key(self) -> &'static str {
@@ -156,6 +186,11 @@ impl Operator {
             Self::Upper => "U",
             Self::Swap => "~",
             Self::Rot13 => "?",
+            Self::Reindent => "=",
+            Self::Format => "q",
+            Self::FormatKeep => "w",
+            Self::Comment => "c",
+            Self::Fold => "f",
         }
     }
 }
@@ -174,7 +209,24 @@ pub(crate) enum Motion {
 #[derive(Clone, Debug)]
 pub(crate) enum Target {
     Motion(Motion),
-    TextObject { object: char, around: bool },
+    TextObject {
+        object: char,
+        around: bool,
+    },
+    Search {
+        spec: Option<SearchSpec>,
+        reverse: bool,
+        select: bool,
+    },
+    WordSearch {
+        forward: bool,
+        whole: bool,
+    },
+    Mark {
+        name: char,
+        linewise: bool,
+        jump: bool,
+    },
     Lines,
 }
 #[derive(Clone, Debug)]
@@ -218,8 +270,18 @@ pub(crate) enum Action {
     ChangeLines,
     Undo,
     Redo,
-    Search,
-    SearchNext(bool),
+    Search(bool, Option<Operator>),
+    Repeat,
+    Record(char),
+    Replay(char),
+    ReplayRecorded,
+    SetMark(char),
+    Jump(bool),
+    ChangeList(bool),
+    InsertLast,
+    UndoTime(bool),
+    UndoLine,
+    Integration(String),
     ExchangeEnds(bool),
     Reselect,
     Scroll(String),
@@ -246,6 +308,13 @@ enum Awaiting {
     },
     Object(bool),
     Replace,
+    Mark {
+        set: bool,
+        linewise: bool,
+        jump: bool,
+    },
+    Record,
+    Replay,
 }
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PendingCommand {
@@ -306,6 +375,36 @@ impl PendingCommand {
     pub fn feed(&mut self, key: &str, visual: bool) -> Option<ParsedCommand> {
         let waiting = std::mem::take(&mut self.awaiting);
         match waiting {
+            Awaiting::Mark {
+                set,
+                linewise,
+                jump,
+            } => {
+                if let Some(name) = single_char(key) {
+                    return if set {
+                        self.finish(Action::SetMark(name))
+                    } else {
+                        self.target(Target::Mark {
+                            name,
+                            linewise,
+                            jump,
+                        })
+                    };
+                }
+                self.clear();
+                return None;
+            }
+            Awaiting::Record | Awaiting::Replay => {
+                if let Some(name) = single_char(key) {
+                    return self.finish(if matches!(waiting, Awaiting::Record) {
+                        Action::Record(name)
+                    } else {
+                        Action::Replay(name)
+                    });
+                }
+                self.clear();
+                return None;
+            }
             Awaiting::Register => {
                 if let Some(c) = single_char(key)
                     .filter(|c| c.is_ascii_alphanumeric() || "\"-+*_./:%#=".contains(*c))
@@ -344,6 +443,19 @@ impl PendingCommand {
                 return None;
             }
             Awaiting::Prefix(prefix) => {
+                if prefix == "ctrl-w"
+                    && let Some(digit) = single_char(key).and_then(|c| c.to_digit(10))
+                {
+                    self.count = Some(
+                        self.count
+                            .unwrap_or(0)
+                            .saturating_mul(10)
+                            .saturating_add(digit as usize)
+                            .min(100_000),
+                    );
+                    self.awaiting = Awaiting::Prefix(prefix);
+                    return None;
+                }
                 let joined = format!("{prefix}{key}");
                 if self.operator.is_some()
                     && matches!(
@@ -355,6 +467,47 @@ impl PendingCommand {
                     return None;
                 }
                 match joined.as_str() {
+                    "g'" | "g`" => {
+                        self.awaiting = Awaiting::Mark {
+                            set: false,
+                            linewise: key == "'",
+                            jump: false,
+                        };
+                        return None;
+                    }
+                    "gr" => {
+                        self.awaiting = Awaiting::Prefix(joined);
+                        return None;
+                    }
+                    "g*" | "g#" => {
+                        return self.target(Target::WordSearch {
+                            forward: key == "*",
+                            whole: false,
+                        });
+                    }
+                    "gn" | "gN" => {
+                        return self.target(Target::Search {
+                            spec: None,
+                            reverse: key == "N",
+                            select: true,
+                        });
+                    }
+                    "g-" | "g+" => return self.finish(Action::UndoTime(key == "+")),
+                    "g;" | "g," => return self.finish(Action::ChangeList(key == ",")),
+                    "gi" => return self.finish(Action::InsertLast),
+                    "gq" => return self.operator(Operator::Format, visual),
+                    "gw" => return self.operator(Operator::FormatKeep, visual),
+                    "gc" => return self.operator(Operator::Comment, visual),
+                    "zf" => return self.operator(Operator::Fold, visual),
+                    "zF" => {
+                        return self.finish(Action::Operate(Operator::Fold, Some(Target::Lines)));
+                    }
+                    "zj" | "zk" => return self.finish(Action::Integration(joined)),
+                    "gra" | "gri" | "grn" | "grr" | "grt" | "gO" | "gd" | "gD" | "gf" | "gF"
+                    | "gt" | "gT" | "[d" | "]d" | "[D" | "]D" | "za" | "zA" | "zo" | "zO"
+                    | "zc" | "zC" | "zd" | "zD" | "zE" | "zM" | "zR" | "zm" | "zr" | "zn"
+                    | "zN" | "zi" => return self.finish(Action::Integration(joined)),
+                    _ if prefix == "ctrl-w" => return self.finish(Action::Integration(joined)),
                     " w" => return self.finish(Action::Save),
                     "gu" => return self.operator(Operator::Lower, visual),
                     "gU" => return self.operator(Operator::Upper, visual),
@@ -413,7 +566,7 @@ impl PendingCommand {
                 self.awaiting = Awaiting::Register;
                 None
             }
-            "g" | "[" | "]" | "z" => {
+            "g" | "[" | "]" | "z" | "ctrl-w" => {
                 self.awaiting = Awaiting::Prefix(key.into());
                 None
             }
@@ -429,6 +582,24 @@ impl PendingCommand {
                 None
             }
             ";" | "," => self.target(Target::Motion(Motion::RepeatFind(key == ";"))),
+            "'" | "`" | "m" => {
+                self.awaiting = Awaiting::Mark {
+                    set: key == "m",
+                    linewise: key == "'",
+                    jump: true,
+                };
+                None
+            }
+            "/" | "?" => self.finish(Action::Search(key == "/", self.operator)),
+            "n" | "N" => self.target(Target::Search {
+                spec: None,
+                reverse: key == "N",
+                select: false,
+            }),
+            "*" | "#" => self.target(Target::WordSearch {
+                forward: key == "*",
+                whole: true,
+            }),
             "i" | "a" if visual || self.operator.is_some() => {
                 self.awaiting = Awaiting::Object(key == "a");
                 None
@@ -456,6 +627,7 @@ impl PendingCommand {
             "y" => self.operator(Operator::Yank, visual),
             ">" => self.operator(Operator::Indent, visual),
             "<" => self.operator(Operator::Outdent, visual),
+            "=" => self.operator(Operator::Reindent, visual),
             _ if self.operator.is_some() => {
                 self.clear();
                 None
@@ -490,8 +662,21 @@ impl PendingCommand {
             "U" if visual => self.finish(Action::Operate(Operator::Upper, None)),
             "u" => self.finish(Action::Undo),
             "ctrl-r" => self.finish(Action::Redo),
-            "/" => self.finish(Action::Search),
-            "n" | "N" => self.finish(Action::SearchNext(key == "n")),
+            "." => self.finish(Action::Repeat),
+            "q" => {
+                self.awaiting = Awaiting::Record;
+                None
+            }
+            "@" => {
+                self.awaiting = Awaiting::Replay;
+                None
+            }
+            "Q" => self.finish(Action::ReplayRecorded),
+            "U" => self.finish(Action::UndoLine),
+            "ctrl-o" | "ctrl-i" | "tab" => self.finish(Action::Jump(key != "ctrl-o")),
+            "ctrl-]" | "ctrl-t" | "ctrl-^" | "ctrl-6" => {
+                self.finish(Action::Integration(key.into()))
+            }
             "ctrl-a" | "ctrl-x" => self.finish(Action::Number(key == "ctrl-a")),
             "ctrl-d" | "ctrl-u" | "ctrl-f" | "ctrl-b" | "ctrl-e" | "ctrl-y" | "pageup"
             | "pagedown" => self.finish(Action::Scroll(key.into())),

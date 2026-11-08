@@ -275,6 +275,15 @@ pub(crate) fn plan_paste(
 ) -> EditTransaction {
     let count = count.clamp(1, 10_000);
     match value {
+        RegisterValue::Keys(_) => plan_paste(
+            text,
+            cursor,
+            &RegisterValue::Character(value.text()),
+            before,
+            after,
+            count,
+            tab,
+        ),
         RegisterValue::Character(value) => {
             let value = value.repeat(count);
             let pos = if before {

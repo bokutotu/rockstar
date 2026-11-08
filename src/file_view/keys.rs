@@ -13,8 +13,31 @@ impl FileView {
         if self.input.read(cx).is_composing() {
             return false;
         }
+        if self.vim.mode == Mode::Normal
+            && self.vim.pending.is_empty()
+            && text_key(key) == "q"
+            && !key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.platform
+            && self.shared.read(cx).macros.running
+        {
+            return true;
+        }
+        if self.vim.mode == Mode::Normal
+            && self.vim.pending.is_empty()
+            && text_key(key) == "q"
+            && !key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.platform
+            && self.shared.read(cx).macros.recording.is_some()
+            && !self.shared.read(cx).macros.running
+        {
+            self.stop_recording(cx);
+            return true;
+        }
         // A pending character is data, even when it is K, Space, a colon, etc.
         if self.vim.mode.is_insert() && self.insert.as_ref().is_some_and(|s| s.literal_next) {
+            self.record_insert_key(key);
             return self.insert_key(key, window, cx);
         }
         if self.vim.pending.is_empty()
@@ -29,6 +52,7 @@ impl FileView {
             if self.search_open {
                 self.end_search(false, window, cx);
             } else if self.vim.mode.is_insert() {
+                self.record_insert_key(key);
                 if key.modifiers.control && key.key == "c" {
                     if let Some(session) = &mut self.insert {
                         session.count = 1;
@@ -38,7 +62,7 @@ impl FileView {
             } else {
                 self.insert = None;
                 if self.vim.mode == Mode::Normal {
-                    self.input.update(cx, |input, cx| input.close_search(cx));
+                    self.search_highlights.clear(cx);
                 }
                 self.set_mode(Mode::Normal, cx);
                 self.select(cx);
@@ -46,13 +70,17 @@ impl FileView {
             return true;
         }
         if self.search_open {
-            return false;
+            return self.search_key(key, window, cx);
         }
         if key.modifiers.alt || key.modifiers.platform {
             return false;
         }
         if self.vim.mode.is_insert() {
-            return self.insert_key(key, window, cx);
+            let handled = self.insert_key(key, window, cx);
+            if handled {
+                self.record_insert_key(key);
+            }
+            return handled;
         }
         let control;
         let k = if key.modifiers.control {
@@ -70,6 +98,9 @@ impl FileView {
             text_key(key)
         };
         let Some(command) = self.vim.pending.feed(k, self.vim.mode.is_visual()) else {
+            if self.vim.pending.is_empty() && self.shared.read(cx).macros.running {
+                self.vim_error(format!("Invalid command: {k}"), window, cx);
+            }
             cx.notify();
             return true;
         };
@@ -90,6 +121,15 @@ impl FileView {
             self.insert = Some(InsertSession::new(self.vim.cursor, 1));
         }
         let k = text_key(key);
+        if self.insert.as_ref().is_some_and(|s| s.control_g) {
+            self.insert.as_mut().unwrap().control_g = false;
+            if k == "u" {
+                self.break_insert(false, cx);
+                self.shared
+                    .update(cx, |shared, _| shared.macros.generation += 1);
+            }
+            return true;
+        }
         if self.insert.as_ref().is_some_and(|s| s.register_pending) {
             if key.modifiers.control && matches!(key.key.as_str(), "r" | "o" | "p") {
                 return true;
@@ -132,6 +172,17 @@ impl FileView {
             let at = self.vim.cursor;
             match key.key.as_str() {
                 "n" | "p" => return false,
+                "g" => {
+                    self.insert.as_mut().unwrap().control_g = true;
+                }
+                "a" | "@" => {
+                    let inserted = self.shared.read(cx).last_insert.clone();
+                    self.type_text(&inserted, window, cx);
+                    if key.key == "@" {
+                        self.finish_insert(window, cx);
+                    }
+                }
+                "s" => self.integration("signature", 1, false, window, cx),
                 "r" => {
                     if let Some(session) = &mut self.insert {
                         session.register_pending = true;
@@ -217,7 +268,7 @@ impl FileView {
                     self.select(cx);
                 }
                 "left" | "right" | "home" | "end" => {
-                    self.break_insert(cx);
+                    self.break_insert(true, cx);
                     return false;
                 }
                 _ => {} // Do not fall through to Ctrl-a/select-all, Ctrl-x/cut, etc.
@@ -240,15 +291,34 @@ impl FileView {
             key.key.as_str(),
             "left" | "right" | "up" | "down" | "home" | "end" | "pageup" | "pagedown"
         ) {
-            self.break_insert(cx);
+            self.break_insert(true, cx);
         }
         false
     }
-    fn break_insert(&mut self, cx: &mut Context<Self>) {
+    fn break_insert(&mut self, restart: bool, cx: &mut Context<Self>) {
+        if restart {
+            self.finish_change(cx);
+            self.change = Some(RepeatableChange {
+                command: ParsedCommand {
+                    action: Action::Insert(match self.vim.mode {
+                        Mode::Replace => "R",
+                        Mode::VirtualReplace => "gR",
+                        _ => "i",
+                    }),
+                    count: 1,
+                    explicit_count: false,
+                    register: None,
+                    forced: None,
+                },
+                visual: None,
+                input: Vec::new(),
+            });
+        }
         if let Some(session) = &mut self.insert {
             session.count = 1;
             session.block = None;
             session.replace_undo.clear();
+            session.restart_at_cursor |= restart;
         }
         self.buffer.update(cx, |buffer, _| buffer.end_insert());
     }
@@ -281,6 +351,89 @@ impl FileView {
         operator: Option<Operator>,
         cx: &mut Context<Self>,
     ) -> Option<ResolvedTarget> {
+        let mut resolved = if operator.is_some()
+            && matches!(target, Target::Lines)
+            && let Some(to) = self.folded_motion(true, command.count.saturating_sub(1), cx)
+        {
+            motion_target(
+                &self.buffer.read(cx).text,
+                self.vim.cursor,
+                to,
+                true,
+                false,
+                operator,
+                command.forced,
+                self.indent,
+            )
+        } else {
+            self.resolve_raw(target, command, operator, cx)?
+        };
+        if operator.is_some() && self.fold_enabled && resolved.kind == SelectionKind::Line {
+            let text = &self.buffer.read(cx).text;
+            for range in &mut resolved.ranges {
+                let mut from = row(text, range.start);
+                let mut to = row(text, prev(text, range.end));
+                loop {
+                    let before = (from, to);
+                    for (fold, closed) in &self.folds {
+                        if *closed && fold.start <= to && from < fold.end {
+                            from = from.min(fold.start);
+                            to = to.max(fold.end - 1);
+                        }
+                    }
+                    if (from, to) == before {
+                        break;
+                    }
+                }
+                *range = line_range(text, line_at(text, from), line_at(text, to));
+            }
+        }
+        Some(resolved)
+    }
+    fn resolve_raw(
+        &mut self,
+        target: &Target,
+        command: &ParsedCommand,
+        operator: Option<Operator>,
+        cx: &mut Context<Self>,
+    ) -> Option<ResolvedTarget> {
+        if matches!(target, Target::Search { .. } | Target::WordSearch { .. }) {
+            return match self.resolve_search(target, command, cx) {
+                Ok(target) => Some(target),
+                Err(error) => {
+                    self.command_error = Some(error.to_string());
+                    None
+                }
+            };
+        }
+        if let Target::Mark {
+            name,
+            linewise,
+            jump,
+        } = target
+        {
+            return self.resolve_mark_target(*name, *linewise, *jump, operator, cx);
+        }
+        if let Target::Motion(Motion::Key(key)) = target {
+            if matches!(key.as_str(), "j" | "k" | "up" | "down" | "gj" | "gk") {
+                if let Some(to) = self.folded_motion(
+                    matches!(key.as_str(), "j" | "down" | "gj"),
+                    command.count,
+                    cx,
+                ) {
+                    return Some(motion_target(
+                        &self.buffer.read(cx).text,
+                        self.vim.cursor,
+                        to,
+                        true,
+                        false,
+                        operator,
+                        command.forced,
+                        self.indent,
+                    ));
+                }
+            }
+        }
         if let Target::Motion(Motion::Find(find)) = target {
             self.shared
                 .update(cx, |shared, _| shared.last_find = Some(*find));
@@ -303,7 +456,18 @@ impl FileView {
     fn set_selection(&mut self, target: ResolvedTarget, source: &Target, cx: &mut Context<Self>) {
         let text = &self.buffer.read(cx).text;
         let old_column = display_column(text, self.vim.cursor, self.indent);
-        if matches!(source, Target::TextObject { .. }) && self.vim.mode.is_visual() {
+        if matches!(
+            source,
+            Target::Search { .. } | Target::WordSearch { .. } | Target::Mark { jump: true, .. }
+        ) || matches!(source, Target::Motion(Motion::Key(k)) if matches!(k.as_str(), "gg" | "G" | "%" | "{" | "}" | "(" | ")" | "[[" | "]]" | "[]" | "][" | "H" | "M" | "L"))
+        {
+            self.remember_jump(cx);
+        }
+        self.reveal_folds(target.destination, false, cx);
+        let text = &self.buffer.read(cx).text;
+        if (matches!(source, Target::TextObject { .. }) && self.vim.mode.is_visual())
+            || matches!(source, Target::Search { select: true, .. })
+        {
             let Some(first) = target.ranges.first() else {
                 return;
             };
@@ -336,13 +500,23 @@ impl FileView {
         self.select(cx);
     }
 
-    fn execute(&mut self, command: ParsedCommand, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn execute_inner(
+        &mut self,
+        command: ParsedCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let text = self.buffer.read(cx).text.clone();
         let at = self.vim.cursor;
         match command.action.clone() {
             Action::Target(target) => {
                 if let Some(resolved) = self.resolve(&target, &command, None, cx) {
                     self.set_selection(resolved, &target, cx);
+                } else if self.command_error.is_none()
+                    && self.shared.read(cx).macros.running
+                    && !self.shared.read(cx).macros.waiting
+                {
+                    self.command_error = Some("Motion failed".into());
                 }
             }
             Action::Operate(op, target) => {
@@ -358,6 +532,8 @@ impl FileView {
                         1
                     };
                     self.operate(op, resolved, command.register, shifts, window, cx);
+                } else if self.command_error.is_none() {
+                    self.command_error = Some("Operator target not found".into());
                 }
             }
             Action::Insert(placement) => self.begin_insert(placement, command.count, window, cx),
@@ -594,18 +770,27 @@ impl FileView {
                     self.undo(matches!(command.action, Action::Redo), window, cx);
                 }
             }
-            Action::Search => {
-                self.search_origin = at;
-                self.search_open = true;
-                self.search
-                    .update(cx, |search, cx| search.set_value("", window, cx));
-                cx.set_global(Mode::Search);
-                self.search.focus_handle(cx).focus(window, cx);
+            Action::Search(forward, _) => self.begin_search(command.clone(), forward, window, cx),
+            Action::Repeat => {
+                self.repeat_change(command.explicit_count.then_some(command.count), window, cx)
             }
-            Action::SearchNext(forward) => {
-                for _ in 0..command.count {
-                    self.search_next(forward, cx);
+            Action::Record(name) => self.record_macro(name, window, cx),
+            Action::Replay(name) => self.replay_register(name, command.count, window, cx),
+            Action::ReplayRecorded => {
+                if let Some(name) = self.shared.read(cx).macros.last_recorded {
+                    self.replay_register(name, command.count, window, cx);
+                } else {
+                    self.command_error = Some("No recorded macro".into());
                 }
+            }
+            Action::SetMark(name) => self.set_mark(name, cx),
+            Action::Jump(newer) => self.jump_history(newer, command.count, cx),
+            Action::ChangeList(newer) => self.change_history(newer, command.count, cx),
+            Action::InsertLast => self.insert_last(command.count, window, cx),
+            Action::UndoTime(newer) => self.undo_time(newer, command.count, window, cx),
+            Action::UndoLine => self.undo_line(window, cx),
+            Action::Integration(name) => {
+                self.integration(&name, command.count, command.explicit_count, window, cx)
             }
             Action::Scroll(key) => self.scroll_key(&key, command.count, command.explicit_count, cx),
             Action::Save => self.save(window, cx),

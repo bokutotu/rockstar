@@ -17,6 +17,8 @@ pub(super) struct InsertSession {
     pub register_pending: bool,
     pub literal_next: bool,
     pub temporary_normal: bool,
+    pub control_g: bool,
+    pub restart_at_cursor: bool,
 }
 impl InsertSession {
     pub(super) fn new(start: usize, count: usize) -> Self {
@@ -31,6 +33,8 @@ impl InsertSession {
             register_pending: false,
             literal_next: false,
             temporary_normal: false,
+            control_g: false,
+            restart_at_cursor: false,
         }
     }
 }
@@ -62,7 +66,8 @@ impl FileView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(text) = transaction.apply(&self.buffer.read(cx).text) else {
+        let old = self.buffer.read(cx).text.clone();
+        let Some(text) = transaction.apply(&old) else {
             return;
         };
         self.vim.cursor = if self.vim.mode.is_insert() {
@@ -72,14 +77,36 @@ impl FileView {
         };
         let id = cx.entity_id();
         let insert = self.vim.mode.is_insert();
+        let replay = self
+            .shared
+            .read(cx)
+            .macros
+            .running
+            .then_some(self.shared.read(cx).macros.generation);
+        if old != text {
+            self.change_dirty = true;
+            self.change_index = None;
+            let buffer = self.buffer.entity_id();
+            self.jumps
+                .update(cx, |jumps, _| jumps.remap(buffer, &old, &text));
+        }
         // Buffer first: the editor's queued Change notification then sees equal
         // text and cannot register this edit a second time.
         self.buffer.update(cx, |buffer, cx| {
-            buffer.edit(text.clone(), transaction.cursor_before, id, insert, cx)
+            buffer.edit(
+                text.clone(),
+                transaction.cursor_before,
+                transaction.cursor_after,
+                id,
+                insert,
+                replay,
+                cx,
+            )
         });
         if self.input.read(cx).value().as_ref() != text {
             self.set_input(&text, self.vim.cursor..self.vim.cursor, true, window, cx);
         }
+        self.remap_folds(&old, &text, cx);
         self.vim.column = None;
         self.select(cx);
     }
@@ -129,7 +156,30 @@ impl FileView {
                 }
             }
         }
+        if old.len() > entered.len() {
+            let removed = old.len() - entered.len();
+            let from = native_cursor;
+            let to = from.saturating_add(removed);
+            if old.is_char_boundary(from)
+                && old.is_char_boundary(to)
+                && entered.is_char_boundary(from)
+                && old[..from] == entered[..from]
+                && old[to..] == entered[from..]
+            {
+                edit = TextEdit {
+                    range: from..to,
+                    replacement: String::new(),
+                };
+            }
+        }
         let before = self.vim.cursor.min(old.len());
+        if let Some(session) = &mut self.insert {
+            if session.restart_at_cursor {
+                session.start = before;
+                session.restart_at_cursor = false;
+            }
+        }
+        self.record_text_edit(&old, &edit, before, true, cx);
         let transaction = if matches!(self.vim.mode, Mode::Replace | Mode::VirtualReplace)
             && edit.range.is_empty()
             && !edit.replacement.is_empty()
@@ -206,6 +256,19 @@ impl FileView {
                 self.buffer.read(cx).path.display().to_string(),
             ));
         }
+        if register == '.' {
+            return Some(RegisterValue::Character(
+                self.shared.read(cx).last_insert.clone(),
+            ));
+        }
+        if register == '/' {
+            return self
+                .shared
+                .read(cx)
+                .search
+                .as_ref()
+                .map(|s| RegisterValue::Character(s.pattern.clone()));
+        }
         if register == '_' {
             return Some(RegisterValue::Character(String::new()));
         }
@@ -254,6 +317,9 @@ impl FileView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.integration_operator(operator, &target, window, cx) {
+            return;
+        }
         if target.ranges.iter().all(Range::is_empty) && operator != Operator::Change {
             return;
         }
@@ -378,6 +444,7 @@ impl FileView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.reveal_folds(self.vim.cursor, true, cx);
         let text = self.buffer.read(cx).text.clone();
         let at = self.vim.cursor;
         let block = if self.vim.mode == Mode::VisualBlock && matches!(placement, "I" | "A") {
@@ -495,6 +562,8 @@ impl FileView {
                         inserted.push_str(&repeat);
                     }
                 }
+                self.shared
+                    .update(cx, |shared, _| shared.last_insert = inserted.clone());
                 if let Some(block) = session.block.filter(|block| {
                     block.rows > 1 && !inserted.contains('\n') && !inserted.is_empty()
                 }) {
@@ -526,12 +595,20 @@ impl FileView {
                 }
             }
         }
+        let at = self.vim.cursor;
+        self.buffer.update(cx, |buffer, _| {
+            buffer.positions.marks.insert('^', at);
+        });
         let text = &self.buffer.read(cx).text;
         if self.vim.cursor > start(text, self.vim.cursor) {
             self.vim.cursor = prev(text, self.vim.cursor);
         }
+        let id = cx.entity_id();
+        self.buffer
+            .update(cx, |buffer, _| buffer.finish_insert(id, self.vim.cursor));
         self.set_mode(Mode::Normal, cx);
         self.select(cx);
+        self.finish_change(cx);
     }
     pub(super) fn type_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let old = self.buffer.read(cx).text.clone();

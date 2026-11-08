@@ -54,6 +54,9 @@ syntax highlighting. These local extensions provide the missing display layer:
 - `set_selection_reversed` lets FileView place the caret at the active end of a
   Vim Visual selection, including a row in a block selection, without changing
   the selected text or removing additional selections.
+- `set_manual_folds` publishes FileView-owned closed fold ranges independently
+  of syntax-derived folding, so Vim manual folds and their open/closed state
+  share the native editor's display map and hit testing.
 
 Markdown's inline parser also gives media extensions a complete paired
 `<audio>`/`<video>` element, including `<source>` children and fallback text.

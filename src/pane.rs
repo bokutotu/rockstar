@@ -4,8 +4,8 @@ use crate::{
     diff::{DiffSession, DiffView},
     file_buffer::FileBuffer,
     file_view::FileView,
-    mode::Mode,
     media::{MediaSession, MediaView},
+    mode::Mode,
     terminal::{TerminalSession, TerminalView},
 };
 use gpui_kit::{
@@ -42,11 +42,15 @@ pub(crate) struct Pane {
     pub(crate) bounds: Rc<Cell<Bounds<Pixels>>>,
     /// Reject late async loads/connections after the destination has changed.
     pub(crate) request: u64,
+    pub(crate) jumps: Entity<crate::file_view::JumpList>,
+    pub(crate) alternate_file: Option<EntityId>,
+    current_file: Option<EntityId>,
 }
 
 impl Pane {
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
-        cx.on_release(|this, cx| this.set_content_visible(false, cx)).detach();
+        cx.on_release(|this, cx| this.set_content_visible(false, cx))
+            .detach();
         Self {
             content: PaneContent::Plain,
             focus: cx.focus_handle(),
@@ -57,6 +61,9 @@ impl Pane {
             diffs: HashMap::new(),
             bounds: Rc::default(),
             request: 0,
+            jumps: cx.new(|_| crate::file_view::JumpList::default()),
+            alternate_file: None,
+            current_file: None,
         }
     }
 
@@ -67,7 +74,9 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.item_id(cx) != Some(session.entity_id()) { self.set_content_visible(false, cx); }
+        if self.item_id(cx) != Some(session.entity_id()) {
+            self.set_content_visible(false, cx);
+        }
         let chat = self
             .chats
             .entry(session.entity_id())
@@ -87,13 +96,24 @@ impl Pane {
         cx: &mut Context<Self>,
     ) {
         let id = buffer.entity_id();
-        if self.item_id(cx) != Some(id) { self.set_content_visible(false, cx); }
+        if self.current_file != Some(id) {
+            self.alternate_file = self.current_file;
+            self.current_file = Some(id);
+        }
+        if self.item_id(cx) != Some(id) {
+            self.set_content_visible(false, cx);
+        }
         let view = self
             .files
             .entry(id)
             .or_insert_with(|| {
-                let view = cx.new(|cx| FileView::new(buffer.clone(), vim, window, cx));
+                let view =
+                    cx.new(|cx| FileView::new(buffer.clone(), vim, self.jumps.clone(), window, cx));
                 cx.subscribe(&view, |_, _, event: &crate::file_view::Navigate, cx| {
+                    cx.emit(event.clone())
+                })
+                .detach();
+                cx.subscribe(&view, |_, _, event: &crate::file_view::VimEvent, cx| {
                     cx.emit(event.clone())
                 })
                 .detach();
@@ -117,19 +137,26 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.item_id(cx) != Some(session.entity_id()) { self.set_content_visible(false, cx); }
-        let view = self.terminals.entry(session.entity_id()).or_insert_with(|| {
-            let mut label = session.read(cx).label();
-            cx.observe(&session, move |_, session, cx| {
-                let next = session.read(cx).label();
-                if next != label {
-                    label = next;
-                    cx.emit(PanelEvent::LayoutChanged);
-                    cx.notify();
-                }
-            }).detach();
-            cx.new(|cx| TerminalView::new(session, window, cx))
-        }).clone();
+        if self.item_id(cx) != Some(session.entity_id()) {
+            self.set_content_visible(false, cx);
+        }
+        let view = self
+            .terminals
+            .entry(session.entity_id())
+            .or_insert_with(|| {
+                let mut label = session.read(cx).label();
+                cx.observe(&session, move |_, session, cx| {
+                    let next = session.read(cx).label();
+                    if next != label {
+                        label = next;
+                        cx.emit(PanelEvent::LayoutChanged);
+                        cx.notify();
+                    }
+                })
+                .detach();
+                cx.new(|cx| TerminalView::new(session, window, cx))
+            })
+            .clone();
         self.content = PaneContent::Terminal(view);
         cx.emit(PanelEvent::LayoutChanged);
         cx.notify();
@@ -137,18 +164,35 @@ impl Pane {
 
     pub(crate) fn show_diff(&mut self, session: Entity<DiffSession>, cx: &mut Context<Self>) {
         let id = session.entity_id();
-        if self.item_id(cx) != Some(id) { self.set_content_visible(false, cx); }
-        let view = self.diffs.entry(id).or_insert_with(|| cx.new(|cx| DiffView::new(session, cx))).clone();
+        if self.item_id(cx) != Some(id) {
+            self.set_content_visible(false, cx);
+        }
+        let view = self
+            .diffs
+            .entry(id)
+            .or_insert_with(|| cx.new(|cx| DiffView::new(session, cx)))
+            .clone();
         self.content = PaneContent::Diff(view);
         self.set_content_visible(true, cx);
         cx.emit(PanelEvent::LayoutChanged);
         cx.notify();
     }
 
-    pub(crate) fn show_media(&mut self, session: Entity<MediaSession>, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn show_media(
+        &mut self,
+        session: Entity<MediaSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let id = session.entity_id();
-        if self.item_id(cx) != Some(id) { self.set_content_visible(false, cx); }
-        let view = self.media.entry(id).or_insert_with(|| cx.new(|cx| MediaView::new(session, false, window, cx))).clone();
+        if self.item_id(cx) != Some(id) {
+            self.set_content_visible(false, cx);
+        }
+        let view = self
+            .media
+            .entry(id)
+            .or_insert_with(|| cx.new(|cx| MediaView::new(session, false, window, cx)))
+            .clone();
         self.content = PaneContent::Media(view);
         self.set_content_visible(true, cx);
         cx.emit(PanelEvent::LayoutChanged);
@@ -159,7 +203,9 @@ impl Pane {
         match &self.content {
             PaneContent::Media(view) => view.update(cx, |view, cx| view.set_visible(visible, cx)),
             PaneContent::Chat(chat) => chat.update(cx, |chat, cx| chat.set_visible(visible, cx)),
-            PaneContent::File(view) => view.update(cx, |view, cx| view.set_media_visible(visible, cx)),
+            PaneContent::File(view) => {
+                view.update(cx, |view, cx| view.set_media_visible(visible, cx))
+            }
             PaneContent::Diff(view) => view.update(cx, |view, cx| view.set_visible(visible, cx)),
             _ => {}
         }
@@ -175,10 +221,18 @@ impl Pane {
     /// Forget both visible and cached views of an item. The layout stays intact.
     pub(crate) fn forget_item(&mut self, id: EntityId, cx: &mut Context<Self>) -> bool {
         let displayed = self.item_id(cx) == Some(id);
-        if displayed { self.set_content_visible(false, cx); }
+        if displayed {
+            self.set_content_visible(false, cx);
+        }
         self.media.remove(&id);
         self.chats.remove(&id);
         self.files.remove(&id);
+        if self.alternate_file == Some(id) {
+            self.alternate_file = None;
+        }
+        if self.current_file == Some(id) {
+            self.current_file = None;
+        }
         self.terminals.remove(&id);
         self.diffs.remove(&id);
         if displayed {
@@ -276,7 +330,11 @@ impl Panel for Pane {
             PaneContent::Terminal(view) => view.read(cx).session.read(cx).label(),
             PaneContent::Diff(view) => view.read(cx).session.read(cx).label(),
             PaneContent::Media(view) => match &view.read(cx).session.read(cx).source {
-                crate::media::MediaSource::File(path) => path.file_name().unwrap_or_default().to_string_lossy().into_owned(),
+                crate::media::MediaSource::File(path) => path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
                 source => source.label(),
             },
             PaneContent::File(view) => {
@@ -303,6 +361,7 @@ impl Panel for Pane {
 impl EventEmitter<PanelEvent> for Pane {}
 impl EventEmitter<PaneActivated> for Pane {}
 impl EventEmitter<crate::file_view::Navigate> for Pane {}
+impl EventEmitter<crate::file_view::VimEvent> for Pane {}
 impl Focusable for Pane {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
