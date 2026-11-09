@@ -8,6 +8,7 @@ mod file_buffer;
 mod file_search;
 mod file_view;
 mod file_watch;
+mod fs_watch;
 mod input_shortcuts;
 mod instance;
 mod launch;

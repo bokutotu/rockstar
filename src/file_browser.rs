@@ -1,13 +1,15 @@
 use crate::{
     file_search,
+    fs_watch::{FsWatch, WatchTargets, WatchUpdate},
     mode::{Mode, text_key},
     workspace::Tab,
 };
 use gpui_kit::{
-    App, AppContext as _, Bounds, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, KeyBinding, Keystroke, MouseButton, ParentElement as _,
-    Pixels, Render, Role, ScrollStrategy, StatefulInteractiveElement as _, Styled as _, Task,
-    UniformListScrollHandle, WeakEntity, Window,
+    AnyWindowHandle, App, AppContext as _, Bounds, Context, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding, Keystroke,
+    MouseButton, ParentElement as _, Pixels, Render, Role, ScrollStrategy,
+    StatefulInteractiveElement as _, Styled as _, Task, UniformListScrollHandle, WeakEntity,
+    Window,
     base::ElementExt as _,
     component::{
         ActiveTheme as _, WindowExt as _,
@@ -19,7 +21,10 @@ use gpui_kit::{
     prelude::FluentBuilder as _,
     px, uniform_list,
 };
-use std::{cell::Cell, collections::HashSet, path::PathBuf, rc::Rc};
+use std::{cell::Cell, collections::HashSet, path::PathBuf, rc::Rc, time::Duration};
+
+mod tree_watch;
+use tree_watch::TreeSnapshot;
 
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
@@ -218,6 +223,12 @@ pub(crate) struct FileTree {
     scroll: UniformListScrollHandle,
     loading: bool,
     scan: Option<Task<()>>,
+    refresh_pending: bool,
+    debounce: Option<Task<()>>,
+    scan_failed: bool,
+    watch: FsWatch,
+    window: AnyWindowHandle,
+    _scan_retry: Task<()>,
 }
 impl EventEmitter<OpenFile> for FileTree {}
 impl Focusable for FileTree {
@@ -226,7 +237,49 @@ impl Focusable for FileTree {
     }
 }
 impl FileTree {
-    pub(crate) fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let (watch, receiver) = FsWatch::new();
+        watch.set_targets(WatchTargets {
+            directories: HashSet::from([
+                root.clone(),
+                root.parent().unwrap_or(&root).to_path_buf(),
+            ]),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            while let Ok(update) = receiver.recv().await {
+                if this
+                    .update_in(cx, |this, window, cx| {
+                        this.handle_watch_update(update, window, cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.observe_window_activation(window, |this, window, _| {
+            if window.is_window_active() {
+                this.watch.recheck();
+            }
+        })
+        .detach();
+        let scan_retry = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if this
+                    .update(cx, |this, cx| {
+                        // Traversal failures are separate from OS watch failures.
+                        if this.scan_failed {
+                            this.request_refresh(cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let mut tree = Self {
             root,
             paths: Vec::new(),
@@ -238,6 +291,12 @@ impl FileTree {
             scroll: UniformListScrollHandle::default(),
             loading: true,
             scan: None,
+            refresh_pending: false,
+            debounce: None,
+            scan_failed: false,
+            watch,
+            window: window.window_handle(),
+            _scan_retry: scan_retry,
         };
         tree.refresh(cx);
         tree
@@ -251,34 +310,103 @@ impl FileTree {
         }
         self.focus.focus(window, cx);
     }
-    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
-        let root = self.root.clone();
-        let scan = cx.background_spawn(async move { file_search::scan(&root) });
-        self.scan = Some(cx.spawn(async move |this, cx| {
-            let mut paths = scan.await;
-            paths.retain(|p| p.split('/').all(|part| !part.starts_with('.')));
-            // Lexicographic component ordering, folders before files at each depth.
-            paths.sort_by_cached_key(|path| {
-                let pieces = path.trim_end_matches('/').split('/').collect::<Vec<_>>();
-                pieces
-                    .iter()
-                    .enumerate()
-                    .map(|(i, part)| {
-                        (
-                            i + 1 == pieces.len() && !path.ends_with('/'),
-                            part.to_string(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            });
+    fn handle_watch_update(
+        &mut self,
+        update: WatchUpdate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match update {
+            WatchUpdate::Changed(event) => {
+                if tree_watch::affects_tree(&self.root, &event) {
+                    self.request_refresh(cx);
+                }
+            }
+            WatchUpdate::Rescan => self.request_refresh(cx),
+            WatchUpdate::Error(error) => window.push_notification(
+                Notification::error(format!("File tree watcher: {error}")),
+                cx,
+            ),
+        }
+    }
+    fn request_refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_pending = true;
+        if self.scan.is_some() || self.debounce.is_some() {
+            return;
+        }
+        // A fixed batching window keeps making progress even during continuous changes.
+        self.debounce = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(100))
+                .await;
             let _ = this.update(cx, |this, cx| {
-                this.paths = paths;
-                this.loading = false;
-                this.rebuild(cx);
+                this.debounce = None;
+                this.refresh(cx);
             });
         }));
     }
+    pub(crate) fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_pending = true;
+        if self.scan.is_some() {
+            return;
+        }
+        self.refresh_pending = false;
+        self.debounce = None;
+        let root = self.root.clone();
+        let window = self.window;
+        let scan = cx.background_spawn(async move { tree_watch::scan_tree(&root) });
+        self.scan = Some(cx.spawn(async move |this, cx| {
+            let result = scan.await;
+            let _ = cx.update_window(window, |_, window, cx| {
+                this.update(cx, |this, cx| {
+                    this.scan = None;
+                    match result {
+                        Ok(snapshot) => {
+                            this.scan_failed = false;
+                            this.apply_snapshot(snapshot, cx);
+                        }
+                        Err(error) => {
+                            if !this.scan_failed {
+                                window.push_notification(
+                                    Notification::error(format!("File tree: {error:#}")),
+                                    cx,
+                                );
+                            }
+                            // Keep the last successful snapshot if a traversal fails.
+                            this.scan_failed = true;
+                            this.loading = false;
+                            cx.notify();
+                        }
+                    }
+                    if this.refresh_pending {
+                        this.request_refresh(cx);
+                    }
+                })
+            });
+        }));
+    }
+    fn apply_snapshot(&mut self, snapshot: TreeSnapshot, cx: &mut Context<Self>) {
+        self.watch.set_targets(WatchTargets {
+            directories: snapshot.watch_directories,
+        });
+        if !self.loading && self.paths == snapshot.paths {
+            return;
+        }
+        self.loading = false;
+        self.paths = snapshot.paths;
+        let directories = self
+            .paths
+            .iter()
+            .filter(|path| path.ends_with('/'))
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        self.expanded
+            .retain(|path| directories.contains(path.as_str()));
+        // Reuse the scroll handle without scrolling to the selection on automatic updates.
+        self.rebuild(cx);
+    }
     fn rebuild(&mut self, cx: &mut Context<Self>) {
+        let selected = self.visible.get(self.selected).cloned();
         self.visible = self
             .paths
             .iter()
@@ -290,7 +418,9 @@ impl FileTree {
             })
             .cloned()
             .collect();
-        self.selected = self.selected.min(self.visible.len().saturating_sub(1));
+        self.selected = selected
+            .and_then(|path| self.visible.iter().position(|visible| visible == &path))
+            .unwrap_or_else(|| self.selected.min(self.visible.len().saturating_sub(1)));
         cx.notify();
     }
     fn open(&mut self, index: usize, cx: &mut Context<Self>) {

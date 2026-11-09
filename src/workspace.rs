@@ -507,7 +507,7 @@ impl Tab {
         self.tree_visible = !self.tree_visible;
         if self.tree_visible {
             if self.tree.is_none() {
-                let tree = cx.new(|cx| FileTree::new(self.root.clone(), cx));
+                let tree = cx.new(|cx| FileTree::new(self.root.clone(), window, cx));
                 cx.subscribe_in(&tree, window, |this, _, event: &OpenFile, window, cx| {
                     let pane = this.panes[this.active].entity_id();
                     this.open_file(pane, event.0.clone(), window, cx);
