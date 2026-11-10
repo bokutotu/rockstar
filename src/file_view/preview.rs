@@ -133,6 +133,11 @@ impl FileView {
                     .p_6()
                     .child(preview.content.view()),
             )
+            .child(
+                div().px_2().py_1().flex_shrink_0().text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Ctrl+U/D half page · Ctrl+B/F page · j/k scroll · Esc source"),
+            )
             .into_any_element()
     }
 }
