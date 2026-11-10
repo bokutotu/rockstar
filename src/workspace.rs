@@ -593,7 +593,7 @@ impl Tab {
                 && !key.modifiers.platform
                 && (!self.pending.is_empty() || matches!(k, "s" | "\\"));
             if !workspace_sequence {
-                return tree.update(cx, |tree, cx| tree.key(key, cx));
+                return tree.update(cx, |tree, cx| tree.key(key, window, cx));
             }
         }
         if mode == Mode::Normal && key.modifiers.control && matches!(key.key.as_str(), "n" | "p") {

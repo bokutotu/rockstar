@@ -10,9 +10,10 @@ use gpui_kit::{
     MouseButton, ParentElement as _, Pixels, Render, Role, ScrollStrategy,
     StatefulInteractiveElement as _, Styled as _, Task, UniformListScrollHandle, WeakEntity,
     Window,
-    base::ElementExt as _,
+    base::{Disableable as _, ElementExt as _},
     component::{
-        ActiveTheme as _, WindowExt as _,
+        ActiveTheme as _, Sizable as _, WindowExt as _,
+        button::Button,
         dialog::DialogEntrance,
         input::{Enter, Input, InputEvent, InputState, MoveDown, MoveUp},
         notification::Notification,
@@ -23,7 +24,10 @@ use gpui_kit::{
 };
 use std::{cell::Cell, collections::HashSet, path::PathBuf, rc::Rc, time::Duration};
 
+mod creation;
+mod creation_dialog;
 mod tree_watch;
+use creation::{EntryKind, initial_creation_path};
 use tree_watch::TreeSnapshot;
 
 pub(crate) fn init(cx: &mut App) {
@@ -224,6 +228,7 @@ pub(crate) struct FileTree {
     loading: bool,
     scan: Option<Task<()>>,
     refresh_pending: bool,
+    reveal_pending: Option<String>,
     debounce: Option<Task<()>>,
     scan_failed: bool,
     watch: FsWatch,
@@ -292,6 +297,7 @@ impl FileTree {
             loading: true,
             scan: None,
             refresh_pending: false,
+            reveal_pending: None,
             debounce: None,
             scan_failed: false,
             watch,
@@ -352,6 +358,8 @@ impl FileTree {
         }
         self.refresh_pending = false;
         self.debounce = None;
+        // Only a scan started after creation may consume the reveal request.
+        let reveal = self.reveal_pending.take();
         let root = self.root.clone();
         let window = self.window;
         let scan = cx.background_spawn(async move { tree_watch::scan_tree(&root) });
@@ -363,7 +371,7 @@ impl FileTree {
                     match result {
                         Ok(snapshot) => {
                             this.scan_failed = false;
-                            this.apply_snapshot(snapshot, cx);
+                            this.apply_snapshot(snapshot, reveal.as_deref(), cx);
                         }
                         Err(error) => {
                             if !this.scan_failed {
@@ -372,7 +380,11 @@ impl FileTree {
                                     cx,
                                 );
                             }
-                            // Keep the last successful snapshot if a traversal fails.
+                            // Keep the snapshot and retry revealing unless a newer
+                            // creation already requested its own selection.
+                            if this.reveal_pending.is_none() {
+                                this.reveal_pending = reveal;
+                            }
                             this.scan_failed = true;
                             this.loading = false;
                             cx.notify();
@@ -385,11 +397,16 @@ impl FileTree {
             });
         }));
     }
-    fn apply_snapshot(&mut self, snapshot: TreeSnapshot, cx: &mut Context<Self>) {
+    fn apply_snapshot(
+        &mut self,
+        snapshot: TreeSnapshot,
+        reveal: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
         self.watch.set_targets(WatchTargets {
             directories: snapshot.watch_directories,
         });
-        if !self.loading && self.paths == snapshot.paths {
+        if !self.loading && self.paths == snapshot.paths && reveal.is_none() {
             return;
         }
         self.loading = false;
@@ -402,8 +419,55 @@ impl FileTree {
             .collect::<HashSet<_>>();
         self.expanded
             .retain(|path| directories.contains(path.as_str()));
-        // Reuse the scroll handle without scrolling to the selection on automatic updates.
+        // Hidden/ignored entries stay hidden, even when created from the tree.
+        let reveal = reveal.filter(|path| self.paths.iter().any(|entry| entry == path));
+        if let Some(path) = reveal {
+            for (index, _) in path.trim_end_matches('/').match_indices('/') {
+                self.expanded.insert(path[..=index].to_owned());
+            }
+        }
+        // Automatic updates keep the viewport; explicit creation reveals its entry.
         self.rebuild(cx);
+        if let Some(path) = reveal
+            && let Some(index) = self.visible.iter().position(|entry| entry == path)
+        {
+            self.selected = index;
+            self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+        }
+    }
+    fn begin_creation(
+        &mut self,
+        kind: EntryKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if cx.global::<Mode>().is_overlay() || window.has_active_dialog(cx) {
+            return;
+        }
+        self.focus(window, cx);
+        let initial_path =
+            initial_creation_path(self.visible.get(self.selected).map(String::as_str));
+        creation_dialog::open(
+            cx.entity().downgrade(),
+            self.root.clone(),
+            kind,
+            initial_path,
+            window,
+            cx,
+        );
+    }
+    fn finish_creation(&mut self, kind: EntryKind, path: PathBuf, cx: &mut Context<Self>) {
+        if let Ok(relative) = path.strip_prefix(&self.root) {
+            let mut relative = relative.to_string_lossy().into_owned();
+            if kind == EntryKind::Directory {
+                relative.push('/');
+            }
+            self.reveal_pending = Some(relative);
+        }
+        self.refresh(cx);
+        if kind == EntryKind::File {
+            cx.emit(OpenFile(path));
+        }
     }
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         let selected = self.visible.get(self.selected).cloned();
@@ -436,7 +500,12 @@ impl FileTree {
             }
         }
     }
-    pub(crate) fn key(&mut self, key: &Keystroke, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn key(
+        &mut self,
+        key: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let k = text_key(key);
         match k {
             "j" | "down" => {
@@ -471,6 +540,17 @@ impl FileTree {
                 }
             }
             "r" => self.refresh(cx),
+            "a" | "A"
+                if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform =>
+            {
+                let kind = if k == "A" || key.modifiers.shift {
+                    EntryKind::Directory
+                } else {
+                    EntryKind::File
+                };
+                self.begin_creation(kind, window, cx);
+                return true;
+            }
             _ => return false,
         }
         self.scroll
@@ -508,6 +588,33 @@ impl Render for FileTree {
             } else {
                 "Files"
             }))
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .px_2()
+                    .pb_2()
+                    .child(
+                        Button::new("new-file")
+                            .small()
+                            .label("New File")
+                            .tooltip("New file (a)")
+                            .disabled(cx.global::<Mode>().is_overlay())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.begin_creation(EntryKind::File, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("new-folder")
+                            .small()
+                            .label("New Folder")
+                            .tooltip("New folder (Shift+A)")
+                            .disabled(cx.global::<Mode>().is_overlay())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.begin_creation(EntryKind::Directory, window, cx)
+                            })),
+                    ),
+            )
             .child(
                 uniform_list(
                     "tree-entries",

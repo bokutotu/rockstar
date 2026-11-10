@@ -1,4 +1,4 @@
-## ROCKSTAR(By DaBaby) IDE 
+## ROCKSTAR IDE 
 
 IDE for AI era.
 
