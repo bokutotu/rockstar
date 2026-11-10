@@ -329,7 +329,7 @@ impl CommandPaletteView {
                 tab.update_diff_index(IndexAction::Unstage, cx)
             }),
             "e!" => tab.update(cx, |tab, cx| tab.reload_active_file(window, cx)),
-            "chat" => {
+            "pi" => {
                 tab.update(cx, |workspace, cx| workspace.show_chat(false, window, cx));
                 Ok(())
             }
@@ -339,11 +339,16 @@ impl CommandPaletteView {
                 tab.update(cx, |tab, cx| tab.open_resume(window, cx));
                 return;
             }
-            "term" => {
+            "term" | "agy" | "codex" => {
+                let kind = match name.to_ascii_lowercase().as_str() {
+                    "agy" => crate::terminal::TerminalKind::Agy,
+                    "codex" => crate::terminal::TerminalKind::Codex,
+                    _ => crate::terminal::TerminalKind::Shell,
+                };
                 // Dismiss before opening: an existing terminal can enter Insert
                 // immediately without the palette resetting it to Normal.
                 self.dismiss(cx);
-                tab.update(cx, |workspace, cx| workspace.show_terminal(window, cx));
+                tab.update(cx, |workspace, cx| workspace.show_terminal(kind, window, cx));
                 return;
             }
             "new" => {

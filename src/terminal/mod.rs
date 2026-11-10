@@ -17,8 +17,34 @@ use screen::Size;
 use std::path::Path;
 pub(crate) use view::TerminalView;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalKind {
+    Shell,
+    Agy,
+    Codex,
+}
+
+impl TerminalKind {
+    pub(crate) fn command(self) -> CommandBuilder {
+        match self {
+            Self::Shell => shell_command(),
+            Self::Agy => CommandBuilder::new("agy"),
+            Self::Codex => CommandBuilder::new("codex"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Shell => "Terminal",
+            Self::Agy => "Agy",
+            Self::Codex => "Codex",
+        }
+    }
+}
+
 pub(crate) struct TerminalSession {
     pub(crate) number: usize,
+    pub(crate) kind: TerminalKind,
     pub(super) process: TerminalProcess,
     requested_size: Size,
     _events: Task<()>,
@@ -31,6 +57,7 @@ impl TerminalSession {
 
     pub(crate) fn new(
         number: usize,
+        kind: TerminalKind,
         process: TerminalProcess,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -96,6 +123,7 @@ impl TerminalSession {
         });
         Self {
             number,
+            kind,
             process,
             requested_size: Size::default(),
             _events: task,
@@ -104,7 +132,8 @@ impl TerminalSession {
 
     pub(crate) fn label(&self) -> String {
         format!(
-            "Terminal {}{}",
+            "{} {}{}",
+            self.kind.label(),
             self.number,
             if self.process.screen.lock().unwrap().exit.is_some() {
                 " (exited)"

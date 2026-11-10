@@ -1,14 +1,16 @@
 // Keep sorted, including every alias handled by CommandPaletteView::confirm.
 const COMMAND_NAMES: &[&str] = &[
+    "agy",
     "bw",
     "bw!",
-    "chat",
     "close",
+    "codex",
     "diff",
     "diffstaged",
     "diffunstaged",
     "e!",
     "new",
+    "pi",
     "prdiff",
     "q",
     "qa",

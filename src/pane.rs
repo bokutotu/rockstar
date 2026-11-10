@@ -383,7 +383,7 @@ impl Render for Pane {
                 .gap_2()
                 .text_color(cx.theme().muted_foreground)
                 .child("Rockstar")
-                .child(":chat  Start a chat")
+                .child(":pi / :agy / :codex  Start an agent")
                 .child(":term  Open a terminal")
                 .child(":diff / :prdiff  Review changes")
                 .child("\\ff    Find a file")

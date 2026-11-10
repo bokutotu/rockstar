@@ -1,9 +1,11 @@
 use super::*;
-use crate::terminal::{self, TerminalSession};
+use crate::terminal::{TerminalKind, TerminalSession};
 
 impl Tab {
-    pub(crate) fn show_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(view) = self.panes[self.active].read(cx).terminal() {
+    pub(crate) fn show_terminal(&mut self, kind: TerminalKind, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.panes[self.active].read(cx).terminal()
+            && view.read(cx).session.read(cx).kind == kind
+        {
             cx.set_global(Mode::Insert);
             view.update(cx, |view, cx| view.focus(window, cx));
             return;
@@ -15,7 +17,7 @@ impl Tab {
             pane.request
         });
         let root = self.root.clone();
-        let command = terminal::shell_command();
+        let command = kind.command();
         let starting = cx.background_spawn(async move { TerminalSession::spawn(&root, command) });
         cx.spawn_in(window, async move |this, cx| {
             let result = starting.await;
@@ -42,7 +44,7 @@ impl Tab {
                             .unwrap_or(0)
                             + 1;
                         let session =
-                            cx.new(|cx| TerminalSession::new(number, process, window, cx));
+                            cx.new(|cx| TerminalSession::new(number, kind, process, window, cx));
                         let id = this.register_item(OpenItem::Terminal(session), cx);
                         this.show_item(pane_id, id, window, cx);
                         // A background completion must not steal focus from a
