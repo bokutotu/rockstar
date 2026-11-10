@@ -95,6 +95,24 @@ impl TerminalView {
             return true;
         }
         let normal = *cx.global::<Mode>() == Mode::Normal;
+        // In Insert these keys belong to the shell/TUI (especially Ctrl+D).
+        if normal && key.modifiers.control
+            && !key.modifiers.shift && !key.modifiers.alt && !key.modifiers.platform
+        {
+            let fraction = match key.key.as_str() {
+                "u" => Some(0.5_f32),
+                "d" => Some(-0.5_f32),
+                "b" => Some(1.0_f32),
+                "f" => Some(-1.0_f32),
+                _ => None,
+            };
+            if let Some(fraction) = fraction {
+                let rows = self.session.read(cx).process.screen.lock().unwrap().size.rows;
+                let lines = ((rows as f32 * fraction.abs()).ceil() as i32).max(1);
+                self.scroll_by(if fraction > 0. { lines } else { -lines }, cx);
+                return true;
+            }
+        }
         if !key.modifiers.alt && !key.modifiers.platform
             && ((key.modifiers.control && key.key.eq_ignore_ascii_case("c")
                 && (key.modifiers.shift || normal))
@@ -268,7 +286,7 @@ impl Render for TerminalView {
             if *cx.global::<Mode>() == Mode::Insert {
                 "INSERT · Esc: Normal".into()
             } else {
-                "NORMAL · i: Terminal input".into()
+                "NORMAL · i: input · Ctrl+U/D: half page · Ctrl+B/F: page".into()
             }
         });
         drop(screen);

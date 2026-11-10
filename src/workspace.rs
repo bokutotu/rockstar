@@ -626,7 +626,7 @@ impl Tab {
             && key.modifiers.control
             && key.key == "b"
             && !key.modifiers.shift && !key.modifiers.alt && !key.modifiers.platform
-            && ((file.is_none() && diff.is_none())
+            && ((file.is_none() && diff.is_none() && terminal.is_none())
                 || self.focused_target(window, cx) == Some(FocusTarget::FileTree))
         {
             self.pending.clear();
