@@ -10,11 +10,13 @@ use std::{
 pub(super) struct TreeSnapshot {
     pub paths: Vec<String>,
     pub watch_directories: HashSet<PathBuf>,
+    pub git: super::git_status::GitStatus,
 }
 
 pub(super) fn scan_tree(root: &Path) -> Result<TreeSnapshot> {
     let mut snapshot = TreeSnapshot {
         paths: Vec::new(),
+        git: Default::default(),
         // The parent covers removal/replacement of the root. FsWatch resolves
         // missing directories to their nearest surviving ancestor.
         watch_directories: HashSet::from([root.parent().unwrap_or(root).to_path_buf()]),
@@ -73,6 +75,11 @@ pub(super) fn scan_tree(root: &Path) -> Result<TreeSnapshot> {
             })
             .collect::<Vec<_>>()
     });
+    snapshot.git = super::git_status::load(root).unwrap_or_else(|error| super::git_status::GitStatus {
+        error: Some(format!("Git status: {error:#}")),
+        ..Default::default()
+    });
+    snapshot.watch_directories.extend(snapshot.git.watch_directories.iter().cloned());
     Ok(snapshot)
 }
 

@@ -1,2 +1,1 @@
-- fileviewにbase branchに対する変更、uncommitedな変更をそれぞれファイルに色をつける
 - fileviewでファイルにファイル形式ごとにアイコンをつける

@@ -26,6 +26,7 @@ use std::{cell::Cell, collections::HashSet, path::PathBuf, rc::Rc, time::Duratio
 
 mod creation;
 mod creation_dialog;
+mod git_status;
 mod tree_watch;
 use creation::{EntryKind, initial_creation_path};
 use tree_watch::TreeSnapshot;
@@ -218,6 +219,7 @@ impl Render for FileFinder {
 pub(crate) struct OpenFile(pub PathBuf);
 pub(crate) struct FileTree {
     root: PathBuf,
+    git: git_status::GitStatus,
     paths: Vec<String>,
     visible: Vec<String>,
     expanded: HashSet<String>,
@@ -287,6 +289,7 @@ impl FileTree {
         });
         let mut tree = Self {
             root,
+            git: Default::default(),
             paths: Vec::new(),
             visible: Vec::new(),
             expanded: HashSet::new(),
@@ -324,7 +327,7 @@ impl FileTree {
     ) {
         match update {
             WatchUpdate::Changed(event) => {
-                if tree_watch::affects_tree(&self.root, &event) {
+                if tree_watch::affects_tree(&self.root, &event) || self.git.affects(&self.root, &event) {
                     self.request_refresh(cx);
                 }
             }
@@ -370,7 +373,7 @@ impl FileTree {
                     this.scan = None;
                     match result {
                         Ok(snapshot) => {
-                            this.scan_failed = false;
+                            this.scan_failed = snapshot.git.error.is_some();
                             this.apply_snapshot(snapshot, reveal.as_deref(), cx);
                         }
                         Err(error) => {
@@ -406,10 +409,11 @@ impl FileTree {
         self.watch.set_targets(WatchTargets {
             directories: snapshot.watch_directories,
         });
-        if !self.loading && self.paths == snapshot.paths && reveal.is_none() {
+        if !self.loading && self.paths == snapshot.paths && self.git == snapshot.git && reveal.is_none() {
             return;
         }
         self.loading = false;
+        self.git = snapshot.git;
         self.paths = snapshot.paths;
         let directories = self
             .paths
@@ -583,11 +587,12 @@ impl Render for FileTree {
             .border_r_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().background)
-            .child(div().px_2().py_2().child(if self.loading {
-                "Files · Scanning…"
-            } else {
-                "Files"
-            }))
+            .child(div().px_2().py_2().child(if self.loading { "Files · Scanning…" } else { "Files" }))
+            .child(div().px_2().pb_1().text_xs().text_color(cx.theme().muted_foreground)
+                .child(self.git.error.clone().unwrap_or_else(|| self.git.base.as_ref().map_or_else(
+                    || "W: uncommitted".to_owned(),
+                    |base| format!("B: vs {base} · W: uncommitted")
+                ))))
             .child(
                 div()
                     .flex()
@@ -638,14 +643,19 @@ impl Render for FileTree {
                                 } else {
                                     "  "
                                 };
+                                let changes = this.git.paths.get(path).copied().unwrap_or_default();
                                 div()
                                     .id(("tree-entry", index))
                                     .role(Role::TreeItem)
                                     .aria_label(path.clone())
+                                    .aria_description(format!("{}{}", if changes.branch { "Changed from base branch. " } else { "" }, if changes.uncommitted { "Uncommitted changes." } else { "" }))
                                     .aria_selected(index == this.selected)
                                     .h(px(24.))
                                     .pl(px(8. + depth as f32 * 14.))
                                     .pr_2()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
                                     .cursor_pointer()
                                     .when(index == this.selected, |row| {
                                         row.bg(cx.theme().accent)
@@ -658,7 +668,12 @@ impl Render for FileTree {
                                         this.focus(window, cx);
                                         this.open(index, cx);
                                     }))
-                                    .child(format!("{icon}{label}"))
+                                    .child(div().flex_1().min_w_0().truncate()
+                                        .when(changes.uncommitted, |name| name.text_color(cx.theme().warning))
+                                        .when(changes.branch && !changes.uncommitted, |name| name.text_color(cx.theme().info))
+                                        .child(format!("{icon}{label}")))
+                                    .when(changes.branch, |row| row.child(div().text_xs().text_color(cx.theme().info).child("B")))
+                                    .when(changes.uncommitted, |row| row.child(div().text_xs().text_color(cx.theme().warning).child("W")))
                             })
                             .collect::<Vec<_>>()
                     }),
