@@ -33,7 +33,7 @@ fn input_hint(mode: Mode) -> &'static str {
     if mode == Mode::Insert {
         "Ask pi… · Ctrl+g stop"
     } else {
-        "NORMAL — j/k messages · yy copy Markdown · i type · Ctrl+g stop · : commands"
+        "NORMAL — Ctrl+U/D half page · Ctrl+B/F page · j/k messages · yy copy · i type · Ctrl+g stop · : commands"
     }
 }
 
