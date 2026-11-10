@@ -1,4 +1,5 @@
 /target/
 /.direnv/
+/.worktrees/
 /result
 /result-*
