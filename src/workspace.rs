@@ -583,6 +583,13 @@ impl Tab {
                 return true;
             }
         }
+        if let Some(chat) = self.panes[self.active].read(cx).chat()
+            && chat.focus_handle(cx).contains_focused(window, cx)
+            && chat.update(cx, |chat, cx| chat.scroll_key(key, cx))
+        {
+            self.pending.clear();
+            return true;
+        }
         let terminal = self.panes[self.active].read(cx).terminal();
         if mode == Mode::Insert
             && let Some(terminal) = &terminal

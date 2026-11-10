@@ -50,6 +50,10 @@ impl ChatPane {
         self.conversation.update(cx, |view, cx| view.move_message(forward, cx));
     }
 
+    pub(crate) fn scroll_key(&self, key: &gpui_kit::Keystroke, cx: &mut App) -> bool {
+        self.conversation.update(cx, |view, cx| view.scroll_key(key, cx))
+    }
+
     pub(crate) fn yank_message(&self, cx: &mut App) {
         let Some(index) = self.conversation.read(cx).current_message() else { return; };
         let text = match self.session.read(cx).messages.get(index) {

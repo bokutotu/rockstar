@@ -1,5 +1,4 @@
-- chatセッションでjk以外のキーでスクロール機能を追加
-- agy, codexの追加
+- agy, codexの追加 (:chatを:piに変更して、, :agy, :codexを追加してそれでcodex, agyを呼べるようにする。)
 - warningとかパネルが手動で消さないと消えない
 - termianlの出力をコピーできない。
 - diffでシンタックスハイライト

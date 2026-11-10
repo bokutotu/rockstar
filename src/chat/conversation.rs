@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use gpui_kit::{
-    Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    ScrollHandle, StatefulInteractiveElement as _, Styled as _, Window, div,
+    Context, Entity, InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, Render,
+    ScrollHandle, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 
 use crate::{agent::Message, mode::Mode};
@@ -17,6 +17,7 @@ pub(super) struct ConversationView {
     scroll: ScrollHandle,
     /// None follows the latest message; a cursor pauses automatic scrolling.
     current: Option<usize>,
+    pending_scroll: Option<usize>,
     base: PathBuf,
     visible: bool,
 }
@@ -45,6 +46,7 @@ impl ConversationView {
                     }).collect();
                     this.scroll = ScrollHandle::new();
                     this.current = None;
+                    this.pending_scroll = None;
                 }
                 ConversationChange::Append(message) => {
                     let message = ChatMessage::new(message.clone(), &this.base, cx);
@@ -67,23 +69,24 @@ impl ConversationView {
                             if current > *index { current - 1 } else { current.min(last) }
                         });
                         if let Some(current) = this.current {
-                            this.scroll.scroll_to_top_of_item(current);
+                            this.pending_scroll = Some(current);
                         }
                     }
                 }
             }
             if this.current.is_none() {
-                this.scroll.scroll_to_top_of_item(this.messages.len());
+                this.pending_scroll = Some(this.messages.len());
             }
             cx.notify();
         })
         .detach();
         let scroll = ScrollHandle::new();
-        scroll.scroll_to_top_of_item(messages.len());
+        let pending_scroll = Some(messages.len());
         Self {
             messages,
             scroll,
             current: None,
+            pending_scroll,
             base: base.into(),
             visible: true,
         }
@@ -101,14 +104,56 @@ impl ConversationView {
             current.saturating_sub(1)
         };
         self.current = Some(next);
-        self.scroll.scroll_to_top_of_item(next);
+        self.pending_scroll = Some(next);
         cx.notify();
     }
 
     pub(super) fn follow_latest(&mut self, cx: &mut Context<Self>) {
         self.current = None;
-        self.scroll.scroll_to_top_of_item(self.messages.len());
+        self.pending_scroll = Some(self.messages.len());
         cx.notify();
+    }
+
+    pub(super) fn scroll_key(&mut self, key: &Keystroke, cx: &mut Context<Self>) -> bool {
+        if *cx.global::<Mode>() != Mode::Normal
+            || key.modifiers.alt || key.modifiers.platform || key.modifiers.shift
+        {
+            return false;
+        }
+        let height = self.scroll.bounds().size.height.max(px(24.));
+        let delta = match (key.modifiers.control, key.key.as_str()) {
+            (false, "up") => px(24.),
+            (false, "down") => -px(24.),
+            (false, "pageup") | (true, "b") => height * 0.9,
+            (false, "pagedown") | (true, "f") => -height * 0.9,
+            (true, "u") => height * 0.5,
+            (true, "d") => -height * 0.5,
+            (false, "home") => {
+                self.current = (!self.messages.is_empty()).then_some(0);
+                self.pending_scroll = Some(0);
+                cx.notify();
+                return true;
+            }
+            (false, "end") => {
+                self.follow_latest(cx);
+                return true;
+            }
+            _ => return false,
+        };
+        // Cancel a queued follow request before it reaches the next layout pass.
+        self.pending_scroll = None;
+        let mut offset = self.scroll.offset();
+        offset.y = (offset.y + delta).clamp(-self.scroll.max_offset().y, px(0.));
+        self.scroll.set_offset(offset);
+        self.pause_following();
+        cx.notify();
+        true
+    }
+
+    fn pause_following(&mut self) {
+        self.pending_scroll = None;
+        self.current = self.messages.len().checked_sub(1)
+            .map(|last| self.scroll.top_item().min(last));
     }
 
     pub(super) fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
@@ -119,6 +164,9 @@ impl ConversationView {
 
 impl Render for ConversationView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(index) = self.pending_scroll.take() {
+            self.scroll.scroll_to_top_of_item(index);
+        }
         let current = (*cx.global::<Mode>() == Mode::Normal)
             .then(|| self.current_message())
             .flatten();
@@ -131,6 +179,10 @@ impl Render for ConversationView {
             .gap_5()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
+            .on_scroll(cx.listener(|this, _, _, cx| {
+                this.pause_following();
+                cx.notify();
+            }))
             .p_6()
             .children(
                 self.messages
