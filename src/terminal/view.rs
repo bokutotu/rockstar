@@ -169,6 +169,14 @@ impl TerminalView {
         }
     }
 
+    pub(crate) fn scroll_to_edge(&mut self, bottom: bool, cx: &mut Context<Self>) {
+        self.scroll = if bottom { 0 } else {
+            self.session.read(cx).process.screen.lock().unwrap().term.history_size()
+        };
+        self.selection = None;
+        cx.notify();
+    }
+
     fn scroll_by(&mut self, lines: i32, cx: &mut Context<Self>) {
         let screen = self.session.read(cx).process.screen.lock().unwrap();
         let scroll = self
@@ -286,7 +294,7 @@ impl Render for TerminalView {
             if *cx.global::<Mode>() == Mode::Insert {
                 "INSERT · Esc: Normal".into()
             } else {
-                "NORMAL · i: input · Ctrl+U/D: half page · Ctrl+B/F: page".into()
+                "NORMAL · gg/G: start/end · Ctrl+U/D: half page · Ctrl+B/F: page · i: input".into()
             }
         });
         drop(screen);
