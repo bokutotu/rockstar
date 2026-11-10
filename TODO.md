@@ -6,3 +6,5 @@
 - diffで開くときのミニマルサイズを追加する
 - prdiffはgithub reviewみたいな機能を追加する。(prdiffとdiffに関して、コメントを作成する機能を追加。それをprのレビューとして渡す機能と、piに渡す機能をそれぞれに追加)
 - markdownのviewerを追加
+- fileviewにbase branchに対する変更、uncommitedな変更をそれぞれファイルに色をつける
+- fileviewでファイルにファイル形式ごとにアイコンをつける
