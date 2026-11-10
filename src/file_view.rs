@@ -26,6 +26,7 @@ mod keys;
 mod lsp;
 mod lsp_actions;
 mod navigation;
+mod preview;
 mod replay;
 mod searching;
 mod vim;
@@ -56,6 +57,7 @@ pub(crate) struct FileView {
     fold_enabled: bool,
     indent: usize,
     lsp_ui: LspViewState,
+    preview: Option<preview::MarkdownPreview>,
 }
 
 impl FileView {
@@ -67,6 +69,7 @@ impl FileView {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.on_release(|this, cx| {
+            if let Some(preview) = &this.preview { preview.content.shutdown(cx); }
             if let Some(panel) = &this.lsp_ui.documentation {
                 panel.content.shutdown(cx);
             }
@@ -98,6 +101,7 @@ impl FileView {
         let search_highlights = searching::decorations(&input, cx);
         cx.observe_in(&buffer, window, |this, _, window, cx| {
             let text = this.buffer.read(cx).text.clone();
+            if let Some(preview) = &mut this.preview { preview.content.set_text(&text, cx); }
             let old = this.input.read(cx).value();
             if old.as_ref() != text {
                 // An external edit invalidates insertion replay positions.
@@ -228,6 +232,7 @@ impl FileView {
             fold_enabled: true,
             indent,
             lsp_ui,
+            preview: None,
         };
         view.init_lsp(window, cx);
         view
@@ -240,6 +245,11 @@ impl FileView {
         !self.vim.pending.is_empty()
     }
     pub(crate) fn focus(&self, window: &mut Window, cx: &mut App) {
+        if let Some(preview) = &self.preview && preview.active {
+            if *cx.global::<Mode>() != Mode::Normal { cx.set_global(Mode::Normal); }
+            preview.content.focus_handle(cx).focus(window, cx);
+            return;
+        }
         if self.focus_lsp_popup(window, cx) {
             return;
         }
@@ -393,12 +403,17 @@ impl FileView {
 }
 impl Focusable for FileView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.input.focus_handle(cx)
+        if let Some(preview) = &self.preview && preview.active {
+            preview.content.focus_handle(cx)
+        } else {
+            self.input.focus_handle(cx)
+        }
     }
 }
 
 impl Render for FileView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.preview_active() { return self.render_preview(cx); }
         let lsp_popup = self.render_lsp_popup(cx);
         let documentation = self.render_documentation(cx);
         let lsp_status = self.lsp_status(cx);
@@ -588,6 +603,11 @@ impl Render for FileView {
                 )
             })
             .children(lsp_popup)
+            .when(language_settings(&buffer.path).0 == "markdown", |view| view.child(
+                gpui_kit::component::button::Button::new("open-markdown-preview")
+                    .label("Markdown preview (:markdown)")
+                    .on_click(cx.listener(|this, _, window, cx| { let _ = this.toggle_markdown(window, cx); }))
+            ))
             .child(
                 div()
                     .id("file-status")
@@ -598,6 +618,7 @@ impl Render for FileView {
                     .bg(cx.theme().muted)
                     .child(status),
             )
+            .into_any_element()
     }
 }
 

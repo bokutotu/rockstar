@@ -47,6 +47,7 @@ impl MarkdownContent {
     }
 
     pub(crate) fn set_text(&mut self, text: &str, cx: &mut App) {
+        if text == self.source { return; }
         if !text.starts_with(&self.source) {
             self.media.reconcile(text, cx);
         } else {

@@ -7,6 +7,9 @@ impl FileView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.preview_active() {
+            return self.preview_key(key, window, cx);
+        }
         if self.lsp_ui.documentation.is_some() {
             return self.documentation_key(key, window, cx);
         }

@@ -77,6 +77,9 @@ pub(super) fn hover_markdown(contents: &HoverContents) -> Option<String> {
 
 impl FileView {
     pub(crate) fn set_media_visible(&self, visible: bool, cx: &mut App) {
+        if let Some(preview) = &self.preview {
+            preview.content.set_visible(visible && preview.active, cx);
+        }
         if let Some(panel) = &self.lsp_ui.documentation {
             panel.content.set_visible(visible, cx);
         }

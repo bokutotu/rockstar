@@ -9,6 +9,7 @@ const COMMAND_NAMES: &[&str] = &[
     "diffstaged",
     "diffunstaged",
     "e!",
+    "markdown",
     "new",
     "pi",
     "prdiff",

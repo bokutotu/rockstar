@@ -495,6 +495,12 @@ impl Tab {
         view.update(cx, |view, cx| view.update_index(action, cx))
     }
 
+    pub(crate) fn toggle_markdown(&self, window: &mut Window, cx: &mut Context<Self>) -> anyhow::Result<()> {
+        let file = self.panes[self.active].read(cx).file()
+            .ok_or_else(|| anyhow::anyhow!("Select a Markdown file first"))?;
+        file.update(cx, |file, cx| file.toggle_markdown(window, cx))
+    }
+
     pub(crate) fn save_active(
         &mut self,
         window: &mut Window,

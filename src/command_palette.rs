@@ -329,6 +329,7 @@ impl CommandPaletteView {
                 tab.update_diff_index(IndexAction::Unstage, cx)
             }),
             "e!" => tab.update(cx, |tab, cx| tab.reload_active_file(window, cx)),
+            "markdown" => tab.update(cx, |tab, cx| tab.toggle_markdown(window, cx)),
             "pi" => {
                 tab.update(cx, |workspace, cx| workspace.show_chat(false, window, cx));
                 Ok(())
