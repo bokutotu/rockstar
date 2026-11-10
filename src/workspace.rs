@@ -679,6 +679,7 @@ impl Tab {
                     }
                     "\\f" | "\\w" | "\\t" | "\\g" => self.pending = pending,
                     "\\ff" => cx.set_global(Mode::FileFinder),
+                    "\\fe" => self.toggle_tree(window, cx),
                     "\\ww" => cx.emit(TabAction::Workspaces),
                     "\\tt" => cx.emit(TabAction::Tabs),
                     "\\wd" => cx.emit(TabAction::CloseWorkspace),

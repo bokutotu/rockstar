@@ -392,7 +392,7 @@ impl Render for Pane {
                 .child(":term  Open a terminal")
                 .child(":diff / :prdiff  Review changes")
                 .child("\\ff    Find a file")
-                .child("Ctrl-b  File tree")
+                .child("\\fe  File tree")
                 .child("ss / sv  Split pane")
                 .child("\\ww / \\tt  Workspaces / tabs")
                 .into_any_element(),
