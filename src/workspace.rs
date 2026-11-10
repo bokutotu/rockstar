@@ -618,13 +618,16 @@ impl Tab {
             return terminal.update(cx, |terminal, cx| terminal.key(key, window, cx));
         }
         let file = self.panes[self.active].read(cx).file();
+        let diff = self.panes[self.active].read(cx).diff();
         if matches!(mode, Mode::Search | Mode::LspPopup) {
             return file.is_some_and(|file| file.update(cx, |file, cx| file.key(key, window, cx)));
         }
         if mode == Mode::Normal
             && key.modifiers.control
             && key.key == "b"
-            && (file.is_none() || self.focused_target(window, cx) == Some(FocusTarget::FileTree))
+            && !key.modifiers.shift && !key.modifiers.alt && !key.modifiers.platform
+            && ((file.is_none() && diff.is_none())
+                || self.focused_target(window, cx) == Some(FocusTarget::FileTree))
         {
             self.pending.clear();
             self.toggle_tree(window, cx);
@@ -728,7 +731,7 @@ impl Tab {
         if let Some(file) = file {
             return file.update(cx, |file, cx| file.key(key, window, cx));
         }
-        if let Some(diff) = self.panes[self.active].read(cx).diff()
+        if let Some(diff) = diff
             && diff.update(cx, |diff, cx| diff.key(key, window, cx))
         {
             return true;

@@ -229,11 +229,23 @@ impl DiffView {
 
     pub(crate) fn key(&mut self, key: &Keystroke, window: &Window, cx: &mut Context<Self>) -> bool {
         if *cx.global::<Mode>() != Mode::Normal
-            || key.modifiers.control
             || key.modifiers.alt
             || key.modifiers.platform
         {
             return false;
+        }
+        if key.modifiers.control {
+            if key.modifiers.shift { return false; }
+            let fraction = match key.key.as_str() {
+                "u" => 0.5,
+                "d" => -0.5,
+                "b" => 0.9,
+                "f" => -0.9,
+                _ => return false,
+            };
+            let height = self.body_scroll.0.borrow().base_handle.bounds().size.height;
+            self.scroll_vertical(height.max(px(LINE_HEIGHT)) * fraction, cx);
+            return true;
         }
         let body_focused = self.body_focus.contains_focused(window, cx);
         match text_key(key) {
@@ -638,6 +650,6 @@ impl Render for DiffView {
             .child(self.render_review(cx))
             .child(div().px_2().py_1().flex_shrink_0().border_t_1().border_color(cx.theme().border)
                 .text_xs().text_color(cx.theme().muted_foreground).truncate()
-                .child("sh/sl focus · j/k select in tree, scroll in diff · Enter open · h/l tree · PgUp/PgDn page · Shift+wheel horizontal · r refresh · :stage / :unstage"))
+                .child("Ctrl+U/D half page · Ctrl+B/F page · sh/sl focus · j/k select/scroll · Enter open · h/l tree · Shift+wheel horizontal · r refresh · :stage / :unstage"))
     }
 }
