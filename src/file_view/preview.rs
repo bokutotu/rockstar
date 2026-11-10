@@ -48,8 +48,22 @@ impl FileView {
         Ok(())
     }
 
-    pub(super) fn preview_active(&self) -> bool {
+    pub(crate) fn preview_active(&self) -> bool {
         self.preview.as_ref().is_some_and(|preview| preview.active)
+    }
+
+    pub(crate) fn scroll_preview_to_edge(&self, bottom: bool, cx: &mut Context<Self>) {
+        let Some(preview) = self.preview.as_ref().filter(|preview| preview.active) else {
+            return;
+        };
+        let mut offset = preview.scroll.offset();
+        offset.y = if bottom {
+            -preview.scroll.max_offset().y
+        } else {
+            px(0.)
+        };
+        preview.scroll.set_offset(offset);
+        cx.notify();
     }
 
     pub(super) fn preview_key(
@@ -80,8 +94,10 @@ impl FileView {
             (false, "pagedown") | (true, "f") => offset.y -= height * 0.9,
             (true, "u") => offset.y += height * 0.5,
             (true, "d") => offset.y -= height * 0.5,
-            (false, "home") => offset.y = px(0.),
-            (false, "end" | "G") => offset.y = -preview.scroll.max_offset().y,
+            (false, "home" | "end" | "G") => {
+                self.scroll_preview_to_edge(key.key != "home", cx);
+                return true;
+            }
             _ => return false,
         }
         offset.y = offset.y.clamp(-preview.scroll.max_offset().y, px(0.));
@@ -136,7 +152,7 @@ impl FileView {
             .child(
                 div().px_2().py_1().flex_shrink_0().text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Ctrl+U/D half page · Ctrl+B/F page · j/k scroll · Esc source"),
+                    .child("gg/G start/end · Ctrl+U/D half page · Ctrl+B/F page · j/k scroll · Esc source"),
             )
             .into_any_element()
     }

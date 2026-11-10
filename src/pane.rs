@@ -297,9 +297,10 @@ impl Pane {
 
     /// Source editors keep their own Vim g-prefix; these read-only views share
     /// workspace-level gg/G navigation instead.
-    pub(crate) fn has_scroll_edges(&self, _: &App) -> bool {
+    pub(crate) fn has_scroll_edges(&self, cx: &App) -> bool {
         match &self.content {
             PaneContent::Chat(_) | PaneContent::Diff(_) => true,
+            PaneContent::File(view) => view.read(cx).preview_active(),
             _ => false,
         }
     }
@@ -308,6 +309,7 @@ impl Pane {
         match &self.content {
             PaneContent::Chat(view) => view.update(cx, |view, cx| view.scroll_to_edge(bottom, cx)),
             PaneContent::Diff(view) => view.update(cx, |view, cx| view.scroll_to_edge(bottom, cx)),
+            PaneContent::File(view) => view.update(cx, |view, cx| view.scroll_preview_to_edge(bottom, cx)),
             _ => {}
         }
     }
