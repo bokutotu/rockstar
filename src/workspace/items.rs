@@ -235,6 +235,7 @@ impl Tab {
             pane.set_content_visible(self.visible, cx);
         });
         if self.panes[self.active] == pane {
+            self.pending.clear();
             self.reveal_active_item(cx);
             if !cx.global::<Mode>().is_overlay() {
                 self.focus_active(window, cx);
