@@ -17,6 +17,18 @@ use gpui_kit::{AppContext as _, Context, EntityId};
 use model::DiffEntry;
 use std::{collections::HashSet, path::Path, sync::Arc};
 
+/// Leave room for the file tree and two source columns when opening a diff.
+/// Never shrink a user's window or request a size larger than the display.
+pub(crate) fn opening_size(
+    current: gpui_kit::Size<gpui_kit::Pixels>,
+    available: gpui_kit::Size<gpui_kit::Pixels>,
+) -> gpui_kit::Size<gpui_kit::Pixels> {
+    gpui_kit::size(
+        current.width.max(gpui_kit::px(960.).min(available.width)),
+        current.height.max(gpui_kit::px(600.).min(available.height)),
+    )
+}
+
 pub(crate) fn load(directory: &Path, request: DiffRequest) -> Result<DiffSnapshot> {
     git::load(directory, request)
 }

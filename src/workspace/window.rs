@@ -485,6 +485,16 @@ impl WorkspaceWindow {
                 let number = workspace.tabs.len();
                 if activate {
                     workspace.active = number - 1;
+                    // Do not disturb maximized/fullscreen windows, nor resize
+                    // for a diff that completed in a background workspace.
+                    if let gpui_kit::WindowBounds::Windowed(bounds) = window.window_bounds() {
+                        let available = window.display(cx)
+                            .map_or(bounds.size, |display| display.bounds().size);
+                        let size = crate::diff::opening_size(bounds.size, available);
+                        if size != bounds.size {
+                            window.resize(size);
+                        }
+                    }
                     this.enter_tab(window, cx);
                 } else {
                     window.push_notification(
