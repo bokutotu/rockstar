@@ -459,7 +459,7 @@ impl WorkspaceWindow {
                     Ok(loaded) => loaded,
                     Err(error) => {
                         window.push_notification(
-                            Notification::error(format!("Diff: {error:#}")).autohide(false),
+                            Notification::error(format!("Diff: {error:#}")),
                             cx,
                         );
                         return;

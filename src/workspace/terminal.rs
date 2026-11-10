@@ -55,7 +55,7 @@ impl Tab {
                         }
                     }
                     Err(error) => window.push_notification(
-                        Notification::error(format!("{error:#}")).autohide(false),
+                        Notification::error(format!("{error:#}")),
                         cx,
                     ),
                 }

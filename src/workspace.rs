@@ -321,7 +321,7 @@ impl Tab {
                         this.show_item(pane.entity_id(), id, window, cx);
                     }
                     (Err(error), _) => window.push_notification(
-                        Notification::error(format!("{error:#}")).autohide(false),
+                        Notification::error(format!("{error:#}")),
                         cx,
                     ),
                 }
@@ -373,8 +373,7 @@ impl Tab {
             Err(error) => {
                 self.vim.update(cx, |vim, _| vim.macros.stop());
                 window.push_notification(
-                    Notification::error(format!("Cannot open {}: {error}", path.display()))
-                        .autohide(false),
+                    Notification::error(format!("Cannot open {}: {error}", path.display())),
                     cx,
                 );
                 return;
@@ -460,7 +459,7 @@ impl Tab {
                     Err(error) => {
                         this.vim.update(cx, |vim, _| vim.macros.stop());
                         window.push_notification(
-                            Notification::error(format!("{error:#}")).autohide(false),
+                            Notification::error(format!("{error:#}")),
                             cx,
                         );
                     }
@@ -576,7 +575,7 @@ impl Tab {
                 self.pending.clear();
                 if let Err(error) = session.read(cx).cancel() {
                     window.push_notification(
-                        Notification::error(error.to_string()).autohide(false),
+                        Notification::error(error.to_string()),
                         cx,
                     );
                 }

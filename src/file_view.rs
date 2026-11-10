@@ -371,7 +371,7 @@ impl FileView {
                         cx.notify();
                     });
                     window.push_notification(
-                        Notification::error(format!("{error:#}")).autohide(false),
+                        Notification::error(format!("{error:#}")),
                         cx,
                     );
                 }

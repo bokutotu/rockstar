@@ -158,7 +158,7 @@ impl ChatSession {
             AgentEvent::Error(error) => {
                 self.set_activity(None, cx);
                 window
-                    .push_notification(Notification::error(error.to_string()).autohide(false), cx);
+                    .push_notification(Notification::error(error.to_string()), cx);
             }
         }
     }

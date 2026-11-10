@@ -410,7 +410,7 @@ impl LspWorkspace {
                     return;
                 };
                 if let ServerState::Failed(error) = session.state() {
-                    window.push_notification(Notification::error(error).autohide(false), cx);
+                    window.push_notification(Notification::error(error), cx);
                 }
                 for doc in self.documents.values() {
                     if doc.read(cx).session.kind == kind {

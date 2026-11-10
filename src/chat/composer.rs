@@ -298,7 +298,7 @@ impl ComposerView {
         match result {
             Ok(()) => self.clear(window, cx),
             Err(_) => window.push_notification(
-                Notification::error(DISCONNECTED_MESSAGE).autohide(false),
+                Notification::error(DISCONNECTED_MESSAGE),
                 cx,
             ),
         }

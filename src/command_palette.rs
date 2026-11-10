@@ -382,7 +382,7 @@ impl CommandPaletteView {
         match result {
             Ok(()) => self.dismiss(cx),
             Err(error) => {
-                window.push_notification(Notification::error(error.to_string()).autohide(false), cx)
+                window.push_notification(Notification::error(error.to_string()), cx)
             }
         }
     }

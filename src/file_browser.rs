@@ -102,7 +102,7 @@ impl FileFinder {
                         this.filter(cx);
                     }
                     Err(error) => window.push_notification(
-                        Notification::error(format!("{error:#}")).autohide(false),
+                        Notification::error(format!("{error:#}")),
                         cx,
                     ),
                 }
