@@ -18,6 +18,12 @@ impl FileView {
             language_settings(&self.buffer.read(cx).path).0 == "markdown",
             "Select a Markdown file first"
         );
+        if self.vim.mode.is_insert() {
+            self.finish_insert(window, cx);
+        }
+        if self.search_open {
+            self.end_search(false, window, cx);
+        }
         self.close_lsp_popup(window, cx);
         if let Some(panel) = self.lsp_ui.documentation.take() {
             panel.content.shutdown(cx);
@@ -58,7 +64,7 @@ impl FileView {
         if !key.modifiers.control && matches!(key.key.as_str(), "escape" | "i") {
             let _ = self.toggle_markdown(window, cx);
             if key.key == "i" {
-                self.set_mode(Mode::Insert, cx);
+                self.begin_insert("i", 1, window, cx);
             }
             return true;
         }
