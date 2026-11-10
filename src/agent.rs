@@ -37,6 +37,14 @@ pub struct PromptRequest {
     pub text: String,
 }
 
+/// One ordered stream keeps cancellation behind earlier submissions and ahead
+/// of prompts explicitly submitted after it.
+#[derive(Debug)]
+pub enum AgentCommand {
+    Prompt(PromptRequest),
+    Cancel,
+}
+
 /// Current context-window usage, not cumulative session token consumption.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContextUsage {
@@ -53,37 +61,39 @@ pub enum AgentEvent {
     ToolActivity(String),
     ContextUsageUpdated(Option<ContextUsage>),
     PromptFinished,
+    PromptCancelled,
+    PendingPromptsReturned(Vec<String>),
     Error(AgentError),
 }
 
 pub struct Agent {
-    prompts: Sender<PromptRequest>,
+    commands: Sender<AgentCommand>,
     results: Option<Receiver<AgentEvent>>,
 }
 
 pub(crate) struct AgentBackend {
-    pub prompts: Receiver<PromptRequest>,
+    pub commands: Receiver<AgentCommand>,
     pub events: Sender<AgentEvent>,
 }
 
 pub(crate) fn channel() -> (Agent, AgentBackend) {
-    let (prompt_sender, prompts) = async_channel::unbounded();
+    let (command_sender, commands) = async_channel::unbounded();
     let (result_sender, results) = async_channel::unbounded();
     (
         Agent {
-            prompts: prompt_sender,
+            commands: command_sender,
             results: Some(results),
         },
         AgentBackend {
-            prompts,
+            commands,
             events: result_sender,
         },
     )
 }
 
 impl Agent {
-    pub fn prompt_sender(&self) -> Sender<PromptRequest> {
-        self.prompts.clone()
+    pub fn command_sender(&self) -> Sender<AgentCommand> {
+        self.commands.clone()
     }
 
     pub fn take_results(&mut self) -> Option<Receiver<AgentEvent>> {

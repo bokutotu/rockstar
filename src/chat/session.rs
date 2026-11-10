@@ -4,7 +4,9 @@ use gpui_kit::{
     component::{WindowExt as _, notification::Notification},
 };
 
-use crate::agent::{AgentEvent, ContextUsage, Message, OpenedChat, PromptRequest};
+use crate::agent::{
+    AgentCommand, AgentError, AgentEvent, ContextUsage, DISCONNECTED_MESSAGE, Message, OpenedChat,
+};
 
 /// A conversation and draft shared by every pane displaying this session.
 /// The single receiver lives here, not in a view: splitting must not distribute
@@ -16,7 +18,7 @@ pub(crate) struct ChatSession {
     /// Latest tool operation for the current response; never part of history.
     pub(super) activity: Option<String>,
     pub(super) context_usage: Option<ContextUsage>,
-    pub(super) prompts: Sender<PromptRequest>,
+    pub(super) commands: Sender<AgentCommand>,
     assistant: Option<usize>,
     _events: Task<()>,
 }
@@ -63,7 +65,7 @@ impl ChatSession {
             draft: "".into(),
             activity: None,
             context_usage: None,
-            prompts: agent.prompt_sender(),
+            commands: agent.command_sender(),
             assistant: None,
             _events: task,
         }
@@ -80,6 +82,12 @@ impl ChatSession {
         *self = Self::new(opened, self.number, window, cx);
         cx.emit(ConversationChange::Reset(self.messages.clone()));
         cx.notify();
+    }
+
+    pub(crate) fn cancel(&self) -> Result<(), AgentError> {
+        self.commands
+            .try_send(AgentCommand::Cancel)
+            .map_err(|_| anyhow::anyhow!(DISCONNECTED_MESSAGE))
     }
 
     pub(super) fn set_draft(&mut self, draft: SharedString, cx: &mut Context<Self>) {
@@ -142,7 +150,11 @@ impl ChatSession {
             }
             AgentEvent::ToolActivity(text) => self.set_activity(Some(text), cx),
             AgentEvent::ContextUsageUpdated(usage) => self.set_context_usage(usage, cx),
-            AgentEvent::PromptFinished => self.set_activity(None, cx),
+            AgentEvent::PromptFinished | AgentEvent::PromptCancelled => self.set_activity(None, cx),
+            AgentEvent::PendingPromptsReturned(prompts) => {
+                let draft = restore_pending_prompts(&self.draft, &prompts);
+                self.set_draft(draft.into(), cx);
+            }
             AgentEvent::Error(error) => {
                 self.set_activity(None, cx);
                 window
@@ -150,4 +162,17 @@ impl ChatSession {
             }
         }
     }
+}
+
+/// Read the current draft when the event arrives, not when cancellation starts:
+/// the user may have kept typing while pi was stopping.
+fn restore_pending_prompts(draft: &str, prompts: &[String]) -> String {
+    let mut restored = prompts.join("\n\n");
+    if !draft.is_empty() {
+        if !restored.is_empty() {
+            restored.push_str("\n\n");
+        }
+        restored.push_str(draft);
+    }
+    restored
 }

@@ -557,6 +557,32 @@ impl Tab {
             }
             return false;
         }
+        if matches!(mode, Mode::Normal | Mode::Insert)
+            && key.key == "g"
+            && key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.platform
+            && !key.modifiers.shift
+        {
+            // Use actual focus, not the last activated pane: pane activation
+            // notifications can still be queued when the key arrives.
+            let session = self.panes.iter().find_map(|pane| {
+                let chat = pane.read(cx).chat()?;
+                chat.focus_handle(cx)
+                    .contains_focused(window, cx)
+                    .then(|| chat.read(cx).session.clone())
+            });
+            if let Some(session) = session {
+                self.pending.clear();
+                if let Err(error) = session.read(cx).cancel() {
+                    window.push_notification(
+                        Notification::error(error.to_string()).autohide(false),
+                        cx,
+                    );
+                }
+                return true;
+            }
+        }
         let terminal = self.panes[self.active].read(cx).terminal();
         if mode == Mode::Insert
             && let Some(terminal) = &terminal

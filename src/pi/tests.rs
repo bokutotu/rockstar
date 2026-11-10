@@ -110,7 +110,7 @@ fn a_response_finishes_only_after_the_agent_settles() {
             id: "prompt-1".into(),
             accepted: true,
             settled: false,
-            failure: None,
+            outcome: None,
         };
         let message_end: PiIncomingRecord = serde_json::from_value(json!({
             "type": "message_end",
@@ -120,7 +120,7 @@ fn a_response_finishes_only_after_the_agent_settles() {
         assert!(request.handle_record(&message_end).is_none());
         let finished = request.handle_record(&PiIncomingRecord::AgentSettled { aborted });
         if aborted {
-            assert!(matches!(finished, Some(AgentEvent::Error(_))));
+            assert!(matches!(finished, Some(AgentEvent::PromptCancelled)));
         } else {
             assert!(matches!(finished, Some(AgentEvent::PromptFinished)));
         }

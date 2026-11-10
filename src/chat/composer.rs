@@ -19,7 +19,7 @@ use super::{
 };
 
 use crate::{
-    agent::{ContextUsage, DISCONNECTED_MESSAGE, PromptRequest},
+    agent::{AgentCommand, ContextUsage, DISCONNECTED_MESSAGE, PromptRequest},
     file_search, input_shortcuts,
     mode::Mode,
 };
@@ -31,9 +31,9 @@ const VISIBLE_MATCHES: usize = 10;
 
 fn input_hint(mode: Mode) -> &'static str {
     if mode == Mode::Insert {
-        "Ask pi…"
+        "Ask pi… · Ctrl+g stop"
     } else {
-        "NORMAL — j/k messages · yy copy Markdown · i type · : commands"
+        "NORMAL — j/k messages · yy copy Markdown · i type · Ctrl+g stop · : commands"
     }
 }
 
@@ -101,7 +101,14 @@ impl ComposerView {
             let draft = session.read(cx).draft.clone();
             if this.input.read(cx).value() != draft {
                 this.input.update(cx, |input, cx| {
-                    let selection = input.selected_range();
+                    let mut selection = input.selected_range();
+                    let previous = input.value();
+                    // Restoring pending prompts prepends text to the live
+                    // draft. Keep the caret/selection on the user's draft.
+                    if let Some(prefix) = draft.strip_suffix(previous.as_ref()) {
+                        selection.start += prefix.len();
+                        selection.end += prefix.len();
+                    }
                     input.set_value(draft, window, cx);
                     input.set_selected_range(selection, cx);
                 });
@@ -286,8 +293,8 @@ impl ComposerView {
         let result = self
             .session
             .read(cx)
-            .prompts
-            .try_send(PromptRequest { text });
+            .commands
+            .try_send(AgentCommand::Prompt(PromptRequest { text }));
         match result {
             Ok(()) => self.clear(window, cx),
             Err(_) => window.push_notification(

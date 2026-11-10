@@ -10,14 +10,14 @@ use std::{
 };
 
 use anyhow::{Context as _, anyhow, bail};
-use async_channel::{Receiver, RecvError};
+use async_channel::{Receiver, RecvError, TryRecvError};
 use futures_lite::future::{block_on, or};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent::{
-    self, AgentBackend, AgentError, AgentEvent, ChatStart, ContextUsage, Message, OpenedChat,
-    PromptRequest,
+    self, AgentBackend, AgentCommand, AgentError, AgentEvent, ChatStart, ContextUsage, Message,
+    OpenedChat, PromptRequest,
 };
 
 mod sessions;
@@ -30,6 +30,8 @@ pub(crate) use sessions::list_sessions;
 #[serde(tag = "type", rename_all = "snake_case")]
 enum PiOutgoingRecord {
     Prompt { id: String, message: String },
+    ClearQueue { id: String },
+    Abort { id: String },
     GetState { id: String },
     GetEntries { id: String },
     GetSessionStats { id: String },
@@ -73,6 +75,9 @@ enum PiIncomingRecord {
 #[serde(tag = "command", rename_all = "snake_case")]
 enum PiResponse {
     Prompt(CommandResponse<PromptResponseData>),
+    ClearQueue(CommandResponse<QueuedMessages>),
+    // Unlike prompt/clear_queue, a successful abort has no data payload.
+    Abort(WireCommandResponse<Value>),
     GetState(CommandResponse<SessionState>),
     GetEntries(CommandResponse<SessionEntries>),
     // Optional status data must not break the chat if its payload is invalid.
@@ -85,6 +90,8 @@ impl PiResponse {
     fn request_id(&self) -> Option<&str> {
         match self {
             Self::Prompt(response) => response.id.as_deref(),
+            Self::ClearQueue(response) => response.id.as_deref(),
+            Self::Abort(response) => response.id.as_deref(),
             Self::GetState(response) => response.id.as_deref(),
             Self::GetEntries(response) => response.id.as_deref(),
             Self::GetSessionStats(response) => response.id.as_deref(),
@@ -149,6 +156,13 @@ impl<T> TryFrom<WireCommandResponse<T>> for CommandResponse<T> {
             result,
         })
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueuedMessages {
+    steering: Vec<String>,
+    follow_up: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,6 +263,9 @@ struct PiCodingAgent {
     next_request_id: u64,
     context_request_id: Option<String>,
     context_dirty: bool,
+    queued: VecDeque<PromptRequest>,
+    active: Option<ActiveRequest>,
+    cancelling: Option<CancelState>,
 }
 
 impl Drop for PiCodingAgent {
@@ -264,12 +281,22 @@ enum ActiveRequest {
         id: String,
         accepted: bool,
         settled: bool,
-        failure: Option<AgentError>,
+        outcome: Option<AgentEvent>,
+    },
+}
+
+enum CancelState {
+    ClearingQueue {
+        request_id: String,
+        pending_prompts: Vec<String>,
+    },
+    Aborting {
+        request_id: String,
     },
 }
 
 enum Incoming {
-    Prompt(Result<PromptRequest, RecvError>),
+    Command(Result<AgentCommand, RecvError>),
     Record(Result<Result<PiIncomingRecord, AgentError>, RecvError>),
     ResultsClosed,
 }
@@ -329,6 +356,9 @@ pub(crate) fn connect(cwd: &Path, start: ChatStart) -> Result<OpenedChat, AgentE
         next_request_id: 0,
         context_request_id: None,
         context_dirty: true,
+        queued: VecDeque::new(),
+        active: None,
+        cancelling: None,
     };
     let _ = thread::Builder::new()
         .name("pi-stdout".into())
@@ -434,47 +464,78 @@ impl PiCodingAgent {
     fn run(mut self, backend: AgentBackend) {
         let result = block_on(self.process_requests(&backend));
         if let Err(error) = result {
+            // Do not lose unsubmitted text when the connection fails mid-cancel.
+            backend.commands.close();
+            let mut pending = match self.cancelling.take() {
+                Some(CancelState::ClearingQueue {
+                    pending_prompts, ..
+                }) => pending_prompts,
+                _ => Vec::new(),
+            };
+            pending.extend(self.queued.drain(..).map(|prompt| prompt.text));
+            while let Ok(command) = backend.commands.try_recv() {
+                if let AgentCommand::Prompt(prompt) = command {
+                    pending.push(prompt.text);
+                }
+            }
+            return_pending_prompts(&backend, pending);
             // A failed session must not terminate the other open chats.
             let _ = backend.events.try_send(AgentEvent::Error(error));
         }
     }
 
     async fn process_requests(&mut self, backend: &AgentBackend) -> Result<(), AgentError> {
-        let mut queued = VecDeque::new();
-        let mut active: Option<ActiveRequest> = None;
         loop {
             if backend.events.is_closed() {
                 return Ok(());
             }
-            if active.is_none()
-                && let Some((record, request)) = queued.pop_front()
-            {
-                self.write_record(&record)?;
-                active = Some(request);
-            }
-            // Status requests run independently of prompts and never hold up the queue.
-            self.request_context_usage()?;
-            let incoming = or(
-                async {
-                    backend.events.closed().await;
-                    Incoming::ResultsClosed
-                },
-                or(
-                    async { Incoming::Record(self.records.recv().await) },
-                    async { Incoming::Prompt(backend.prompts.recv().await) },
-                ),
-            )
-            .await;
+            // Drain commands in FIFO order before starting another prompt. A
+            // ready Cancel must not sit behind the next queued prompt's launch.
+            let incoming = match backend.commands.try_recv() {
+                Ok(command) => Incoming::Command(Ok(command)),
+                Err(TryRecvError::Closed) => return Ok(()),
+                Err(TryRecvError::Empty) => {
+                    if self.active.is_none()
+                        && self.cancelling.is_none()
+                        && let Some(prompt) = self.queued.pop_front()
+                    {
+                        let (record, request) = self.prepare_prompt(prompt);
+                        self.write_record(&record)?;
+                        self.active = Some(request);
+                    }
+                    // Status requests never hold up prompts or cancellation.
+                    self.request_context_usage()?;
+                    or(
+                        async {
+                            backend.events.closed().await;
+                            Incoming::ResultsClosed
+                        },
+                        or(
+                            async { Incoming::Command(backend.commands.recv().await) },
+                            async { Incoming::Record(self.records.recv().await) },
+                        ),
+                    )
+                    .await
+                }
+            };
             let record = match incoming {
-                Incoming::Prompt(Ok(request)) => {
-                    queued.push_back(self.prepare_prompt(request));
+                Incoming::Command(Ok(AgentCommand::Prompt(prompt))) => {
+                    self.queued.push_back(prompt);
                     continue;
                 }
-                Incoming::Prompt(Err(_)) => return Ok(()),
+                Incoming::Command(Ok(AgentCommand::Cancel)) => {
+                    if self.cancelling.is_none() {
+                        let pending = self.queued.drain(..).map(|prompt| prompt.text).collect();
+                        self.clear_queue_for_cancel(pending)?;
+                    }
+                    continue;
+                }
+                Incoming::Command(Err(_)) => return Ok(()),
                 Incoming::Record(result) => result.context("pi disconnected")??,
                 Incoming::ResultsClosed => return Ok(()),
             };
             self.handle_extension(&record)?;
+            self.handle_cancellation(&record, backend)?;
             if matches!(
                 record,
                 PiIncomingRecord::MessageEnd { .. }
@@ -488,11 +549,12 @@ impl PiCodingAgent {
             {
                 return Ok(());
             }
-            if let Some(event) = active
+            if let Some(event) = self
+                .active
                 .as_mut()
                 .and_then(|request| request.handle_record(&record))
             {
-                active = None;
+                self.active = None;
                 // Also refresh after commands handled without an agent run.
                 self.context_dirty = true;
                 if backend.events.try_send(event).is_err() {
@@ -528,6 +590,99 @@ impl PiCodingAgent {
         }
     }
 
+    fn clear_queue_for_cancel(&mut self, pending_prompts: Vec<String>) -> Result<(), AgentError> {
+        let id = self.next_id();
+        // Retain the text before writing, so even a failed write can restore it.
+        self.cancelling = Some(CancelState::ClearingQueue {
+            request_id: id.clone(),
+            pending_prompts,
+        });
+        self.write_record(&PiOutgoingRecord::ClearQueue { id })
+    }
+
+    fn handle_cancellation(
+        &mut self,
+        record: &PiIncomingRecord,
+        backend: &AgentBackend,
+    ) -> Result<(), AgentError> {
+        // Input hooks/auth preflight can outlive an early successful abort.
+        // Keep the cancellation barrier and abort again after acceptance (or
+        // rejection), rather than allowing that late prompt to start unnoticed.
+        if matches!(self.cancelling, Some(CancelState::Aborting { .. }))
+            && let Some(ActiveRequest::Prompt {
+                id,
+                accepted: false,
+                ..
+            }) = &self.active
+            && let PiIncomingRecord::Response(PiResponse::Prompt(response)) = record
+            && response.id.as_deref() == Some(id.as_str())
+        {
+            self.clear_queue_for_cancel(Vec::new())?;
+        }
+
+        match (&self.cancelling, record) {
+            (
+                Some(CancelState::ClearingQueue { request_id, .. }),
+                PiIncomingRecord::Response(PiResponse::ClearQueue(response)),
+            ) if response.id.as_deref() == Some(request_id.as_str()) => {
+                let Some(CancelState::ClearingQueue {
+                    pending_prompts, ..
+                }) = self.cancelling.take()
+                else {
+                    unreachable!()
+                };
+                let mut pending = match &response.result {
+                    Ok(messages) => messages
+                        .steering
+                        .iter()
+                        .chain(&messages.follow_up)
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    Err(error) => {
+                        // Still attempt to stop the active run if clearing failed.
+                        let _ = backend.events.try_send(AgentEvent::Error(anyhow!(
+                            "Could not clear pi's pending messages: {error}"
+                        )));
+                        Vec::new()
+                    }
+                };
+                pending.extend(pending_prompts);
+                return_pending_prompts(backend, pending);
+                let id = self.next_id();
+                self.cancelling = Some(CancelState::Aborting {
+                    request_id: id.clone(),
+                });
+                self.write_record(&PiOutgoingRecord::Abort { id })?;
+            }
+            (
+                Some(CancelState::Aborting { request_id }),
+                PiIncomingRecord::Response(PiResponse::Abort(response)),
+            ) if response.id.as_deref() == Some(request_id.as_str()) => {
+                if !response.success {
+                    self.cancelling = None;
+                    let error = response.error.as_deref().unwrap_or("Unknown pi error");
+                    let _ = backend
+                        .events
+                        .try_send(AgentEvent::Error(anyhow!("Could not stop pi: {error}")));
+                } else if !self
+                    .active
+                    .as_ref()
+                    .is_some_and(ActiveRequest::awaiting_acceptance)
+                {
+                    // Abort acknowledges session idleness, not just receipt of
+                    // the command. Only now may post-cancel submissions start.
+                    self.cancelling = None;
+                    if self.active.take().is_some() {
+                        let _ = backend.events.try_send(AgentEvent::PromptCancelled);
+                    }
+                    self.context_dirty = true;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn request_context_usage(&mut self) -> Result<(), AgentError> {
         if self.context_dirty && self.context_request_id.is_none() {
             let id = self.next_id();
@@ -554,7 +709,7 @@ impl PiCodingAgent {
                 id,
                 accepted: false,
                 settled: false,
-                failure: None,
+                outcome: None,
             },
         )
     }
@@ -594,13 +749,23 @@ impl PiCodingAgent {
 }
 
 impl ActiveRequest {
+    fn awaiting_acceptance(&self) -> bool {
+        matches!(
+            self,
+            Self::Prompt {
+                accepted: false,
+                ..
+            }
+        )
+    }
+
     fn handle_record(&mut self, record: &PiIncomingRecord) -> Option<AgentEvent> {
         match self {
             Self::Prompt {
                 id,
                 accepted,
                 settled,
-                failure,
+                outcome,
             } => {
                 match record {
                     PiIncomingRecord::Response(PiResponse::Prompt(response))
@@ -627,31 +792,37 @@ impl ActiveRequest {
                                 ..
                             },
                     } => {
-                        *failure = match stop_reason {
-                            StopReason::Error | StopReason::Aborted => Some(anyhow!(
+                        *outcome = match stop_reason {
+                            StopReason::Error => Some(AgentEvent::Error(anyhow!(
                                 "{}",
                                 error_message
                                     .as_deref()
                                     .unwrap_or("pi could not complete the response")
-                            )),
+                            ))),
+                            StopReason::Aborted => Some(AgentEvent::PromptCancelled),
                             _ => None,
                         };
                     }
                     PiIncomingRecord::AgentSettled { aborted } => {
                         *settled = true;
                         if *aborted {
-                            *failure = Some(anyhow!("The pi request was cancelled."));
+                            *outcome = Some(AgentEvent::PromptCancelled);
                         }
                     }
                     _ => {}
                 }
-                (*accepted && *settled).then(|| {
-                    failure
-                        .take()
-                        .map_or(AgentEvent::PromptFinished, AgentEvent::Error)
-                })
+                (*accepted && *settled)
+                    .then(|| outcome.take().unwrap_or(AgentEvent::PromptFinished))
             }
         }
+    }
+}
+
+fn return_pending_prompts(backend: &AgentBackend, prompts: Vec<String>) {
+    if !prompts.is_empty() {
+        let _ = backend
+            .events
+            .try_send(AgentEvent::PendingPromptsReturned(prompts));
     }
 }
 
