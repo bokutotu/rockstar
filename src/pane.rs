@@ -295,6 +295,22 @@ impl Pane {
         }
     }
 
+    /// Source editors keep their own Vim g-prefix; these read-only views share
+    /// workspace-level gg/G navigation instead.
+    pub(crate) fn has_scroll_edges(&self, _: &App) -> bool {
+        match &self.content {
+            PaneContent::Chat(_) => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn scroll_to_edge(&self, bottom: bool, cx: &mut App) {
+        match &self.content {
+            PaneContent::Chat(view) => view.update(cx, |view, cx| view.scroll_to_edge(bottom, cx)),
+            _ => {}
+        }
+    }
+
     pub(crate) fn focus_content(&self, window: &mut Window, cx: &mut App) {
         match &self.content {
             PaneContent::Plain => {

@@ -559,7 +559,7 @@ impl Tab {
         cx: &mut Context<Self>,
     ) -> bool {
         let mode = *cx.global::<Mode>();
-        if self.pending == "y"
+        if matches!(self.pending.as_str(), "y" | "g")
             && (key.modifiers.control || key.modifiers.alt || key.modifiers.platform)
         {
             self.pending.clear();
@@ -664,6 +664,23 @@ impl Tab {
         {
             if self.pending == "y" && k != "y" {
                 self.pending.clear();
+            }
+            let scroll_edges = !tree_focused && self.panes[self.active].read(cx).has_scroll_edges(cx);
+            let bottom = k == "G" || (k == "g" && key.modifiers.shift);
+            if self.pending == "g" {
+                self.pending.clear();
+                if scroll_edges && k == "g" && !bottom {
+                    self.panes[self.active].update(cx, |pane, cx| pane.scroll_to_edge(false, cx));
+                    return true;
+                }
+            }
+            if scroll_edges && self.pending.is_empty() && (k == "g" || bottom) {
+                if bottom {
+                    self.panes[self.active].update(cx, |pane, cx| pane.scroll_to_edge(true, cx));
+                } else {
+                    self.pending.push('g');
+                }
+                return true;
             }
             if !self.pending.is_empty() {
                 self.pending.push_str(k);

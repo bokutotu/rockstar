@@ -114,6 +114,16 @@ impl ConversationView {
         cx.notify();
     }
 
+    pub(super) fn scroll_to_edge(&mut self, bottom: bool, cx: &mut Context<Self>) {
+        if bottom {
+            self.follow_latest(cx);
+        } else {
+            self.current = (!self.messages.is_empty()).then_some(0);
+            self.pending_scroll = Some(0);
+            cx.notify();
+        }
+    }
+
     pub(super) fn scroll_key(&mut self, key: &Keystroke, cx: &mut Context<Self>) -> bool {
         if *cx.global::<Mode>() != Mode::Normal
             || key.modifiers.alt || key.modifiers.platform || key.modifiers.shift
@@ -128,14 +138,8 @@ impl ConversationView {
             (false, "pagedown") | (true, "f") => -height * 0.9,
             (true, "u") => height * 0.5,
             (true, "d") => -height * 0.5,
-            (false, "home") => {
-                self.current = (!self.messages.is_empty()).then_some(0);
-                self.pending_scroll = Some(0);
-                cx.notify();
-                return true;
-            }
-            (false, "end") => {
-                self.follow_latest(cx);
+            (false, "home" | "end") => {
+                self.scroll_to_edge(key.key == "end", cx);
                 return true;
             }
             _ => return false,

@@ -50,6 +50,10 @@ impl ChatPane {
         self.conversation.update(cx, |view, cx| view.move_message(forward, cx));
     }
 
+    pub(crate) fn scroll_to_edge(&self, bottom: bool, cx: &mut App) {
+        self.conversation.update(cx, |view, cx| view.scroll_to_edge(bottom, cx));
+    }
+
     pub(crate) fn scroll_key(&self, key: &gpui_kit::Keystroke, cx: &mut App) -> bool {
         self.conversation.update(cx, |view, cx| view.scroll_key(key, cx))
     }
