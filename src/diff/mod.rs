@@ -2,6 +2,8 @@
 mod git;
 mod model;
 mod presentation;
+mod review;
+mod review_ui;
 mod tree;
 mod view;
 mod watch;
@@ -13,7 +15,10 @@ pub(crate) use view::DiffView;
 pub(crate) use watch::DiffWatches;
 
 use anyhow::{Result, ensure};
-use gpui_kit::{AppContext as _, Context, EntityId};
+use gpui_kit::{AppContext as _, Context, EntityId, Window, component::{WindowExt as _, notification::Notification}};
+
+#[derive(Clone)]
+pub(crate) struct ReviewToPi(pub String);
 use model::DiffEntry;
 use std::{collections::HashSet, path::Path, sync::Arc};
 
@@ -40,6 +45,9 @@ pub(crate) struct DiffSession {
     error: Option<String>,
     visible_views: HashSet<EntityId>,
     needs_refresh: bool,
+    comments: Vec<review::Comment>,
+    next_comment_id: u64,
+    submitting_review: bool,
 }
 
 impl DiffSession {
@@ -51,11 +59,56 @@ impl DiffSession {
             error: None,
             visible_views: HashSet::new(),
             needs_refresh: false,
+            comments: Vec::new(),
+            next_comment_id: 0,
+            submitting_review: false,
         }
     }
 
     pub(crate) fn label(&self) -> String {
         self.snapshot.source.label()
+    }
+
+    pub(crate) fn has_review_draft(&self) -> bool { !self.comments.is_empty() }
+
+    pub(crate) fn review_pending(&self) -> bool { self.submitting_review }
+
+    fn save_comment(&mut self, id: Option<u64>, target: review::Target, body: String) -> Result<()> {
+        ensure!(!self.submitting_review, "A review is being submitted");
+        ensure!(!body.trim().is_empty(), "The comment is empty");
+        ensure!(body.len() <= 60_000, "The comment is too long");
+        if let Some(id) = id {
+            let comment = self.comments.iter_mut().find(|comment| comment.id == id)
+                .ok_or_else(|| anyhow::anyhow!("The comment was removed"))?;
+            comment.body = body;
+        } else {
+            self.next_comment_id += 1;
+            self.comments.push(review::Comment { id: self.next_comment_id, target, body });
+        }
+        Ok(())
+    }
+
+    fn submit_review(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.submitting_review || self.comments.is_empty() { return; }
+        self.submitting_review = true;
+        let snapshot = self.snapshot.clone();
+        let comments = self.comments.clone();
+        let submitting = cx.background_spawn(async move { review::submit(&snapshot, &comments) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = submitting.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.submitting_review = false;
+                match result {
+                    Ok(url) => {
+                        this.comments.clear();
+                        window.push_notification(Notification::success(format!("Review submitted: {url}")), cx);
+                    }
+                    Err(error) => window.push_notification(Notification::error(format!("{error:#}")), cx),
+                }
+                cx.notify();
+            });
+        }).detach();
+        cx.notify();
     }
 
     fn set_visible(&mut self, view: EntityId, visible: bool, cx: &mut Context<Self>) {

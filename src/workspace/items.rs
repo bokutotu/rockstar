@@ -18,6 +18,12 @@ pub(crate) enum WipeMode {
 
 impl OpenItem {
     fn check_wipe(&self, mode: WipeMode, cx: &App) -> anyhow::Result<()> {
+        if let Self::Diff(session) = self {
+            let session = session.read(cx);
+            anyhow::ensure!(!session.review_pending(), "A review is being submitted; please wait.");
+            anyhow::ensure!(matches!(mode, WipeMode::Force) || !session.has_review_draft(),
+                "This diff has review comments. Submit them or use :bw! to discard them.");
+        }
         if let Self::File(buffer) = self {
             let buffer = buffer.read(cx);
             if buffer.saving {

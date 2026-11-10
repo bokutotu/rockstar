@@ -114,11 +114,11 @@ pub(super) fn load(directory: &Path, request: DiffRequest) -> Result<DiffSnapsho
     let root = repository_root(directory)?;
     match request {
         DiffRequest::Local(filter) => load_local_diff(&root, filter),
-        DiffRequest::PullRequest => load_pr_diff(&root),
+        DiffRequest::PullRequest => load_pr_diff(&root, None),
     }
 }
 
-fn changes(root: &Path, args: &[&str], section: DiffSection) -> Result<Vec<DiffEntry>> {
+pub(super) fn changes(root: &Path, args: &[&str], section: DiffSection) -> Result<Vec<DiffEntry>> {
     let data = checked(
         git(root)
             .args([
@@ -230,14 +230,14 @@ struct PrInfo {
     url: String,
 }
 
-fn load_pr_diff(root: &Path) -> Result<DiffSnapshot> {
-    let data = checked(
-        Command::new("gh")
-            .current_dir(root)
-            .env("GH_PROMPT_DISABLED", "1")
-            .stdin(Stdio::null())
-            .args(["pr", "view", "--json", "number,baseRefOid,headRefOid,url"]),
-    )?;
+pub(super) fn load_pr_diff(root: &Path, url: Option<&str>) -> Result<DiffSnapshot> {
+    let mut command = Command::new("gh");
+    command.current_dir(root).env("GH_PROMPT_DISABLED", "1").stdin(Stdio::null())
+        .args(["pr", "view"]);
+    if let Some(url) = url {
+        command.arg(url);
+    }
+    let data = checked(command.args(["--json", "number,baseRefOid,headRefOid,url"]))?;
     let pr: PrInfo = serde_json::from_slice(&data).context("Invalid PR information from gh")?;
     oid(&pr.base)?;
     oid(&pr.head)?;
@@ -290,6 +290,8 @@ fn load_pr_diff(root: &Path) -> Result<DiffSnapshot> {
         source: DiffSource::PullRequest {
             number: pr.number,
             merge_base_oid: merge_base,
+            head_oid: pr.head,
+            url: pr.url,
         },
         entries: Vec::new(),
     })
@@ -386,7 +388,7 @@ fn file_version(mode: u32, bytes: Vec<u8>) -> FileVersion {
     }
 }
 
-fn tree_file(root: &Path, revision: &str, file: &Path) -> Result<FileVersion> {
+pub(super) fn tree_file(root: &Path, revision: &str, file: &Path) -> Result<FileVersion> {
     let data = checked(git(root).args(["ls-tree", "-z", revision, "--"]).arg(file))?;
     if data.is_empty() {
         return Ok(FileVersion::missing());

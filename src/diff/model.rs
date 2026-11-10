@@ -23,6 +23,8 @@ pub(crate) enum DiffSource {
     PullRequest {
         number: u64,
         merge_base_oid: String,
+        head_oid: String,
+        url: String,
     },
 }
 

@@ -1,16 +1,16 @@
 use super::{
-    DiffSession, git,
+    DiffSession, ReviewToPi, git, review, review_ui,
     model::*,
     presentation::{HighlightedSource, PreparedDocument},
     tree::{DiffTree, TreeAction},
 };
 use crate::mode::{Mode, text_key};
 use gpui_kit::{
-    App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
+    App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
     IntoElement, Keystroke, MouseButton, ParentElement as _, Pixels, Render, Role, ScrollStrategy,
     StatefulInteractiveElement as _, Styled as _, StyledText, UniformListScrollHandle, Window,
-    base::ElementExt as _,
-    component::ActiveTheme as _, div, point, prelude::FluentBuilder as _, px, relative, rgb,
+    base::{ElementExt as _, Disableable as _},
+    component::{ActiveTheme as _, button::Button}, div, point, prelude::FluentBuilder as _, px, relative, rgb,
     uniform_list,
 };
 use std::{cell::Cell, ops::Range, rc::Rc, sync::Arc};
@@ -255,6 +255,63 @@ impl DiffView {
         true
     }
 
+    fn comment_line(&self, row: usize, added: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(entry), Some(prepared)) = (&self.selected_entry, &self.document) else { return; };
+        let Some(row) = prepared.rows.get(row) else { return; };
+        let (line, text, side) = if added {
+            (row.after, prepared.document.after.text(), review::Side::Right)
+        } else {
+            (row.before, prepared.document.before.text(), review::Side::Left)
+        };
+        let (Some(line), Some(text)) = (line, text) else { return; };
+        let target = review::Target::new(entry.clone(), side, line, text);
+        let id = self.session.read(cx).comments.iter()
+            .find(|comment| comment.target == target).map(|comment| comment.id);
+        review_ui::edit(self.session.clone(), target, id, window, cx);
+    }
+
+    fn render_review(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let state = self.session.read(cx);
+        let disabled = state.comments.is_empty() || state.submitting_review;
+        let comments = state.comments.clone();
+        div().flex_shrink_0().border_t_1().border_color(cx.theme().border)
+            .child(div().id("review-comments").max_h(px(160.)).overflow_y_scroll()
+                .children(comments.into_iter().map(|comment| {
+                    let id = comment.id;
+                    let target = comment.target.clone();
+                    div().px_2().py_1().flex().items_center().gap_2()
+                        .child(div().flex_1().min_w_0().truncate()
+                            .child(format!("{} — {}", target.label(), comment.body)))
+                        .child(Button::new(("edit-comment", id as usize)).label("Edit")
+                            .disabled(state.submitting_review)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                review_ui::edit(this.session.clone(), target.clone(), Some(id), window, cx);
+                            })))
+                        .child(Button::new(("delete-comment", id as usize)).label("Remove")
+                            .disabled(state.submitting_review)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.session.update(cx, |session, cx| {
+                                    if !session.submitting_review {
+                                        session.comments.retain(|comment| comment.id != id);
+                                        cx.notify();
+                                    }
+                                });
+                            })))
+                })))
+            .child(div().px_2().py_1().flex().items_center().gap_2()
+                .child(div().flex_1().child(format!("{} comments · Click a line number to comment", state.comments.len())))
+                .child(Button::new("review-to-pi").label("Send to pi").disabled(disabled)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let state = this.session.read(cx);
+                        if !state.comments.is_empty() && !state.submitting_review {
+                            let text = format!("Please address these code review comments. Paths are relative to {}. Line numbers refer to the reviewed snapshots; verify the current source before making changes.\n\n{}", state.snapshot.root.display(), review::markdown(&state.comments));
+                            cx.emit(ReviewToPi(text));
+                        }
+                    })))
+                .child(Button::new("review-to-github").label(if state.submitting_review { "Submitting…" } else { "GitHub review…" }).disabled(disabled)
+                    .on_click(cx.listener(|this, _, window, cx| review_ui::confirm_submit(this.session.clone(), window, cx)))))
+    }
+
     fn render_files(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let bounds = self.tree_bounds.clone();
         div()
@@ -445,6 +502,9 @@ impl DiffView {
                                             .border_color(cx.theme().border)
                                             .child(
                                                 div()
+                                                    .id((if added { "diff-new-line" } else { "diff-old-line" }, index))
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(move |this, _, window, cx| this.comment_line(index, added, window, cx)))
                                                     .w(px(52.))
                                                     .h_full()
                                                     .flex_shrink_0()
@@ -526,6 +586,8 @@ impl DiffView {
     }
 }
 
+impl EventEmitter<ReviewToPi> for DiffView {}
+
 impl Focusable for DiffView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -573,6 +635,7 @@ impl Render for DiffView {
                     .flex_1().min_w_0().h_full().flex().flex_col()
                     .child(div().px_2().py_1().flex_shrink_0().truncate().child(path))
                     .child(div().flex_1().min_h_0().child(self.render_document(cx)))))
+            .child(self.render_review(cx))
             .child(div().px_2().py_1().flex_shrink_0().border_t_1().border_color(cx.theme().border)
                 .text_xs().text_color(cx.theme().muted_foreground).truncate()
                 .child("sh/sl focus · j/k select in tree, scroll in diff · Enter open · h/l tree · PgUp/PgDn page · Shift+wheel horizontal · r refresh · :stage / :unstage"))

@@ -55,7 +55,7 @@ impl Tab {
                 .any(|pane| pane.entity_id() == target && pane.read(cx).request == request)
         {
             window.push_notification(Notification::info("Resuming chat…"), cx);
-            self.start_chat(target, ChatStart::Resume(path), window, cx);
+            self.start_chat(target, ChatStart::Resume(path), None, window, cx);
         }
     }
 }

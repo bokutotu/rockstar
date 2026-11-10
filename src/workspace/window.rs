@@ -622,19 +622,36 @@ impl WorkspaceWindow {
         {
             anyhow::bail!("Saving files. Please wait before closing.");
         }
+        if self.target_tabs(target).iter().any(|tab| tab.read(cx).items.iter().any(|item| {
+            matches!(item, OpenItem::Diff(session) if session.read(cx).review_pending())
+        })) {
+            anyhow::bail!("A review is being submitted. Please wait before closing.");
+        }
         Ok(())
     }
 
+    fn has_review_drafts(&self, target: CloseTarget, cx: &App) -> bool {
+        self.target_tabs(target).iter().any(|tab| tab.read(cx).items.iter().any(|item| {
+            matches!(item, OpenItem::Diff(session) if session.read(cx).has_review_draft())
+        }))
+    }
+
     pub(crate) fn request_close_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_target(CloseTarget::Tab(self.active_tab().entity_id()), window, cx);
+        let target = CloseTarget::Tab(self.active_tab().entity_id());
+        if self.has_review_drafts(target, cx) {
+            self.confirm_close(target, window, cx);
+        } else {
+            self.close_target(target, window, cx);
+        }
     }
 
     pub(crate) fn request_close_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_target(
-            CloseTarget::Workspace(self.workspaces[self.active].id),
-            window,
-            cx,
-        );
+        let target = CloseTarget::Workspace(self.workspaces[self.active].id);
+        if self.has_review_drafts(target, cx) {
+            self.confirm_close(target, window, cx);
+        } else {
+            self.close_target(target, window, cx);
+        }
     }
 
     pub(crate) fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -646,6 +663,7 @@ impl WorkspaceWindow {
             .target_tabs(CloseTarget::Window)
             .iter()
             .all(|tab| tab.read(cx).buffers().all(|b| !b.read(cx).dirty()))
+            && !self.has_review_drafts(CloseTarget::Window, cx)
         {
             return true;
         }
@@ -679,6 +697,9 @@ impl WorkspaceWindow {
                     match item {
                         OpenItem::File(buffer) if buffer.read(cx).dirty() => {
                             details.push(format!("Unsaved: {}", item.label(&workspace.root, cx)))
+                        }
+                        OpenItem::Diff(session) if session.read(cx).has_review_draft() => {
+                            details.push(format!("Unsubmitted review: {}", item.label(&workspace.root, cx)))
                         }
                         OpenItem::Chat(_) | OpenItem::Terminal(_) | OpenItem::Media(_) => {
                             details.push(format!("Will stop: {}", item.label(&workspace.root, cx)))

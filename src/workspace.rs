@@ -163,6 +163,11 @@ impl Tab {
             },
         )
         .detach();
+        cx.subscribe_in(&pane, window, |this, pane, event: &crate::diff::ReviewToPi, window, cx| {
+            if this.visible && this.panes.get(this.active) == Some(&pane) {
+                this.start_chat(pane.entity_id(), ChatStart::New, Some(event.0.clone()), window, cx);
+            }
+        }).detach();
         self.panes.push(pane.clone());
         pane
     }
@@ -259,6 +264,7 @@ impl Tab {
         self.start_chat(
             self.panes[self.active].entity_id(),
             ChatStart::New,
+            None,
             window,
             cx,
         );
@@ -268,6 +274,7 @@ impl Tab {
         &mut self,
         pane_id: EntityId,
         start: ChatStart,
+        prompt: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -299,6 +306,14 @@ impl Tab {
                 else {
                     return;
                 };
+                let result = result.and_then(|opened| {
+                    if let Some(text) = prompt {
+                        opened.agent.command_sender().try_send(crate::agent::AgentCommand::Prompt(
+                            crate::agent::PromptRequest { text }
+                        )).map_err(|_| anyhow::anyhow!(crate::agent::DISCONNECTED_MESSAGE))?;
+                    }
+                    Ok(opened)
+                });
                 match (result, session) {
                     (Ok(opened), Some(session)) => {
                         if let Some(session) = session.upgrade() {

@@ -170,7 +170,11 @@ impl Pane {
         let view = self
             .diffs
             .entry(id)
-            .or_insert_with(|| cx.new(|cx| DiffView::new(session, cx)))
+            .or_insert_with(|| {
+                let view = cx.new(|cx| DiffView::new(session, cx));
+                cx.subscribe(&view, |_, _, event: &crate::diff::ReviewToPi, cx| cx.emit(event.clone())).detach();
+                view
+            })
             .clone();
         self.content = PaneContent::Diff(view);
         self.set_content_visible(true, cx);
@@ -360,6 +364,7 @@ impl Panel for Pane {
 }
 impl EventEmitter<PanelEvent> for Pane {}
 impl EventEmitter<PaneActivated> for Pane {}
+impl EventEmitter<crate::diff::ReviewToPi> for Pane {}
 impl EventEmitter<crate::file_view::Navigate> for Pane {}
 impl EventEmitter<crate::file_view::VimEvent> for Pane {}
 impl Focusable for Pane {
