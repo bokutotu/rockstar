@@ -27,6 +27,7 @@ use std::{cell::Cell, collections::HashSet, path::PathBuf, rc::Rc, time::Duratio
 mod creation;
 mod creation_dialog;
 mod git_status;
+mod icons;
 mod tree_watch;
 use creation::{EntryKind, initial_creation_path};
 use tree_watch::TreeSnapshot;
@@ -668,10 +669,12 @@ impl Render for FileTree {
                                         this.focus(window, cx);
                                         this.open(index, cx);
                                     }))
+                                    .child(div().w(px(10.)).flex_shrink_0().child(icon))
+                                    .child(icons::view(path, this.expanded.contains(path)))
                                     .child(div().flex_1().min_w_0().truncate()
                                         .when(changes.uncommitted, |name| name.text_color(cx.theme().warning))
                                         .when(changes.branch && !changes.uncommitted, |name| name.text_color(cx.theme().info))
-                                        .child(format!("{icon}{label}")))
+                                        .child(label.to_owned()))
                                     .when(changes.branch, |row| row.child(div().text_xs().text_color(cx.theme().info).child("B")))
                                     .when(changes.uncommitted, |row| row.child(div().text_xs().text_color(cx.theme().warning).child("W")))
                             })
