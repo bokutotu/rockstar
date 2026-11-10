@@ -227,6 +227,14 @@ impl DiffView {
         cx.notify();
     }
 
+    pub(crate) fn scroll_to_edge(&self, bottom: bool, cx: &mut Context<Self>) {
+        let handle = &self.body_scroll.0.borrow().base_handle;
+        let mut offset = handle.offset();
+        offset.y = if bottom { -handle.max_offset().y } else { px(0.) };
+        handle.set_offset(offset);
+        cx.notify();
+    }
+
     pub(crate) fn key(&mut self, key: &Keystroke, window: &Window, cx: &mut Context<Self>) -> bool {
         if *cx.global::<Mode>() != Mode::Normal
             || key.modifiers.alt
@@ -650,6 +658,6 @@ impl Render for DiffView {
             .child(self.render_review(cx))
             .child(div().px_2().py_1().flex_shrink_0().border_t_1().border_color(cx.theme().border)
                 .text_xs().text_color(cx.theme().muted_foreground).truncate()
-                .child("Ctrl+U/D half page · Ctrl+B/F page · sh/sl focus · j/k select/scroll · Enter open · h/l tree · Shift+wheel horizontal · r refresh · :stage / :unstage"))
+                .child("gg/G start/end · Ctrl+U/D half page · Ctrl+B/F page · sh/sl focus · j/k select/scroll · Enter open · h/l tree · Shift+wheel horizontal · r refresh · :stage / :unstage"))
     }
 }

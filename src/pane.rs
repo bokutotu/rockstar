@@ -299,7 +299,7 @@ impl Pane {
     /// workspace-level gg/G navigation instead.
     pub(crate) fn has_scroll_edges(&self, _: &App) -> bool {
         match &self.content {
-            PaneContent::Chat(_) => true,
+            PaneContent::Chat(_) | PaneContent::Diff(_) => true,
             _ => false,
         }
     }
@@ -307,6 +307,7 @@ impl Pane {
     pub(crate) fn scroll_to_edge(&self, bottom: bool, cx: &mut App) {
         match &self.content {
             PaneContent::Chat(view) => view.update(cx, |view, cx| view.scroll_to_edge(bottom, cx)),
+            PaneContent::Diff(view) => view.update(cx, |view, cx| view.scroll_to_edge(bottom, cx)),
             _ => {}
         }
     }
