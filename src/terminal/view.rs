@@ -11,7 +11,7 @@ use gpui_kit::{
     FocusHandle, Focusable, Font, InteractiveElement as _, IntoElement, Keystroke, MouseButton,
     ParentElement as _, Pixels, Point, Render, Role, StatefulInteractiveElement as _, Styled as _,
     TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, canvas,
-    component::ActiveTheme as _, div, outline, point, px, size,
+    component::{ActiveTheme as _, button::Button}, div, outline, point, px, size,
 };
 use std::ops::Range;
 
@@ -94,8 +94,23 @@ impl TerminalView {
             cx.notify();
             return true;
         }
-        if key.modifiers.control && key.modifiers.shift && key.key.eq_ignore_ascii_case("c") {
+        let normal = *cx.global::<Mode>() == Mode::Normal;
+        if !key.modifiers.alt && !key.modifiers.platform
+            && ((key.modifiers.control && key.key.eq_ignore_ascii_case("c")
+                && (key.modifiers.shift || normal))
+                || (normal && !key.modifiers.control && !key.modifiers.shift && key.key == "y"))
+        {
             self.copy(cx);
+            return true;
+        }
+        if key.modifiers.control && key.modifiers.shift
+            && !key.modifiers.alt && !key.modifiers.platform
+            && key.key.eq_ignore_ascii_case("a")
+        {
+            let screen = self.session.read(cx).process.screen.lock().unwrap();
+            self.selection = Some(((0, 0), (screen.term.screen_lines() - 1, screen.term.columns() - 1)));
+            drop(screen);
+            cx.notify();
             return true;
         }
         if *cx.global::<Mode>() != Mode::Insert {
@@ -161,20 +176,9 @@ impl TerminalView {
     }
 
     fn copy(&self, cx: &mut App) {
-        let Some((a, b)) = self.selection else {
-            return;
-        };
-        let (start, end) = if a <= b { (a, b) } else { (b, a) };
         let text = {
             let screen = self.session.read(cx).process.screen.lock().unwrap();
-            let offset = self.scroll.min(screen.term.history_size()) as i32;
-            let to_point = |(r, c): (usize, usize)| {
-                TermPoint::new(
-                    Line(r.min(screen.term.screen_lines() - 1) as i32 - offset),
-                    Column(c.min(screen.term.columns() - 1)),
-                )
-            };
-            screen.term.bounds_to_string(to_point(start), to_point(end))
+            copy_text(&screen, self.selection, self.scroll)
         };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
@@ -214,6 +218,30 @@ impl TerminalView {
         };
         self.send(bytes, window, cx);
         true
+    }
+}
+
+/// Use the terminal's own extraction to preserve soft wraps, wide characters,
+/// and combining marks. With no selection, copy the retained output/history.
+fn copy_text(
+    screen: &super::screen::Screen,
+    selection: Option<((usize, usize), (usize, usize))>,
+    scroll: usize,
+) -> String {
+    let term = &screen.term;
+    if let Some((a, b)) = selection {
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        let offset = scroll.min(term.history_size()) as i32;
+        let to_point = |(r, c): (usize, usize)| TermPoint::new(
+            Line(r.min(term.screen_lines() - 1) as i32 - offset),
+            Column(c.min(term.columns() - 1)),
+        );
+        term.bounds_to_string(to_point(start), to_point(end))
+    } else {
+        term.bounds_to_string(
+            TermPoint::new(Line(-(term.history_size() as i32)), Column(0)),
+            TermPoint::new(Line(term.screen_lines() as i32 - 1), Column(term.columns() - 1)),
+        ).trim_end_matches('\n').to_owned()
     }
 }
 
@@ -350,12 +378,21 @@ impl Render for TerminalView {
                     .role(Role::Status)
                     .aria_label(status.clone())
                     .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .px_2()
                     .py_1()
                     .text_xs()
                     .bg(cx.theme().muted)
                     .text_color(cx.theme().muted_foreground)
-                    .child(status),
+                    .child(div().flex_1().min_w_0().truncate().child(format!(
+                        "{status} · Shift+drag: select · Ctrl+Shift+C: copy"
+                    )))
+                    .child(Button::new("terminal-copy")
+                        .label(if self.selection.is_some() { "Copy selection" } else { "Copy output" })
+                        .on_click(cx.listener(|this, _, _, cx| this.copy(cx)))),
+
             )
     }
 }
