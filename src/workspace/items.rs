@@ -48,7 +48,7 @@ impl OpenItem {
 
     pub(super) fn label(&self, root: &Path, cx: &App) -> String {
         match self {
-            Self::Chat(session) => format!("Chat {}", session.read(cx).number),
+            Self::Chat(session) => session.read(cx).label(),
             Self::Terminal(session) => session.read(cx).label(),
             Self::Diff(session) => session.read(cx).label(),
             Self::Media(session) => match &session.read(cx).source {
@@ -166,6 +166,17 @@ impl Tab {
                 .detach();
                 self.watches
                     .update(cx, |watches, cx| watches.attach(buffer, cx));
+            }
+            if let OpenItem::Chat(session) = &item {
+                let mut label = session.read(cx).label();
+                cx.observe(session, move |_, session, cx| {
+                    let next = session.read(cx).label();
+                    if next != label {
+                        label = next;
+                        cx.notify();
+                    }
+                })
+                .detach();
             }
             if let OpenItem::Terminal(session) = &item {
                 let mut label = session.read(cx).label();

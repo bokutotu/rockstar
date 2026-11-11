@@ -16,6 +16,7 @@ use gpui_kit::{
 };
 
 use crate::{
+    agent::AgentKind,
     diff::{DiffRequest, IndexAction, LocalFilter},
     input_shortcuts,
     mode::Mode,
@@ -330,8 +331,13 @@ impl CommandPaletteView {
             }),
             "e!" => tab.update(cx, |tab, cx| tab.reload_active_file(window, cx)),
             "markdown" => tab.update(cx, |tab, cx| tab.toggle_markdown(window, cx)),
-            "pi" => {
-                tab.update(cx, |workspace, cx| workspace.show_chat(false, window, cx));
+            "pi" | "agy" | "codex" => {
+                let kind = match name.to_ascii_lowercase().as_str() {
+                    "agy" => AgentKind::Agy,
+                    "codex" => AgentKind::Codex,
+                    _ => AgentKind::Pi,
+                };
+                tab.update(cx, |workspace, cx| workspace.show_chat(kind, window, cx));
                 Ok(())
             }
             "resume" => {
@@ -340,20 +346,17 @@ impl CommandPaletteView {
                 tab.update(cx, |tab, cx| tab.open_resume(window, cx));
                 return;
             }
-            "term" | "agy" | "codex" => {
-                let kind = match name.to_ascii_lowercase().as_str() {
-                    "agy" => crate::terminal::TerminalKind::Agy,
-                    "codex" => crate::terminal::TerminalKind::Codex,
-                    _ => crate::terminal::TerminalKind::Shell,
-                };
+            "term" => {
                 // Dismiss before opening: an existing terminal can enter Insert
                 // immediately without the palette resetting it to Normal.
                 self.dismiss(cx);
-                tab.update(cx, |workspace, cx| workspace.show_terminal(kind, window, cx));
+                tab.update(cx, |workspace, cx| {
+                    workspace.show_terminal(crate::terminal::TerminalKind::Shell, window, cx)
+                });
                 return;
             }
             "new" => {
-                tab.update(cx, |workspace, cx| workspace.show_chat(true, window, cx));
+                tab.update(cx, |workspace, cx| workspace.new_chat(window, cx));
                 Ok(())
             }
             "close" | "q" => {

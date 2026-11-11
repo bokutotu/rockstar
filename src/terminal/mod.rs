@@ -20,24 +20,18 @@ pub(crate) use view::TerminalView;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TerminalKind {
     Shell,
-    Agy,
-    Codex,
 }
 
 impl TerminalKind {
     pub(crate) fn command(self) -> CommandBuilder {
         match self {
             Self::Shell => shell_command(),
-            Self::Agy => CommandBuilder::new("agy"),
-            Self::Codex => CommandBuilder::new("codex"),
         }
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::Shell => "Terminal",
-            Self::Agy => "Agy",
-            Self::Codex => "Codex",
         }
     }
 }

@@ -7,7 +7,7 @@ use gpui_kit::{
 };
 
 use crate::{
-    agent::{self, AgentBackend, AgentEvent, OpenedChat},
+    agent::{self, AgentBackend, AgentEvent, AgentKind, OpenedChat},
     mode,
 };
 
@@ -50,6 +50,7 @@ fn open_chat(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<ChatSession>, 
                                 agent,
                                 messages: Vec::new(),
                             },
+                            AgentKind::Pi,
                             1,
                             window,
                             cx,
@@ -174,6 +175,8 @@ fn replacing_the_session_clears_activity_and_ignores_the_old_connection(cx: &mut
                     agent,
                     messages: Vec::new(),
                 },
+                AgentKind::Pi,
+                1,
                 window,
                 cx,
             )

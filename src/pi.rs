@@ -1,9 +1,8 @@
 use std::{
     collections::VecDeque,
-    io::{self, BufRead, BufReader, Write},
-    os::unix::process::CommandExt,
+    io::{BufRead, BufReader, Write},
     path::Path,
-    process::{self, Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
     thread,
     time::Duration,
@@ -17,7 +16,7 @@ use serde_json::Value;
 
 use crate::agent::{
     self, AgentBackend, AgentCommand, AgentError, AgentEvent, ChatStart, ContextUsage, Message,
-    OpenedChat, PromptRequest,
+    OpenedChat, PromptRequest, ResumeTarget,
 };
 
 mod sessions;
@@ -302,7 +301,6 @@ enum Incoming {
 }
 
 pub(crate) fn connect(cwd: &Path, start: ChatStart) -> Result<OpenedChat, AgentError> {
-    let parent_pid = process::id() as libc::pid_t;
     let mut command = Command::new("pi");
     command
         .args(["--mode", "rpc"])
@@ -312,7 +310,7 @@ pub(crate) fn connect(cwd: &Path, start: ChatStart) -> Result<OpenedChat, AgentE
         .stderr(Stdio::inherit());
     let expected_session = match start {
         ChatStart::New => None,
-        ChatStart::Resume(path) => {
+        ChatStart::Resume(ResumeTarget::Pi(path)) => {
             let path = cwd
                 .join(path)
                 .canonicalize()
@@ -321,28 +319,9 @@ pub(crate) fn connect(cwd: &Path, start: ChatStart) -> Result<OpenedChat, AgentE
             command.arg("--session").arg(path);
             Some(id)
         }
+        ChatStart::Resume(_) => bail!("Selected session does not belong to pi"),
     };
-    // SAFETY: The child-side hook only makes syscalls and constructs OS-code
-    // errors; it does not allocate or acquire locks after fork.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::prctl(
-                libc::PR_SET_PDEATHSIG,
-                libc::SIGKILL as libc::c_ulong,
-                0 as libc::c_ulong,
-                0 as libc::c_ulong,
-                0 as libc::c_ulong,
-            ) == -1
-            {
-                return Err(io::Error::last_os_error());
-            }
-            // Do not start pi if Rockstar exited before the signal was armed.
-            if libc::getppid() != parent_pid {
-                return Err(io::Error::from_raw_os_error(libc::ESRCH));
-            }
-            Ok(())
-        });
-    }
+    agent::arm_parent_death_signal(&mut command);
     let mut child = command
         .spawn()
         .context("Could not start pi. Make sure pi is installed and available on PATH.")?;
@@ -478,7 +457,7 @@ impl PiCodingAgent {
                     pending.push(prompt.text);
                 }
             }
-            return_pending_prompts(&backend, pending);
+            agent::return_pending_prompts(&backend, pending);
             // A failed session must not terminate the other open chats.
             let _ = backend.events.try_send(AgentEvent::Error(error));
         }
@@ -647,7 +626,7 @@ impl PiCodingAgent {
                     }
                 };
                 pending.extend(pending_prompts);
-                return_pending_prompts(backend, pending);
+                agent::return_pending_prompts(backend, pending);
                 let id = self.next_id();
                 self.cancelling = Some(CancelState::Aborting {
                     request_id: id.clone(),
@@ -818,14 +797,6 @@ impl ActiveRequest {
     }
 }
 
-fn return_pending_prompts(backend: &AgentBackend, prompts: Vec<String>) {
-    if !prompts.is_empty() {
-        let _ = backend
-            .events
-            .try_send(AgentEvent::PendingPromptsReturned(prompts));
-    }
-}
-
 fn decode_context_usage(stats: PiSessionStats) -> Option<ContextUsage> {
     let usage = stats.context_usage?;
     let used_tokens = usage.tokens?;
@@ -874,17 +845,7 @@ fn tool_activity(name: &str, args: &Value) -> String {
         Some(detail) => format!("{name} {detail}"),
         None => name.to_owned(),
     };
-    // Preserve ordinary spaces, including those inside quoted shell arguments.
-    text.replace("\r\n", "\n")
-        .chars()
-        .map(|ch| {
-            if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
-                ' '
-            } else {
-                ch
-            }
-        })
-        .collect()
+    agent::sanitize_activity(&text)
 }
 
 impl MessageContent {

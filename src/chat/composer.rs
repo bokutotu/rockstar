@@ -2,8 +2,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use gpui_kit::{
     App, AppContext as _, Context, Entity, EntityId, Focusable as _, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement as _, Role, StatefulInteractiveElement as _,
-    Styled as _, Task, View, Window,
+    IntoElement, MouseButton, ParentElement as _, Role, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Task, View, Window,
     component::{
         ActiveTheme as _, WindowExt as _,
         input::{Enter, IndentInline, InputEvent, MoveDown, MoveUp, Textarea, TextareaState},
@@ -19,7 +19,7 @@ use super::{
 };
 
 use crate::{
-    agent::{AgentCommand, ContextUsage, DISCONNECTED_MESSAGE, PromptRequest},
+    agent::{AgentCommand, AgentKind, ContextUsage, PromptRequest},
     file_search, input_shortcuts,
     mode::Mode,
 };
@@ -29,11 +29,11 @@ const MAX_MATCHES: usize = 50;
 /// Rows shown at once in the mention popup.
 const VISIBLE_MATCHES: usize = 10;
 
-fn input_hint(mode: Mode) -> &'static str {
+fn input_hint(mode: Mode, kind: AgentKind) -> SharedString {
     if mode == Mode::Insert {
-        "Ask pi… · Ctrl+g stop"
+        format!("Ask {}… · Ctrl+g stop", kind.name()).into()
     } else {
-        "NORMAL — gg first · G latest · Ctrl+U/D half page · Ctrl+B/F page · j/k messages · yy copy · i type · Ctrl+g stop · : commands"
+        "NORMAL — gg first · G latest · Ctrl+U/D half page · Ctrl+B/F page · j/k messages · yy copy · i type · Ctrl+g stop · : commands".into()
     }
 }
 
@@ -92,7 +92,7 @@ impl ComposerView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let hint = input_hint(*cx.global::<Mode>());
+        let hint = input_hint(*cx.global::<Mode>(), session.read(cx).kind);
         let input = cx.new(|cx| TextareaState::new(window, cx).rows(3).placeholder(hint));
         observe_ime_position(&input, window, cx).detach();
         let draft = session.read(cx).draft.clone();
@@ -117,15 +117,18 @@ impl ComposerView {
             cx.notify();
         })
         .detach();
-        cx.subscribe_in(&session, window, |this, _, change, window, cx| {
+        cx.subscribe_in(&session, window, |this, session, change, window, cx| {
             if matches!(change, ConversationChange::Reset(_)) {
+                let hint = input_hint(*cx.global::<Mode>(), session.read(cx).kind);
+                this.input
+                    .update(cx, |input, cx| input.set_placeholder(hint, window, cx));
                 this.clear(window, cx);
             }
         })
         .detach();
         cx.observe_global_in::<Mode>(window, |this, window, cx| {
             let mode = *cx.global::<Mode>();
-            let hint = input_hint(mode);
+            let hint = input_hint(mode, this.session.read(cx).kind);
             this.input
                 .update(cx, |input, cx| input.set_placeholder(hint, window, cx));
             if mode != Mode::Insert {
@@ -298,7 +301,7 @@ impl ComposerView {
         match result {
             Ok(()) => self.clear(window, cx),
             Err(_) => window.push_notification(
-                Notification::error(DISCONNECTED_MESSAGE),
+                Notification::error(self.session.read(cx).kind.disconnected_message()),
                 cx,
             ),
         }
@@ -397,8 +400,9 @@ impl View for Composer {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         self.state.update(cx, |state, cx| {
             let mode = *cx.global::<Mode>();
-            let context_usage =
-                format_context_usage(state.session.read(cx).context_usage.as_ref());
+            let session = state.session.read(cx);
+            let agent_name = session.kind.name();
+            let context_usage = format_context_usage(session.context_usage.as_ref());
             div()
                 .key_context(input_shortcuts::CONTEXT)
                 // Capture Ctrl+Enter before the textarea inserts a newline.
@@ -435,7 +439,7 @@ impl View for Composer {
                     Textarea::new(&state.input)
                         .w_full()
                         .readonly(mode != Mode::Insert)
-                        .aria_label("Message to pi"),
+                        .aria_label(format!("Message to {agent_name}")),
                 )
                 .child(
                     div()

@@ -1,6 +1,8 @@
 mod agent;
+mod agy;
 mod app;
 mod chat;
+mod codex;
 mod command_palette;
 mod diff;
 mod file_browser;
@@ -24,7 +26,7 @@ mod syntax;
 mod terminal;
 mod workspace;
 
-use std::{env, os::unix::net::UnixStream, process::ExitCode, sync::Arc};
+use std::{env, os::unix::net::UnixStream, path::Path, process::ExitCode, sync::Arc};
 
 use anyhow::Context as _;
 
@@ -34,11 +36,20 @@ use gpui_kit::{
     px, size,
 };
 
+use agent::{AgentError, AgentKind, ChatStart, OpenedChat};
 use app::{dispatch_requests, open_dock_window};
 use instance::{InstanceServer, OpenWorkspaceRequest};
 use launch::{LaunchMode, StartupStatus};
 
-const USAGE: &str = "Usage: rockstar\n\nOpen the current directory in Rockstar's single window, reusing its workspace if already open. Return after startup; Rockstar keeps running when the terminal closes. Use :wsnew <directory> for another workspace, :tabnew for a tab, :chat for pi, :resume for saved chats, :term for a terminal, or \\ff to open files.";
+const USAGE: &str = "Usage: rockstar\n\nOpen the current directory in Rockstar's single window, reusing its workspace if already open. Return after startup; Rockstar keeps running when the terminal closes. Use :wsnew <directory> for another workspace, :tabnew for a tab, :pi / :agy / :codex for agents, :resume for saved chats, :term for a terminal, or \\ff to open files.";
+
+fn connect_agent(kind: AgentKind, cwd: &Path, start: ChatStart) -> Result<OpenedChat, AgentError> {
+    match kind {
+        AgentKind::Pi => pi::connect(cwd, start),
+        AgentKind::Agy => agy::connect(cwd, start),
+        AgentKind::Codex => codex::connect(cwd, start),
+    }
+}
 
 fn init_key_handling(cx: &mut App) {
     mode::init(cx);
@@ -114,7 +125,7 @@ fn run_gui(
                 window_bounds: Some(WindowBounds::centered(size(px(960.0), px(720.0)), cx)),
                 window_min_size: Some(size(px(360.0), px(240.0))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Rockstar — pi".into()),
+                    title: Some("Rockstar".into()),
                     ..Default::default()
                 }),
                 app_id: Some("rockstar".into()),
@@ -122,7 +133,7 @@ fn run_gui(
             };
             let result = (|| {
                 let (window, workspace) =
-                    open_dock_window(options, request.root, Arc::new(pi::connect), cx)
+                    open_dock_window(options, request.root, Arc::new(connect_agent), cx)
                         .context("Cannot open the Rockstar window")?;
                 dispatch_requests(requests, workspace, window, cx);
                 cx.activate(true);

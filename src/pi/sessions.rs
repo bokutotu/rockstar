@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::agent::{Message, SavedSession};
+use crate::agent::{self, Message, ResumeTarget, SavedSession};
 
 use super::PiMessage;
 
@@ -47,7 +47,7 @@ pub(crate) fn list_sessions(root: &Path) -> Result<Vec<SavedSession>> {
     sessions.sort_by(|a, b| {
         b.updated_at
             .cmp(&a.updated_at)
-            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.detail.cmp(&b.detail))
     });
     Ok(sessions)
 }
@@ -213,19 +213,12 @@ fn read_summary(path: &Path, root: &Path) -> Result<Option<SavedSession>> {
             _ => {}
         }
     }
-    let title = name
-        .or(first_message)
-        .unwrap_or_else(|| "(no messages)".into());
     // A first prompt can be a whole document; retain only a useful one-line title.
-    let title = title
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(160)
-        .collect();
+    let raw_title = name.or(first_message);
+    let title = agent::summarize_title(raw_title.as_deref());
     Ok(Some(SavedSession {
-        path: path.to_path_buf(),
+        detail: path.display().to_string(),
+        target: ResumeTarget::Pi(path.to_path_buf()),
         title,
         updated_at: last_activity.unwrap_or(fallback),
     }))

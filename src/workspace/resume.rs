@@ -5,7 +5,7 @@ use gpui_kit::{
 };
 
 use super::*;
-use crate::agent::SavedSession;
+use crate::agent::{AgentKind, ResumeTarget, SavedSession};
 
 impl Tab {
     pub(crate) fn open_resume(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -43,7 +43,7 @@ impl Tab {
         &mut self,
         target: EntityId,
         request: u64,
-        path: PathBuf,
+        resume: ResumeTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -54,8 +54,17 @@ impl Tab {
                 .iter()
                 .any(|pane| pane.entity_id() == target && pane.read(cx).request == request)
         {
+            let kind = resume.kind();
             window.push_notification(Notification::info("Resuming chat…"), cx);
-            self.start_chat(target, ChatStart::Resume(path), None, window, cx);
+            self.start_chat(
+                target,
+                kind,
+                ChatStart::Resume(resume),
+                None,
+                true,
+                window,
+                cx,
+            );
         }
     }
 }
@@ -67,13 +76,30 @@ fn filter_sessions(sessions: &[SavedSession], query: &str) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter_map(|(index, session)| {
+            let agent = session.kind().name();
             let title = session.title.to_lowercase();
             words
                 .iter()
-                .all(|word| title.contains(word))
+                .all(|word| title.contains(word) || agent.contains(word))
                 .then_some(index)
         })
         .collect()
+}
+
+fn list_sessions_for_kind(kind: AgentKind, root: &Path) -> anyhow::Result<Vec<SavedSession>> {
+    match kind {
+        AgentKind::Pi => crate::pi::list_sessions(root),
+        AgentKind::Agy => crate::agy::list_sessions(root),
+        AgentKind::Codex => crate::codex::list_sessions(root),
+    }
+}
+
+fn is_missing_binary(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 struct ResumePicker {
@@ -84,9 +110,9 @@ struct ResumePicker {
     sessions: Vec<SavedSession>,
     matches: Vec<usize>,
     selected: usize,
-    loading: bool,
+    pending_scans: usize,
     error: Option<String>,
-    _scan: Task<()>,
+    _scans: Vec<Task<()>>,
 }
 
 impl ResumePicker {
@@ -105,21 +131,56 @@ impl ResumePicker {
             }
         })
         .detach();
-        let scan = cx.background_spawn(async move { crate::pi::list_sessions(&root) });
-        let task = cx.spawn(async move |this, cx| {
-            let result = scan.await;
-            let _ = this.update(cx, |this, cx| {
-                this.loading = false;
-                match result {
-                    Ok(sessions) => {
-                        this.sessions = sessions;
-                        this.filter(cx);
-                    }
-                    Err(error) => this.error = Some(format!("{error:#}")),
-                }
-                cx.notify();
-            });
-        });
+        let scans = AgentKind::ALL
+            .into_iter()
+            .map(|kind| {
+                let root = root.clone();
+                let scan = cx.background_spawn(async move { list_sessions_for_kind(kind, &root) });
+                cx.spawn(async move |this, cx| {
+                    let result = scan.await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.pending_scans = this.pending_scans.saturating_sub(1);
+                        match result {
+                            Ok(mut sessions) => {
+                                let previous = this
+                                    .matches
+                                    .get(this.selected)
+                                    .map(|&idx| this.sessions[idx].target.clone());
+                                this.sessions.append(&mut sessions);
+                                this.sessions.sort_by(|a, b| {
+                                    b.updated_at
+                                        .cmp(&a.updated_at)
+                                        .then_with(|| a.detail.cmp(&b.detail))
+                                });
+                                this.matches =
+                                    filter_sessions(&this.sessions, &this.input.read(cx).value());
+                                this.selected = previous
+                                    .and_then(|target| {
+                                        this.matches
+                                            .iter()
+                                            .position(|&idx| this.sessions[idx].target == target)
+                                    })
+                                    .unwrap_or(0);
+                                if !this.sessions.is_empty() {
+                                    this.error = None;
+                                }
+                            }
+                            Err(error) if is_missing_binary(&error) => {}
+                            Err(error) => {
+                                eprintln!(
+                                    "rockstar: could not list {} sessions: {error:#}",
+                                    kind.name()
+                                );
+                                if this.sessions.is_empty() && this.error.is_none() {
+                                    this.error = Some(format!("{error:#}"));
+                                }
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+            })
+            .collect();
         Self {
             owner,
             target,
@@ -128,9 +189,9 @@ impl ResumePicker {
             sessions: Vec::new(),
             matches: Vec::new(),
             selected: 0,
-            loading: true,
+            pending_scans: AgentKind::ALL.len(),
             error: None,
-            _scan: task,
+            _scans: scans,
         }
     }
 
@@ -151,19 +212,22 @@ impl ResumePicker {
         let Some(&index) = self.matches.get(index) else {
             return;
         };
-        let path = self.sessions[index].path.clone();
+        let resume = self.sessions[index].target.clone();
         cx.set_global(Mode::Normal);
         let _ = self.owner.update(cx, |owner, cx| {
-            owner.resume_from_picker(self.target, self.request, path, window, cx);
+            owner.resume_from_picker(self.target, self.request, resume, window, cx);
         });
     }
 }
 
 impl Render for ResumePicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let status = if self.loading {
+        let loading = self.pending_scans > 0 && self.sessions.is_empty();
+        let status = if loading {
             "Loading sessions…".into()
-        } else if let Some(error) = &self.error {
+        } else if self.sessions.is_empty()
+            && let Some(error) = &self.error
+        {
             format!("Could not load sessions: {error}")
         } else {
             format!(
@@ -197,7 +261,7 @@ impl Render for ResumePicker {
             .child(Input::new(&self.input).aria_label("Session query"))
             .child(div().text_color(cx.theme().muted_foreground).child(status))
             .when(
-                !self.loading && self.error.is_none() && self.matches.is_empty(),
+                !loading && self.error.is_none() && self.matches.is_empty(),
                 |this| {
                     this.child(if self.sessions.is_empty() {
                         "No saved sessions for this workspace"
@@ -214,6 +278,7 @@ impl Render for ResumePicker {
                     .take(10)
                     .map(|(index, candidate)| {
                         let session = &self.sessions[*candidate];
+                        let agent = session.kind().name();
                         let updated = session
                             .updated_at
                             .with_timezone(&chrono::Local)
@@ -222,7 +287,7 @@ impl Render for ResumePicker {
                         div()
                             .id(("resume-candidate", index))
                             .role(Role::ListBoxOption)
-                            .aria_label(format!("{} · {updated}", session.title))
+                            .aria_label(format!("{agent} · {} · {updated}", session.title))
                             .aria_selected(index == self.selected)
                             .px_2()
                             .py_1()
@@ -235,6 +300,7 @@ impl Render for ResumePicker {
                                 this.bg(cx.theme().accent)
                                     .text_color(cx.theme().accent_foreground)
                             })
+                            .child(div().flex_shrink_0().text_xs().child(agent))
                             .child(
                                 div()
                                     .flex_1()
@@ -249,13 +315,13 @@ impl Render for ResumePicker {
                     }),
             )
             .when_some(self.matches.get(self.selected), |this, index| {
-                // The file path distinguishes sessions with the same title/date.
+                // The session identifier distinguishes chats with the same title/date.
                 this.child(
                     div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .truncate()
-                        .child(self.sessions[*index].path.display().to_string()),
+                        .child(self.sessions[*index].detail.clone()),
                 )
             })
     }

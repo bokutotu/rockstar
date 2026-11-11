@@ -80,7 +80,19 @@ impl Pane {
         let chat = self
             .chats
             .entry(session.entity_id())
-            .or_insert_with(|| cx.new(|cx| ChatPane::new(session, root, window, cx)))
+            .or_insert_with(|| {
+                let mut label = session.read(cx).label();
+                cx.observe(&session, move |_, session, cx| {
+                    let next = session.read(cx).label();
+                    if next != label {
+                        label = next;
+                        cx.emit(PanelEvent::LayoutChanged);
+                        cx.notify();
+                    }
+                })
+                .detach();
+                cx.new(|cx| ChatPane::new(session, root, window, cx))
+            })
             .clone();
         self.content = PaneContent::Chat(chat);
         self.set_content_visible(true, cx);
@@ -350,7 +362,7 @@ impl Panel for Pane {
     fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match &self.content {
             PaneContent::Plain => "Plain".to_string(),
-            PaneContent::Chat(chat) => format!("Chat {}", chat.read(cx).session.read(cx).number),
+            PaneContent::Chat(chat) => chat.read(cx).session.read(cx).label(),
             PaneContent::Terminal(view) => view.read(cx).session.read(cx).label(),
             PaneContent::Diff(view) => view.read(cx).session.read(cx).label(),
             PaneContent::Media(view) => match &view.read(cx).session.read(cx).source {

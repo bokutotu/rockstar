@@ -86,7 +86,7 @@ impl Render for ChatPane {
         div()
             .id("chat")
             .role(Role::Group)
-            .aria_label(format!("Chat {}", self.session.read(cx).number))
+            .aria_label(self.session.read(cx).label())
             .track_focus(&self.focus)
             .on_mouse_down(
                 MouseButton::Left,

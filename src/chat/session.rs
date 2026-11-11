@@ -5,13 +5,14 @@ use gpui_kit::{
 };
 
 use crate::agent::{
-    AgentCommand, AgentError, AgentEvent, ContextUsage, DISCONNECTED_MESSAGE, Message, OpenedChat,
+    AgentCommand, AgentError, AgentEvent, AgentKind, ContextUsage, Message, OpenedChat,
 };
 
 /// A conversation and draft shared by every pane displaying this session.
 /// The single receiver lives here, not in a view: splitting must not distribute
 /// incoming events between competing consumers.
 pub(crate) struct ChatSession {
+    pub(crate) kind: AgentKind,
     pub(crate) number: usize,
     pub(super) messages: Vec<Message>,
     pub(super) draft: SharedString,
@@ -36,6 +37,7 @@ impl EventEmitter<ConversationChange> for ChatSession {}
 impl ChatSession {
     pub(crate) fn new(
         opened: OpenedChat,
+        kind: AgentKind,
         number: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -60,6 +62,7 @@ impl ChatSession {
             });
         });
         Self {
+            kind,
             number,
             messages,
             draft: "".into(),
@@ -71,15 +74,21 @@ impl ChatSession {
         }
     }
 
+    pub(crate) fn label(&self) -> String {
+        format!("{} {}", self.kind.label(), self.number)
+    }
+
     /// Keep this session's identity while replacing its conversation and connection.
     pub(crate) fn replace(
         &mut self,
         opened: OpenedChat,
+        kind: AgentKind,
+        number: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Dropping the old receiver task prevents late replies from entering the new chat.
-        *self = Self::new(opened, self.number, window, cx);
+        *self = Self::new(opened, kind, number, window, cx);
         cx.emit(ConversationChange::Reset(self.messages.clone()));
         cx.notify();
     }
@@ -87,7 +96,7 @@ impl ChatSession {
     pub(crate) fn cancel(&self) -> Result<(), AgentError> {
         self.commands
             .try_send(AgentCommand::Cancel)
-            .map_err(|_| anyhow::anyhow!(DISCONNECTED_MESSAGE))
+            .map_err(|_| anyhow::anyhow!(self.kind.disconnected_message()))
     }
 
     pub(super) fn set_draft(&mut self, draft: SharedString, cx: &mut Context<Self>) {

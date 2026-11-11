@@ -1,5 +1,5 @@
 use crate::{
-    agent::{AgentError, ChatStart, OpenedChat},
+    agent::{AgentError, AgentKind, ChatStart, OpenedChat},
     chat::ChatSession,
     diff::{DiffRequest, IndexAction, LocalFilter},
     file_browser::{self, FileTree, OpenFile},
@@ -43,7 +43,7 @@ pub(crate) use items::WipeMode;
 pub(crate) use window::WorkspaceWindow;
 
 pub(crate) type AgentConnector =
-    Arc<dyn Fn(&Path, ChatStart) -> Result<OpenedChat, AgentError> + Send + Sync>;
+    Arc<dyn Fn(AgentKind, &Path, ChatStart) -> Result<OpenedChat, AgentError> + Send + Sync>;
 
 /// One independent editing context inside a directory-scoped workspace.
 pub(crate) struct Tab {
@@ -165,7 +165,15 @@ impl Tab {
         .detach();
         cx.subscribe_in(&pane, window, |this, pane, event: &crate::diff::ReviewToPi, window, cx| {
             if this.visible && this.panes.get(this.active) == Some(&pane) {
-                this.start_chat(pane.entity_id(), ChatStart::New, Some(event.0.clone()), window, cx);
+                this.start_chat(
+                    pane.entity_id(),
+                    AgentKind::Pi,
+                    ChatStart::New,
+                    Some(event.0.clone()),
+                    true,
+                    window,
+                    cx,
+                );
             }
         }).detach();
         self.panes.push(pane.clone());
@@ -257,24 +265,71 @@ impl Tab {
         cx.notify();
     }
 
-    pub(crate) fn show_chat(&mut self, fresh: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if !fresh && self.panes[self.active].read(cx).session(cx).is_some() {
+    pub(crate) fn show_chat(
+        &mut self,
+        kind: AgentKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.panes[self.active]
+            .read(cx)
+            .session(cx)
+            .is_some_and(|session| session.read(cx).kind == kind)
+        {
             return;
         }
         self.start_chat(
             self.panes[self.active].entity_id(),
+            kind,
             ChatStart::New,
             None,
+            false,
             window,
             cx,
         );
     }
 
+    pub(crate) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let kind = self.panes[self.active]
+            .read(cx)
+            .session(cx)
+            .map(|session| session.read(cx).kind)
+            .unwrap_or(AgentKind::Pi);
+        self.start_chat(
+            self.panes[self.active].entity_id(),
+            kind,
+            ChatStart::New,
+            None,
+            true,
+            window,
+            cx,
+        );
+    }
+
+    fn next_chat_number(&self, kind: AgentKind, excluding: Option<EntityId>, cx: &App) -> usize {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                OpenItem::Chat(session)
+                    if Some(session.entity_id()) != excluding
+                        && session.read(cx).kind == kind =>
+                {
+                    Some(session.read(cx).number)
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+
     fn start_chat(
         &mut self,
         pane_id: EntityId,
+        kind: AgentKind,
         start: ChatStart,
         prompt: Option<String>,
+        replace_existing: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -287,14 +342,16 @@ impl Tab {
             return;
         };
         // A pending replacement must not keep a wiped session and its connection alive.
-        let session = pane.read(cx).session(cx).map(|session| session.downgrade());
+        let session = replace_existing
+            .then(|| pane.read(cx).session(cx).map(|session| session.downgrade()))
+            .flatten();
         let request = pane.update(cx, |pane, _| {
             pane.request += 1;
             pane.request
         });
         let root = self.root.clone();
         let connect = self.connect.clone();
-        let connecting = cx.background_spawn(async move { connect(&root, start) });
+        let connecting = cx.background_spawn(async move { connect(kind, &root, start) });
         cx.spawn_in(window, async move |this, cx| {
             let result = connecting.await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -308,30 +365,33 @@ impl Tab {
                 };
                 let result = result.and_then(|opened| {
                     if let Some(text) = prompt {
-                        opened.agent.command_sender().try_send(crate::agent::AgentCommand::Prompt(
-                            crate::agent::PromptRequest { text }
-                        )).map_err(|_| anyhow::anyhow!(crate::agent::DISCONNECTED_MESSAGE))?;
+                        opened
+                            .agent
+                            .command_sender()
+                            .try_send(crate::agent::AgentCommand::Prompt(
+                                crate::agent::PromptRequest { text },
+                            ))
+                            .map_err(|_| anyhow::anyhow!(kind.disconnected_message()))?;
                     }
                     Ok(opened)
                 });
                 match (result, session) {
                     (Ok(opened), Some(session)) => {
                         if let Some(session) = session.upgrade() {
-                            session.update(cx, |session, cx| session.replace(opened, window, cx));
+                            let number = if session.read(cx).kind == kind {
+                                session.read(cx).number
+                            } else {
+                                this.next_chat_number(kind, Some(session.entity_id()), cx)
+                            };
+                            session.update(cx, |session, cx| {
+                                session.replace(opened, kind, number, window, cx)
+                            });
                         }
                     }
                     (Ok(opened), None) => {
-                        let number = this
-                            .items
-                            .iter()
-                            .filter_map(|item| match item {
-                                OpenItem::Chat(session) => Some(session.read(cx).number),
-                                _ => None,
-                            })
-                            .max()
-                            .unwrap_or(0)
-                            + 1;
-                        let session = cx.new(|cx| ChatSession::new(opened, number, window, cx));
+                        let number = this.next_chat_number(kind, None, cx);
+                        let session =
+                            cx.new(|cx| ChatSession::new(opened, kind, number, window, cx));
                         let id = this.register_item(OpenItem::Chat(session), cx);
                         this.show_item(pane.entity_id(), id, window, cx);
                     }
