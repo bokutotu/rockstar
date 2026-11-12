@@ -116,6 +116,7 @@ impl Tab {
                             cx,
                         )
                     });
+                    self.equalize_splits(None, window, cx);
                     self.focus_active(window, cx);
                 }
             }
@@ -179,7 +180,6 @@ impl Tab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use gpui_kit::component::dock::{DockLayout, PaneNode, PaneRef};
         let Some(tree) = self.dock.read(cx).layout(DockPlacement::Center).cloned() else {
             return;
         };
@@ -276,10 +276,10 @@ impl Tab {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use gpui_kit::{
-            Axis,
-            component::dock::{PaneNode, PaneRef},
-        };
+        if key == "=" {
+            self.equalize_splits(None, window, cx);
+            return;
+        }
         let Some(tree) = self.dock.read(cx).layout(DockPlacement::Center).cloned() else {
             return;
         };
@@ -320,62 +320,55 @@ impl Tab {
             });
             (end.unwrap_or(240.) - start.unwrap_or(0.)).max(48.)
         };
-        let mut nodes = Vec::new();
+        let mut target_id = None;
         tree.root().walk(&mut |node| {
             if let PaneRef::Split {
                 axis: split_axis,
                 children,
                 ..
             } = node.kind()
+                && children.len() > 1
+                && split_axis == axis
+                && has_panel(node)
             {
-                if children.len() > 1 && (key == "=" || split_axis == axis && has_panel(node)) {
-                    nodes.push(node.id());
-                }
+                target_id = Some(node.id());
             }
         });
-        if key != "=" {
-            nodes = nodes.last().copied().into_iter().collect();
-        }
-        let mut changes = Vec::new();
-        for id in nodes {
-            let Some(node) = tree.find_node(id) else {
-                continue;
-            };
-            let PaneRef::Split { axis, children, .. } = node.kind() else {
-                continue;
-            };
-            let mut sizes: Vec<_> = children.iter().map(|child| size(child, axis)).collect();
-            let total: f32 = sizes.iter().sum();
-            if key == "=" {
-                sizes.fill(total / children.len() as f32);
-            } else if let Some(index) = children.iter().position(&has_panel) {
-                let unit = f32::from(cx.theme().mono_font_size)
-                    * if axis == Axis::Horizontal { 0.6 } else { 1.5 };
-                let desired = match key {
-                    "|" | "_" if !explicit => total,
-                    "|" | "_" => count as f32 * unit,
-                    "+" | ">" => sizes[index] + count as f32 * unit,
-                    _ => sizes[index] - count as f32 * unit,
-                }
-                .clamp(48., (total - 48. * (sizes.len() - 1) as f32).max(48.));
-                let rest = total - sizes[index];
-                for (i, size) in sizes.iter_mut().enumerate() {
-                    if i != index {
-                        *size = if rest > 0. {
-                            *size / rest * (total - desired)
-                        } else {
-                            48.
-                        };
-                    }
-                }
-                sizes[index] = desired;
+        let Some(id) = target_id else {
+            return;
+        };
+        let Some(node) = tree.find_node(id) else {
+            return;
+        };
+        let PaneRef::Split { axis, children, .. } = node.kind() else {
+            return;
+        };
+        let mut sizes: Vec<_> = children.iter().map(|child| size(child, axis)).collect();
+        let total: f32 = sizes.iter().sum();
+        if let Some(index) = children.iter().position(&has_panel) {
+            let unit = f32::from(cx.theme().mono_font_size)
+                * if axis == Axis::Horizontal { 0.6 } else { 1.5 };
+            let desired = match key {
+                "|" | "_" if !explicit => total,
+                "|" | "_" => count as f32 * unit,
+                "+" | ">" => sizes[index] + count as f32 * unit,
+                _ => sizes[index] - count as f32 * unit,
             }
-            changes.push((id, sizes.into_iter().map(px).collect()));
-        }
-        self.dock.update(cx, |dock, cx| {
-            for (id, sizes) in changes {
-                dock.set_split_sizes(id, sizes, window, cx);
+            .clamp(48., (total - 48. * (sizes.len() - 1) as f32).max(48.));
+            let rest = total - sizes[index];
+            for (i, size) in sizes.iter_mut().enumerate() {
+                if i != index {
+                    *size = if rest > 0. {
+                        *size / rest * (total - desired)
+                    } else {
+                        48.
+                    };
+                }
             }
-        });
+            sizes[index] = desired;
+        }
+        let sizes = sizes.into_iter().map(px).collect();
+        self.dock
+            .update(cx, |dock, cx| dock.set_split_sizes(id, sizes, window, cx));
     }
 }

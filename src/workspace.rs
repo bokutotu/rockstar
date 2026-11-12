@@ -8,7 +8,7 @@ use crate::{
     pane::{Pane, PaneActivated, PaneContent},
 };
 use gpui_kit::{
-    App, AppContext as _, Bounds, Context, Entity, EntityId, EventEmitter, Focusable as _,
+    App, AppContext as _, Axis, Bounds, Context, Entity, EntityId, EventEmitter, Focusable as _,
     InteractiveElement as _, IntoElement, Keystroke, ParentElement as _, Pixels, Render, Role,
     ScrollHandle, StatefulInteractiveElement as _, Styled as _, Window,
     base::Placement,
@@ -17,7 +17,10 @@ use gpui_kit::{
         ActiveTheme as _, WindowExt as _,
         button::Button,
         dialog::DialogEntrance,
-        dock::{DockArea, DockLayout, DockPlacement, InsertTarget, PanelId, panel_handle},
+        dock::{
+            DockArea, DockLayout, DockPlacement, InsertTarget, NodeId, PaneNode, PaneRef, PanelId,
+            panel_handle,
+        },
         notification::Notification,
     },
     div, outline,
@@ -219,10 +222,29 @@ impl Tab {
             anyhow::bail!("Cannot close the last pane.");
         }
         let pane = self.panes.remove(self.active);
+        let closed_axis = self
+            .dock
+            .read(cx)
+            .layout(DockPlacement::Center)
+            .and_then(|tree| {
+                let target = tree.find_panel_node(PanelId::from(pane.entity_id()))?;
+                let mut parent_axis = None;
+                tree.root().walk(&mut |node| {
+                    if let PaneRef::Split { axis, children, .. } = node.kind()
+                        && children.iter().any(|child| child.id() == target)
+                    {
+                        parent_axis = Some(axis);
+                    }
+                });
+                parent_axis
+            });
         pane.update(cx, |pane, cx| pane.set_content_visible(false, cx));
         self.active = self.active.min(self.panes.len() - 1);
         self.dock
             .update(cx, |dock, cx| dock.remove_panel(pane, window, cx));
+        if let Some(axis) = closed_axis {
+            self.equalize_splits(Some(axis), window, cx);
+        }
         self.focus_active(window, cx);
         cx.notify();
         Ok(())
@@ -258,11 +280,123 @@ impl Tab {
                 cx,
             );
         });
+        self.equalize_splits(Some(placement.axis()), window, cx);
         self.previous_pane = Some(self.panes[self.active].entity_id());
         self.active = self.panes.len() - 1;
         cx.set_global(Mode::Normal);
         self.focus_active(window, cx);
         cx.notify();
+    }
+
+    /// Match Neovim's `equalalways` sizing along `target_axis` (or both axes
+    /// when `None`), weighting each split slot by its subtree leaf span.
+    pub(super) fn equalize_splits(
+        &mut self,
+        target_axis: Option<Axis>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(tree), dock_size) = ({
+            let dock = self.dock.read(cx);
+            (
+                dock.layout(DockPlacement::Center).cloned(),
+                dock.bounds().size,
+            )
+        }) else {
+            return;
+        };
+        let viewport = window.viewport_size();
+        let root_width = if dock_size.width > px(0.) {
+            f32::from(dock_size.width)
+        } else {
+            f32::from(viewport.width).max(240.)
+        };
+        let root_height = if dock_size.height > px(0.) {
+            f32::from(dock_size.height)
+        } else {
+            f32::from(viewport.height).max(240.)
+        };
+
+        fn leaf_span(node: &PaneNode, target: Axis) -> usize {
+            match node.kind() {
+                PaneRef::Tabs { panels, .. } => usize::from(!panels.is_empty()),
+                PaneRef::Split { axis, children, .. } => {
+                    if axis == target {
+                        children.iter().map(|child| leaf_span(child, target)).sum()
+                    } else {
+                        children
+                            .iter()
+                            .map(|child| leaf_span(child, target))
+                            .max()
+                            .unwrap_or(0)
+                    }
+                }
+            }
+        }
+
+        fn collect(
+            node: &PaneNode,
+            width: f32,
+            height: f32,
+            target_axis: Option<Axis>,
+            changes: &mut Vec<(NodeId, Vec<Pixels>)>,
+        ) {
+            let PaneRef::Split { axis, children, .. } = node.kind() else {
+                return;
+            };
+            if children.is_empty() {
+                return;
+            }
+            if children.len() == 1 {
+                collect(&children[0], width, height, target_axis, changes);
+                return;
+            }
+            if target_axis.is_none_or(|target| target == axis) {
+                let total = if axis == Axis::Horizontal {
+                    width
+                } else {
+                    height
+                };
+                let spans: Vec<f32> = children
+                    .iter()
+                    .map(|child| leaf_span(child, axis).max(1) as f32)
+                    .collect();
+                let span_sum: f32 = spans.iter().sum();
+                let sizes: Vec<f32> = spans
+                    .iter()
+                    .map(|span| total * (*span / span_sum))
+                    .collect();
+                changes.push((node.id(), sizes.iter().copied().map(px).collect()));
+                for (child, size) in children.iter().zip(sizes) {
+                    let (child_w, child_h) = if axis == Axis::Horizontal {
+                        (size, height)
+                    } else {
+                        (width, size)
+                    };
+                    collect(child, child_w, child_h, target_axis, changes);
+                }
+            } else {
+                for child in children {
+                    collect(child, width, height, target_axis, changes);
+                }
+            }
+        }
+
+        let mut changes = Vec::new();
+        collect(
+            tree.root(),
+            root_width,
+            root_height,
+            target_axis,
+            &mut changes,
+        );
+        if !changes.is_empty() {
+            self.dock.update(cx, |dock, cx| {
+                for (id, sizes) in changes {
+                    dock.set_split_sizes(id, sizes, window, cx);
+                }
+            });
+        }
     }
 
     pub(crate) fn show_chat(
