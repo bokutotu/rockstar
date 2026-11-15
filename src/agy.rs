@@ -1,17 +1,20 @@
 use std::{
-    collections::VecDeque,
-    io::{BufRead, BufReader, Write},
-    path::Path,
+    collections::{HashMap, HashSet, VecDeque},
+    env,
+    fs::{self, File},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, anyhow, bail};
 use async_channel::{Receiver, RecvError, TryRecvError};
 use chrono::{DateTime, Utc};
-use futures_lite::future::{block_on, or};
+use futures_lite::future::{block_on, or, pending};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher as _};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -45,14 +48,19 @@ enum ServerReply {
     Error { code: i64, message: String },
 }
 
+const TRANSCRIPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const WAKEUP_STALL_TIMEOUT: Duration = Duration::from_secs(600);
+
 struct AgyAgent {
     child: Child,
     input: ChildStdin,
     frames: Receiver<Result<IncomingFrame, AgentError>>,
     next_request_id: u64,
     session_id: String,
+    brain_dir: Option<PathBuf>,
     queued: VecDeque<PromptRequest>,
     active: Option<ActivePrompt>,
+    transcript_watch: Option<TranscriptWatch>,
 }
 
 impl Drop for AgyAgent {
@@ -67,15 +75,19 @@ struct ActivePrompt {
     segment_text: String,
     assistant_open: bool,
     cancelled: bool,
+    response_received: bool,
+    follower: TranscriptFollower,
 }
 
 impl ActivePrompt {
-    fn new(request_id: u64) -> Self {
+    fn new(request_id: u64, follower: TranscriptFollower) -> Self {
         Self {
             request_id,
             segment_text: String::new(),
             assistant_open: false,
             cancelled: false,
+            response_received: false,
+            follower,
         }
     }
 }
@@ -83,6 +95,7 @@ impl ActivePrompt {
 enum Incoming {
     Command(Result<AgentCommand, RecvError>),
     Frame(Result<Result<IncomingFrame, AgentError>, RecvError>),
+    TranscriptTick,
     ResultsClosed,
 }
 
@@ -190,8 +203,10 @@ fn spawn_acp(cwd: &Path, stderr: Stdio) -> Result<AgyAgent, AgentError> {
         frames,
         next_request_id: 0,
         session_id: String::new(),
+        brain_dir: default_brain_dir(),
         queued: VecDeque::new(),
         active: None,
+        transcript_watch: None,
     })
 }
 
@@ -310,11 +325,7 @@ impl AgyAgent {
                     )
                     .await?
                 }
-                None => self
-                    .frames
-                    .recv()
-                    .await
-                    .context("agy disconnected")??,
+                None => self.frames.recv().await.context("agy disconnected")??,
             };
             match frame {
                 IncomingFrame::ServerRequest { id, method, params } => {
@@ -331,12 +342,11 @@ impl AgyAgent {
                         }
                         if backend.is_some()
                             && update["sessionUpdate"].as_str() == Some("usage_update")
-                            && let Some(session_id) = params.get("sessionId").and_then(Value::as_str)
+                            && let Some(session_id) =
+                                params.get("sessionId").and_then(Value::as_str)
                         {
-                            context_updates.push((
-                                session_id.to_owned(),
-                                decode_context_usage(update),
-                            ));
+                            context_updates
+                                .push((session_id.to_owned(), decode_context_usage(update)));
                         }
                     }
                 }
@@ -399,7 +409,15 @@ impl AgyAgent {
                         },
                         or(
                             async { Incoming::Command(backend.commands.recv().await) },
-                            async { Incoming::Frame(self.frames.recv().await) },
+                            or(async { Incoming::Frame(self.frames.recv().await) }, async {
+                                match &self.transcript_watch {
+                                    Some(watch) => {
+                                        let _ = watch.ticks.recv().await;
+                                        Incoming::TranscriptTick
+                                    }
+                                    None => pending().await,
+                                }
+                            }),
                         ),
                     )
                     .await
@@ -411,21 +429,68 @@ impl AgyAgent {
                     continue;
                 }
                 Incoming::Command(Ok(AgentCommand::Cancel)) => {
-                    let pending = self.queued.drain(..).map(|prompt| prompt.text).collect();
-                    agent::return_pending_prompts(backend, pending);
-                    if let Some(active) = &mut self.active
-                        && !active.cancelled
-                    {
-                        active.cancelled = true;
+                    let pending_prompts = self.queued.drain(..).map(|prompt| prompt.text).collect();
+                    agent::return_pending_prompts(backend, pending_prompts);
+                    if self.active.as_ref().is_some_and(|active| !active.cancelled) {
+                        let was_following = self
+                            .active
+                            .as_mut()
+                            .map(|active| {
+                                active.cancelled = true;
+                                active.response_received
+                            })
+                            .unwrap_or(false);
                         self.send_notification(
                             "session/cancel",
                             json!({ "sessionId": self.session_id }),
                         )?;
+                        if was_following {
+                            self.transcript_watch = None;
+                            self.active = None;
+                            if backend
+                                .events
+                                .try_send(AgentEvent::PromptCancelled)
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
                     }
                     continue;
                 }
                 Incoming::Command(Err(_)) => return Ok(()),
                 Incoming::Frame(result) => result.context("agy disconnected")??,
+                Incoming::TranscriptTick => {
+                    if let Some(active) = &mut self.active
+                        && active.response_received
+                    {
+                        for event in active.follower.poll() {
+                            if backend.events.try_send(event).is_err() {
+                                return Ok(());
+                            }
+                        }
+                        if !active.follower.should_keep_waiting() {
+                            self.transcript_watch = None;
+                            self.active = None;
+                            if backend.events.try_send(AgentEvent::PromptFinished).is_err() {
+                                return Ok(());
+                            }
+                        } else if active.follower.has_stalled(WAKEUP_STALL_TIMEOUT) {
+                            self.transcript_watch = None;
+                            self.active = None;
+                            if backend
+                                .events
+                                .try_send(AgentEvent::Error(anyhow!(
+                                    "agy stopped updating the conversation after a background task finished"
+                                )))
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    continue;
+                }
                 Incoming::ResultsClosed => return Ok(()),
             };
             match frame {
@@ -450,7 +515,9 @@ impl AgyAgent {
                         {
                             return Ok(());
                         }
-                    } else if let Some(active) = &mut self.active {
+                    } else if let Some(active) = &mut self.active
+                        && !active.response_received
+                    {
                         for event in active.handle_update(update) {
                             if backend.events.try_send(event).is_err() {
                                 return Ok(());
@@ -462,13 +529,19 @@ impl AgyAgent {
                     if self
                         .active
                         .as_ref()
-                        .is_some_and(|active| active.request_id == id)
+                        .is_some_and(|active| active.request_id == id && !active.response_received)
                     {
-                        let active = self.active.take().expect("checked active prompt");
-                        for event in active.finish(result) {
+                        let mut active = self.active.take().expect("checked active prompt");
+                        let (events, keep_following) = active.finish_rpc_turn(result);
+                        for event in events {
                             if backend.events.try_send(event).is_err() {
                                 return Ok(());
                             }
+                        }
+                        if keep_following {
+                            self.transcript_watch =
+                                Some(TranscriptWatch::new(active.follower.path()));
+                            self.active = Some(active);
                         }
                     }
                 }
@@ -482,6 +555,7 @@ impl AgyAgent {
         backend: &AgentBackend,
     ) -> Result<(), AgentError> {
         let id = self.next_id();
+        let follower = TranscriptFollower::new(&self.session_id, self.brain_dir.as_deref());
         let _ = backend
             .events
             .try_send(AgentEvent::UserMessage(prompt.text.clone()));
@@ -493,7 +567,7 @@ impl AgyAgent {
                 "prompt": [{ "type": "text", "text": prompt.text }],
             }),
         )?;
-        self.active = Some(ActivePrompt::new(id));
+        self.active = Some(ActivePrompt::new(id, follower));
         Ok(())
     }
 
@@ -605,7 +679,7 @@ impl ActivePrompt {
         events
     }
 
-    fn finish(mut self, result: Result<Value, String>) -> Vec<AgentEvent> {
+    fn finish_rpc_turn(&mut self, result: Result<Value, String>) -> (Vec<AgentEvent>, bool) {
         let mut events = Vec::new();
         self.flush_segment(&mut events);
         match result {
@@ -613,9 +687,15 @@ impl ActivePrompt {
                 let stop_reason = value.get("stopReason").and_then(Value::as_str);
                 if self.cancelled || stop_reason == Some("cancelled") {
                     events.push(AgentEvent::PromptCancelled);
-                } else {
-                    events.push(AgentEvent::PromptFinished);
+                    return (events, false);
                 }
+                let catchup_events = self.follower.poll();
+                if self.follower.should_keep_waiting() {
+                    self.response_received = true;
+                    events.extend(catchup_events);
+                    return (events, true);
+                }
+                events.push(AgentEvent::PromptFinished);
             }
             Err(error) => {
                 if self.cancelled {
@@ -625,8 +705,362 @@ impl ActivePrompt {
                 }
             }
         }
+        (events, false)
+    }
+}
+
+/// Signals when `transcript_full.jsonl` grows after `agy acp` closes its RPC
+/// turn early while background tasks or subagents are still running.
+struct TranscriptWatch {
+    ticks: Receiver<()>,
+    _stop: mpsc::Sender<()>,
+    _watcher: Option<RecommendedWatcher>,
+}
+
+impl TranscriptWatch {
+    fn new(transcript_path: Option<&Path>) -> Self {
+        let (tick_tx, ticks) = async_channel::bounded(1);
+        let (stop, stop_rx) = mpsc::channel();
+        let watcher = transcript_path.and_then(|path| {
+            let notify_tx = tick_tx.clone();
+            let mut watcher =
+                notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                    if res.is_ok() {
+                        let _ = notify_tx.try_send(());
+                    }
+                })
+                .ok()?;
+            let dir = path.ancestors().skip(1).find(|dir| dir.is_dir())?;
+            watcher.watch(dir, RecursiveMode::NonRecursive).ok()?;
+            Some(watcher)
+        });
+        let _ = thread::Builder::new()
+            .name("agy-transcript".into())
+            .spawn(move || {
+                while matches!(
+                    stop_rx.recv_timeout(TRANSCRIPT_POLL_INTERVAL),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    if tick_tx.is_closed() {
+                        break;
+                    }
+                    let _ = tick_tx.try_send(());
+                }
+            });
+        Self {
+            ticks,
+            _stop: stop,
+            _watcher: watcher,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum TimerCondition {
+    Never,
+    Any,
+    Sender(String),
+}
+
+struct PendingToolCall {
+    name: String,
+    is_daemon: bool,
+    timer_condition: TimerCondition,
+}
+
+struct TranscriptFollower {
+    session_id: String,
+    path: Option<PathBuf>,
+    byte_offset: u64,
+    last_step_index: Option<u64>,
+    seen_user_input: bool,
+    pending_tools: VecDeque<PendingToolCall>,
+    pending_tasks: HashMap<String, TimerCondition>,
+    pending_subagents: HashSet<String>,
+    awaiting_planner: bool,
+    following: bool,
+    last_progress: Instant,
+}
+
+impl TranscriptFollower {
+    fn new(session_id: &str, brain_dir: Option<&Path>) -> Self {
+        let path = brain_dir.map(|dir| {
+            dir.join(session_id)
+                .join(".system_generated/logs/transcript_full.jsonl")
+        });
+        let byte_offset = path
+            .as_deref()
+            .and_then(|p| fs::metadata(p).ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        Self {
+            session_id: session_id.to_owned(),
+            path,
+            byte_offset,
+            last_step_index: None,
+            seen_user_input: false,
+            pending_tools: VecDeque::new(),
+            pending_tasks: HashMap::new(),
+            pending_subagents: HashSet::new(),
+            awaiting_planner: false,
+            following: false,
+            last_progress: Instant::now(),
+        }
+    }
+
+    fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    fn has_background_work(&self) -> bool {
+        !self.pending_tasks.is_empty() || !self.pending_subagents.is_empty()
+    }
+
+    fn should_keep_waiting(&self) -> bool {
+        self.has_background_work() || (self.following && self.awaiting_planner)
+    }
+
+    fn has_stalled(&self, timeout: Duration) -> bool {
+        !self.has_background_work()
+            && self.following
+            && self.awaiting_planner
+            && self.last_progress.elapsed() >= timeout
+    }
+
+    fn poll(&mut self) -> Vec<AgentEvent> {
+        let Some(path) = self.path.clone() else {
+            return Vec::new();
+        };
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(_) => return Vec::new(),
+        };
+        let len = match file.metadata() {
+            Ok(meta) => meta.len(),
+            Err(_) => return Vec::new(),
+        };
+        let rewound = len < self.byte_offset;
+        if rewound {
+            self.byte_offset = 0;
+        }
+        if len == self.byte_offset {
+            return Vec::new();
+        }
+        if file.seek(SeekFrom::Start(self.byte_offset)).is_err() {
+            return Vec::new();
+        }
+        let mut bytes = Vec::new();
+        if file.read_to_end(&mut bytes).is_err() || bytes.is_empty() {
+            return Vec::new();
+        }
+        let Some(complete_len) = bytes.iter().rposition(|&b| b == b'\n').map(|i| i + 1) else {
+            return Vec::new();
+        };
+        self.byte_offset += complete_len as u64;
+        self.last_progress = Instant::now();
+
+        let mut events = Vec::new();
+        for raw_line in bytes[..complete_len].split(|&b| b == b'\n') {
+            if raw_line.is_empty() {
+                continue;
+            }
+            let Ok(step) = serde_json::from_slice::<Value>(raw_line) else {
+                continue;
+            };
+            if rewound
+                && let (Some(idx), Some(last)) = (
+                    step.get("step_index").and_then(Value::as_u64),
+                    self.last_step_index,
+                )
+                && idx <= last
+            {
+                continue;
+            }
+            if let Some(idx) = step.get("step_index").and_then(Value::as_u64) {
+                self.last_step_index = Some(idx);
+            }
+            self.apply_step(&step, &mut events);
+        }
         events
     }
+
+    fn apply_step(&mut self, step: &Value, events: &mut Vec<AgentEvent>) {
+        let step_type = step.get("type").and_then(Value::as_str).unwrap_or("");
+        if !self.seen_user_input {
+            if step_type == "USER_INPUT" {
+                self.seen_user_input = true;
+                self.awaiting_planner = true;
+            }
+            return;
+        }
+
+        let source = step.get("source").and_then(Value::as_str).unwrap_or("");
+        let status = step.get("status").and_then(Value::as_str).unwrap_or("");
+        let content = step.get("content").and_then(Value::as_str).unwrap_or("");
+
+        match step_type {
+            "USER_INPUT" => {
+                self.awaiting_planner = true;
+            }
+            "PLANNER_RESPONSE" => {
+                self.pending_tools.clear();
+                let tool_calls = step
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+
+                if self.following && status == "DONE" && !content.is_empty() {
+                    events.push(AgentEvent::AssistantFinished(content.to_owned()));
+                }
+
+                for call in tool_calls {
+                    let name = call.get("name").and_then(Value::as_str).unwrap_or("tool");
+                    let args = call.get("args").unwrap_or(&Value::Null);
+                    let is_daemon = args
+                        .get("IsDaemon")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let timer_condition = match args.get("TimerCondition").and_then(Value::as_str) {
+                        None | Some("" | "never") => TimerCondition::Never,
+                        Some("any") => TimerCondition::Any,
+                        Some(sender) => TimerCondition::Sender(sender.to_owned()),
+                    };
+                    self.pending_tools.push_back(PendingToolCall {
+                        name: name.to_owned(),
+                        is_daemon,
+                        timer_condition,
+                    });
+                    if name == "manage_subagents" {
+                        match args.get("Action").and_then(Value::as_str) {
+                            Some("kill_all") => self.pending_subagents.clear(),
+                            Some("kill") => {
+                                if let Some(ids) =
+                                    args.get("ConversationIds").and_then(Value::as_array)
+                                {
+                                    for id in ids.iter().filter_map(Value::as_str) {
+                                        self.pending_subagents.remove(id);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if self.following {
+                        events.push(AgentEvent::ToolActivity(tool_activity(name, args)));
+                    }
+                }
+
+                self.awaiting_planner = !tool_calls.is_empty();
+                if !self.following && !self.awaiting_planner && self.has_background_work() {
+                    self.following = true;
+                }
+            }
+            "SYSTEM_MESSAGE" => {
+                if let Some((sender, body)) = parse_system_message(content) {
+                    self.pending_tasks.retain(|_, cond| match cond {
+                        TimerCondition::Never => true,
+                        TimerCondition::Any => false,
+                        TimerCondition::Sender(target) => target != sender,
+                    });
+                    if !body.starts_with("The command output has stabilized") {
+                        self.pending_tasks.remove(sender);
+                    }
+                    self.pending_subagents.remove(sender);
+                }
+                self.awaiting_planner = true;
+            }
+            "ERROR_MESSAGE" => {
+                self.awaiting_planner = true;
+            }
+            _ if source == "MODEL" => {
+                let (tool_name, is_daemon, timer_condition) = match self.pending_tools.pop_front() {
+                    Some(meta) => (meta.name, meta.is_daemon, meta.timer_condition),
+                    None => (String::new(), false, TimerCondition::Never),
+                };
+
+                if status == "RUNNING"
+                    && !is_daemon
+                    && let Some(task_id) = extract_running_task_id(content, &self.session_id)
+                {
+                    self.pending_tasks.insert(task_id, timer_condition);
+                }
+                if tool_name == "invoke_subagent"
+                    && status == "DONE"
+                    && let Some(sub_id) = extract_subagent_id(content)
+                {
+                    self.pending_subagents.insert(sub_id);
+                }
+                if tool_name == "manage_task" {
+                    if content.contains("No background tasks are currently running.") {
+                        self.pending_tasks.clear();
+                    }
+                    if let Some(task_id) = extract_cancelled_task_id(content) {
+                        self.pending_tasks.remove(task_id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn default_brain_dir() -> Option<PathBuf> {
+    Some(env::home_dir()?.join(".gemini/antigravity-cli/brain"))
+}
+
+fn extract_running_task_id(content: &str, session_id: &str) -> Option<String> {
+    for line in content.lines().take(4) {
+        if let Some(rest) = line.strip_prefix("Tool is running as a background task with task id: ")
+        {
+            let task_id = rest.trim();
+            if task_id.starts_with(session_id)
+                && task_id.as_bytes().get(session_id.len()) == Some(&b'/')
+            {
+                return Some(task_id.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn extract_subagent_id(content: &str) -> Option<String> {
+    let (_, rest) = content.split_once("Created the following subagent:\n")?;
+    let payload = serde_json::Deserializer::from_str(rest.trim_start())
+        .into_iter::<Value>()
+        .next()?
+        .ok()?;
+    payload
+        .get("conversationId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+fn extract_cancelled_task_id(content: &str) -> Option<&str> {
+    if let Some((_, rest)) = content.split_once("Task \"")
+        && let Some((task_id, _)) = rest.split_once("\" cancelled.")
+    {
+        return Some(task_id);
+    }
+    if let Some((_, rest)) = content.split_once("cannot kill task \"")
+        && let Some((task_id, _)) = rest.split_once("\": task is not running")
+    {
+        return Some(task_id);
+    }
+    None
+}
+
+fn parse_system_message(content: &str) -> Option<(&str, &str)> {
+    let (_, rest) = content.split_once("[Message] timestamp=")?;
+    let (_, rest) = rest.split_once(" sender=")?;
+    let (sender, rest) = rest.split_once(" priority=")?;
+    let (_, body) = rest.split_once(" content=")?;
+    let body = body
+        .strip_suffix("</SYSTEM_MESSAGE>")
+        .unwrap_or(body)
+        .trim();
+    (!sender.is_empty()).then_some((sender, body))
 }
 
 #[derive(Default)]
@@ -777,6 +1211,9 @@ fn tool_activity(name: &str, args: &Value) -> String {
             .or_else(|| args.get("SearchPath")),
         "search_web" => args.get("query"),
         "read_url_content" => args.get("Url").or_else(|| args.get("url")),
+        "invoke_subagent" => args.get("Role").or_else(|| args.get("TypeName")),
+        "schedule" => args.get("Prompt"),
+        "run_workflow" => args.get("Description"),
         _ => None,
     }
     .and_then(Value::as_str)
