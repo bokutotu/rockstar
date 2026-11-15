@@ -98,6 +98,7 @@ fn run_gui(
     mut startup: UnixStream,
 ) -> anyhow::Result<()> {
     let requests = server.requests()?;
+    syntax::init().context("Cannot initialize syntax highlighting")?;
 
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
