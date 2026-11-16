@@ -4,6 +4,7 @@ mod app;
 mod chat;
 mod codex;
 mod command_palette;
+mod devshell;
 mod diff;
 mod file_browser;
 mod file_buffer;
@@ -43,11 +44,17 @@ use launch::{LaunchMode, StartupStatus};
 
 const USAGE: &str = "Usage: rockstar\n\nOpen the current directory in Rockstar's single window, reusing its workspace if already open. Return after startup; Rockstar keeps running when the terminal closes. Use :wsnew <directory> for another workspace, :tabnew for a tab, :pi / :agy / :codex for agents, :resume for saved chats, :term for a terminal, or \\ff to open files.";
 
-fn connect_agent(kind: AgentKind, cwd: &Path, start: ChatStart) -> Result<OpenedChat, AgentError> {
+fn connect_agent(
+    kind: AgentKind,
+    cwd: &Path,
+    devshell: &devshell::WorkspaceEnv,
+    start: ChatStart,
+) -> Result<OpenedChat, AgentError> {
+    let env = devshell.resolve();
     match kind {
-        AgentKind::Pi => pi::connect(cwd, start),
-        AgentKind::Agy => agy::connect(cwd, start),
-        AgentKind::Codex => codex::connect(cwd, start),
+        AgentKind::Pi => pi::connect(cwd, &env, start),
+        AgentKind::Agy => agy::connect(cwd, &env, start),
+        AgentKind::Codex => codex::connect(cwd, &env, start),
     }
 }
 

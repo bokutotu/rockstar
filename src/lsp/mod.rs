@@ -320,12 +320,18 @@ fn null_array(value: Value) -> Value {
 
 pub(crate) struct LspWorkspace {
     root: PathBuf,
+    devshell: Arc<crate::devshell::WorkspaceEnv>,
     sessions: HashMap<ServerKind, Arc<ServerSession>>,
     documents: HashMap<Uri, Entity<DocumentBinding>>,
     events: async_channel::Sender<transport::Event>,
 }
 impl LspWorkspace {
-    pub fn new(root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        root: PathBuf,
+        devshell: Arc<crate::devshell::WorkspaceEnv>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let (events, rx) = async_channel::unbounded();
         cx.on_app_quit(|this, _| {
             let stopped = this
@@ -353,6 +359,7 @@ impl LspWorkspace {
         .detach();
         Self {
             root,
+            devshell,
             sessions: HashMap::new(),
             documents: HashMap::new(),
             events,
@@ -371,12 +378,24 @@ impl LspWorkspace {
         if let Some(doc) = self.documents.get(&uri) {
             return Ok(Some(doc.clone()));
         }
+        if self.sessions.get(&kind).is_some_and(|session| {
+            matches!(session.state(), ServerState::Failed(_))
+                && self.devshell.should_retry_consumer()
+        }) {
+            self.sessions.remove(&kind);
+        }
         let session = self
             .sessions
             .entry(kind)
             .or_insert_with(|| {
                 let command = CommandSpec::from(kind);
-                ServerSession::start(kind, self.root.clone(), command, self.events.clone())
+                ServerSession::start(
+                    kind,
+                    self.root.clone(),
+                    self.devshell.clone(),
+                    command,
+                    self.events.clone(),
+                )
             })
             .clone();
         let binding =

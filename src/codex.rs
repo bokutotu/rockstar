@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     io::{BufRead, BufReader, Write},
     path::Path,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Stdio},
     sync::mpsc,
     thread,
     time::Duration,
@@ -110,7 +110,11 @@ enum Incoming {
     ResultsClosed,
 }
 
-pub(crate) fn connect(cwd: &Path, start: ChatStart) -> Result<OpenedChat, AgentError> {
+pub(crate) fn connect(
+    cwd: &Path,
+    env: &crate::devshell::ResolutionOutcome,
+    start: ChatStart,
+) -> Result<OpenedChat, AgentError> {
     let canonical_cwd = cwd
         .canonicalize()
         .context("Cannot resolve the workspace directory")?;
@@ -120,7 +124,7 @@ pub(crate) fn connect(cwd: &Path, start: ChatStart) -> Result<OpenedChat, AgentE
         ChatStart::Resume(_) => bail!("Selected session does not belong to codex"),
     };
 
-    let mut codex = spawn_app_server(&canonical_cwd, Stdio::inherit())?;
+    let mut codex = spawn_app_server(&canonical_cwd, env, Stdio::inherit())?;
     let (agent, backend) = agent::channel();
     let (ready, initialized) = mpsc::channel();
     thread::Builder::new()
@@ -145,11 +149,14 @@ pub(crate) fn connect(cwd: &Path, start: ChatStart) -> Result<OpenedChat, AgentE
     Ok(OpenedChat { agent, messages })
 }
 
-pub(crate) fn list_sessions(root: &Path) -> Result<Vec<SavedSession>, AgentError> {
+pub(crate) fn list_sessions(
+    root: &Path,
+    env: &crate::devshell::ResolutionOutcome,
+) -> Result<Vec<SavedSession>, AgentError> {
     let root = root
         .canonicalize()
         .context("Cannot resolve the workspace directory")?;
-    let mut codex = spawn_app_server(&root, Stdio::null())?;
+    let mut codex = spawn_app_server(&root, env, Stdio::null())?;
     let (done_tx, done_rx) = mpsc::channel();
     let root_for_rpc = root.clone();
     thread::Builder::new()
@@ -180,8 +187,12 @@ pub(crate) fn list_sessions(root: &Path) -> Result<Vec<SavedSession>, AgentError
         .context("Timed out while listing codex sessions")?
 }
 
-fn spawn_app_server(cwd: &Path, stderr: Stdio) -> Result<CodexAgent, AgentError> {
-    let mut command = Command::new("codex");
+fn spawn_app_server(
+    cwd: &Path,
+    env: &crate::devshell::ResolutionOutcome,
+    stderr: Stdio,
+) -> Result<CodexAgent, AgentError> {
+    let mut command = env.command("codex");
     command
         .args(["app-server", "--listen", "stdio://"])
         .current_dir(cwd)
@@ -385,9 +396,8 @@ impl CodexAgent {
                 IncomingFrame::Response { id, result } if id == expected_id => {
                     let response = result.map_err(|error| anyhow!("{error}"))?;
                     if let Some(backend) = backend {
-                        let thread_id = response["thread"]["id"]
-                            .as_str()
-                            .unwrap_or(&self.thread_id);
+                        let thread_id =
+                            response["thread"]["id"].as_str().unwrap_or(&self.thread_id);
                         for (params, event) in context_events {
                             if !thread_id.is_empty()
                                 && notification_matches_thread(&params, thread_id)
@@ -901,7 +911,12 @@ fn messages_from_turns(turns: &Value) -> Vec<Message> {
         .as_array()
         .into_iter()
         .flatten()
-        .flat_map(|turn| turn.get("items").and_then(Value::as_array).into_iter().flatten())
+        .flat_map(|turn| {
+            turn.get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
         .filter_map(item_to_message)
         .collect()
 }

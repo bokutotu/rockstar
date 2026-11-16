@@ -45,12 +45,21 @@ use items::OpenItem;
 pub(crate) use items::WipeMode;
 pub(crate) use window::WorkspaceWindow;
 
-pub(crate) type AgentConnector =
-    Arc<dyn Fn(AgentKind, &Path, ChatStart) -> Result<OpenedChat, AgentError> + Send + Sync>;
+pub(crate) type AgentConnector = Arc<
+    dyn Fn(
+            AgentKind,
+            &Path,
+            &crate::devshell::WorkspaceEnv,
+            ChatStart,
+        ) -> Result<OpenedChat, AgentError>
+        + Send
+        + Sync,
+>;
 
 /// One independent editing context inside a directory-scoped workspace.
 pub(crate) struct Tab {
     root: PathBuf,
+    devshell: Arc<crate::devshell::WorkspaceEnv>,
     visible: bool,
     watches: Entity<crate::file_watch::FileWatches>,
     lsp: Entity<crate::lsp::LspWorkspace>,
@@ -81,6 +90,7 @@ impl EventEmitter<TabAction> for Tab {}
 impl Tab {
     pub(crate) fn new(
         root: PathBuf,
+        devshell: Arc<crate::devshell::WorkspaceEnv>,
         connect: AgentConnector,
         watches: Entity<crate::file_watch::FileWatches>,
         vim: Entity<crate::file_view::VimSharedState>,
@@ -94,9 +104,11 @@ impl Tab {
         })
         .detach();
         let dock = dock::new(window, cx);
-        let lsp = cx.new(|cx| crate::lsp::LspWorkspace::new(root.clone(), window, cx));
+        let lsp =
+            cx.new(|cx| crate::lsp::LspWorkspace::new(root.clone(), devshell.clone(), window, cx));
         let mut workspace = Self {
             root,
+            devshell,
             visible: false,
             watches,
             lsp,
@@ -166,19 +178,24 @@ impl Tab {
             },
         )
         .detach();
-        cx.subscribe_in(&pane, window, |this, pane, event: &crate::diff::ReviewToPi, window, cx| {
-            if this.visible && this.panes.get(this.active) == Some(&pane) {
-                this.start_chat(
-                    pane.entity_id(),
-                    AgentKind::Pi,
-                    ChatStart::New,
-                    Some(event.0.clone()),
-                    true,
-                    window,
-                    cx,
-                );
-            }
-        }).detach();
+        cx.subscribe_in(
+            &pane,
+            window,
+            |this, pane, event: &crate::diff::ReviewToPi, window, cx| {
+                if this.visible && this.panes.get(this.active) == Some(&pane) {
+                    this.start_chat(
+                        pane.entity_id(),
+                        AgentKind::Pi,
+                        ChatStart::New,
+                        Some(event.0.clone()),
+                        true,
+                        window,
+                        cx,
+                    );
+                }
+            },
+        )
+        .detach();
         self.panes.push(pane.clone());
         pane
     }
@@ -445,8 +462,7 @@ impl Tab {
             .iter()
             .filter_map(|item| match item {
                 OpenItem::Chat(session)
-                    if Some(session.entity_id()) != excluding
-                        && session.read(cx).kind == kind =>
+                    if Some(session.entity_id()) != excluding && session.read(cx).kind == kind =>
                 {
                     Some(session.read(cx).number)
                 }
@@ -484,8 +500,9 @@ impl Tab {
             pane.request
         });
         let root = self.root.clone();
+        let devshell = self.devshell.clone();
         let connect = self.connect.clone();
-        let connecting = cx.background_spawn(async move { connect(kind, &root, start) });
+        let connecting = cx.background_spawn(async move { connect(kind, &root, &devshell, start) });
         cx.spawn_in(window, async move |this, cx| {
             let result = connecting.await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -529,10 +546,9 @@ impl Tab {
                         let id = this.register_item(OpenItem::Chat(session), cx);
                         this.show_item(pane.entity_id(), id, window, cx);
                     }
-                    (Err(error), _) => window.push_notification(
-                        Notification::error(format!("{error:#}")),
-                        cx,
-                    ),
+                    (Err(error), _) => {
+                        window.push_notification(Notification::error(format!("{error:#}")), cx)
+                    }
                 }
             });
         })
@@ -667,10 +683,7 @@ impl Tab {
                     }
                     Err(error) => {
                         this.vim.update(cx, |vim, _| vim.macros.stop());
-                        window.push_notification(
-                            Notification::error(format!("{error:#}")),
-                            cx,
-                        );
+                        window.push_notification(Notification::error(format!("{error:#}")), cx);
                     }
                 }
             });
@@ -689,8 +702,14 @@ impl Tab {
         view.update(cx, |view, cx| view.update_index(action, cx))
     }
 
-    pub(crate) fn toggle_markdown(&self, window: &mut Window, cx: &mut Context<Self>) -> anyhow::Result<()> {
-        let file = self.panes[self.active].read(cx).file()
+    pub(crate) fn toggle_markdown(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let file = self.panes[self.active]
+            .read(cx)
+            .file()
             .ok_or_else(|| anyhow::anyhow!("Select a Markdown file first"))?;
         file.update(cx, |file, cx| file.toggle_markdown(window, cx))
     }
@@ -789,10 +808,7 @@ impl Tab {
             if let Some(session) = session {
                 self.pending.clear();
                 if let Err(error) = session.read(cx).cancel() {
-                    window.push_notification(
-                        Notification::error(error.to_string()),
-                        cx,
-                    );
+                    window.push_notification(Notification::error(error.to_string()), cx);
                 }
                 return true;
             }
@@ -819,7 +835,9 @@ impl Tab {
         if mode == Mode::Normal
             && key.modifiers.control
             && key.key == "b"
-            && !key.modifiers.shift && !key.modifiers.alt && !key.modifiers.platform
+            && !key.modifiers.shift
+            && !key.modifiers.alt
+            && !key.modifiers.platform
             && ((file.is_none() && diff.is_none() && terminal.is_none())
                 || self.focused_target(window, cx) == Some(FocusTarget::FileTree))
         {
@@ -859,7 +877,8 @@ impl Tab {
             if self.pending == "y" && k != "y" {
                 self.pending.clear();
             }
-            let scroll_edges = !tree_focused && self.panes[self.active].read(cx).has_scroll_edges(cx);
+            let scroll_edges =
+                !tree_focused && self.panes[self.active].read(cx).has_scroll_edges(cx);
             let bottom = k == "G" || (k == "g" && key.modifiers.shift);
             if self.pending == "g" {
                 self.pending.clear();

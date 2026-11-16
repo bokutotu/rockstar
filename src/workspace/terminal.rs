@@ -2,7 +2,12 @@ use super::*;
 use crate::terminal::{TerminalKind, TerminalSession};
 
 impl Tab {
-    pub(crate) fn show_terminal(&mut self, kind: TerminalKind, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn show_terminal(
+        &mut self,
+        kind: TerminalKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(view) = self.panes[self.active].read(cx).terminal()
             && view.read(cx).session.read(cx).kind == kind
         {
@@ -17,8 +22,12 @@ impl Tab {
             pane.request
         });
         let root = self.root.clone();
-        let command = kind.command();
-        let starting = cx.background_spawn(async move { TerminalSession::spawn(&root, command) });
+        let devshell = self.devshell.clone();
+        let starting = cx.background_spawn(async move {
+            let mut command = kind.command();
+            devshell.resolve().apply_pty(&mut command);
+            TerminalSession::spawn(&root, command)
+        });
         cx.spawn_in(window, async move |this, cx| {
             let result = starting.await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -49,15 +58,17 @@ impl Tab {
                         this.show_item(pane_id, id, window, cx);
                         // A background completion must not steal focus from a
                         // different pane, the finder, or another command.
-                        if this.visible && this.panes[this.active] == pane && *cx.global::<Mode>() == Mode::Normal {
+                        if this.visible
+                            && this.panes[this.active] == pane
+                            && *cx.global::<Mode>() == Mode::Normal
+                        {
                             cx.set_global(Mode::Insert);
                             this.focus_active(window, cx);
                         }
                     }
-                    Err(error) => window.push_notification(
-                        Notification::error(format!("{error:#}")),
-                        cx,
-                    ),
+                    Err(error) => {
+                        window.push_notification(Notification::error(format!("{error:#}")), cx)
+                    }
                 }
             });
         })

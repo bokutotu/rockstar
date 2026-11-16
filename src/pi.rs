@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     io::{BufRead, BufReader, Write},
     path::Path,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Stdio},
     sync::mpsc,
     thread,
     time::Duration,
@@ -300,8 +300,12 @@ enum Incoming {
     ResultsClosed,
 }
 
-pub(crate) fn connect(cwd: &Path, start: ChatStart) -> Result<OpenedChat, AgentError> {
-    let mut command = Command::new("pi");
+pub(crate) fn connect(
+    cwd: &Path,
+    env: &crate::devshell::ResolutionOutcome,
+    start: ChatStart,
+) -> Result<OpenedChat, AgentError> {
+    let mut command = env.command("pi");
     command
         .args(["--mode", "rpc"])
         .current_dir(cwd)

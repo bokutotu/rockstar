@@ -6,6 +6,7 @@ use crate::{diff::DiffWatches, file_watch::FileWatches};
 struct Workspace {
     id: EntityId,
     root: PathBuf,
+    devshell: Arc<crate::devshell::WorkspaceEnv>,
     tabs: Vec<Entity<Tab>>,
     active: usize,
 }
@@ -42,6 +43,13 @@ impl WorkspaceWindow {
             this.schedule_replay(window, cx)
         })
         .detach();
+        cx.on_app_quit(|this, _| {
+            for workspace in &this.workspaces {
+                workspace.devshell.cancel();
+            }
+            async {}
+        })
+        .detach();
         let mut this = Self {
             workspaces: Vec::new(),
             active: 0,
@@ -53,26 +61,56 @@ impl WorkspaceWindow {
             replay_task: None,
         };
         let root = root.canonicalize().unwrap_or(root);
-        let tab = this.create_tab(root.clone(), window, cx);
+        let devshell = crate::devshell::WorkspaceEnv::new(root.clone());
+        let tab = this.create_tab(root.clone(), devshell.clone(), window, cx);
+        let id = tab.entity_id();
         tab.update(cx, |tab, _| tab.visible = true);
         this.workspaces.push(Workspace {
-            id: tab.entity_id(),
-            root,
+            id,
+            root: root.clone(),
+            devshell: devshell.clone(),
             tabs: vec![tab],
             active: 0,
         });
+        this.warmup_devshell(id, root, devshell, window, cx);
         this
+    }
+
+    fn warmup_devshell(
+        &self,
+        workspace_id: EntityId,
+        root: PathBuf,
+        devshell: Arc<crate::devshell::WorkspaceEnv>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let resolving = cx.background_spawn(async move { devshell.resolve() });
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = resolving.await;
+            let Some(error) = outcome.failure() else {
+                return;
+            };
+            let message = format!("nix develop ({}): {error}", root.display());
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.workspaces.iter().any(|w| w.id == workspace_id) {
+                    window.push_notification(Notification::error(message), cx);
+                }
+            });
+        })
+        .detach();
     }
 
     fn create_tab(
         &self,
         root: PathBuf,
+        devshell: Arc<crate::devshell::WorkspaceEnv>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<Tab> {
         let tab = cx.new(|cx| {
             Tab::new(
                 root,
+                devshell,
                 self.connect.clone(),
                 self.watches.clone(),
                 self.vim.clone(),
@@ -401,14 +439,18 @@ impl WorkspaceWindow {
         if let Some(index) = existing {
             self.active = index;
         } else {
-            let tab = self.create_tab(root.clone(), window, cx);
+            let devshell = crate::devshell::WorkspaceEnv::new(root.clone());
+            let tab = self.create_tab(root.clone(), devshell.clone(), window, cx);
+            let id = tab.entity_id();
             self.workspaces.push(Workspace {
-                id: tab.entity_id(),
-                root,
+                id,
+                root: root.clone(),
+                devshell: devshell.clone(),
                 tabs: vec![tab],
                 active: 0,
             });
             self.active = self.workspaces.len() - 1;
+            self.warmup_devshell(id, root, devshell, window, cx);
         }
         self.enter_tab(window, cx);
         Ok(())
@@ -416,7 +458,12 @@ impl WorkspaceWindow {
 
     pub(crate) fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.leave_tab(cx);
-        let tab = self.create_tab(self.workspaces[self.active].root.clone(), window, cx);
+        let tab = self.create_tab(
+            self.workspaces[self.active].root.clone(),
+            self.workspaces[self.active].devshell.clone(),
+            window,
+            cx,
+        );
         let workspace = &mut self.workspaces[self.active];
         workspace.tabs.push(tab);
         workspace.active = workspace.tabs.len() - 1;
@@ -458,10 +505,8 @@ impl WorkspaceWindow {
                 let (snapshot, target) = match result {
                     Ok(loaded) => loaded,
                     Err(error) => {
-                        window.push_notification(
-                            Notification::error(format!("Diff: {error:#}")),
-                            cx,
-                        );
+                        window
+                            .push_notification(Notification::error(format!("Diff: {error:#}")), cx);
                         return;
                     }
                 };
@@ -472,7 +517,12 @@ impl WorkspaceWindow {
                 if activate {
                     this.leave_tab(cx);
                 }
-                let tab = this.create_tab(this.workspaces[index].root.clone(), window, cx);
+                let tab = this.create_tab(
+                    this.workspaces[index].root.clone(),
+                    this.workspaces[index].devshell.clone(),
+                    window,
+                    cx,
+                );
                 tab.update(cx, |tab, cx| {
                     let session = cx.new(|_| crate::diff::DiffSession::new(snapshot));
                     this.diff_watches
@@ -488,7 +538,8 @@ impl WorkspaceWindow {
                     // Do not disturb maximized/fullscreen windows, nor resize
                     // for a diff that completed in a background workspace.
                     if let gpui_kit::WindowBounds::Windowed(bounds) = window.window_bounds() {
-                        let available = window.display(cx)
+                        let available = window
+                            .display(cx)
                             .map_or(bounds.size, |display| display.bounds().size);
                         let size = crate::diff::opening_size(bounds.size, available);
                         if size != bounds.size {
@@ -622,18 +673,22 @@ impl WorkspaceWindow {
         {
             anyhow::bail!("Saving files. Please wait before closing.");
         }
-        if self.target_tabs(target).iter().any(|tab| tab.read(cx).items.iter().any(|item| {
-            matches!(item, OpenItem::Diff(session) if session.read(cx).review_pending())
-        })) {
+        if self.target_tabs(target).iter().any(|tab| {
+            tab.read(cx).items.iter().any(
+                |item| matches!(item, OpenItem::Diff(session) if session.read(cx).review_pending()),
+            )
+        }) {
             anyhow::bail!("A review is being submitted. Please wait before closing.");
         }
         Ok(())
     }
 
     fn has_review_drafts(&self, target: CloseTarget, cx: &App) -> bool {
-        self.target_tabs(target).iter().any(|tab| tab.read(cx).items.iter().any(|item| {
+        self.target_tabs(target).iter().any(|tab| {
+            tab.read(cx).items.iter().any(|item| {
             matches!(item, OpenItem::Diff(session) if session.read(cx).has_review_draft())
-        }))
+        })
+        })
     }
 
     pub(crate) fn request_close_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -698,9 +753,11 @@ impl WorkspaceWindow {
                         OpenItem::File(buffer) if buffer.read(cx).dirty() => {
                             details.push(format!("Unsaved: {}", item.label(&workspace.root, cx)))
                         }
-                        OpenItem::Diff(session) if session.read(cx).has_review_draft() => {
-                            details.push(format!("Unsubmitted review: {}", item.label(&workspace.root, cx)))
-                        }
+                        OpenItem::Diff(session) if session.read(cx).has_review_draft() => details
+                            .push(format!(
+                                "Unsubmitted review: {}",
+                                item.label(&workspace.root, cx)
+                            )),
                         OpenItem::Chat(_) | OpenItem::Terminal(_) | OpenItem::Media(_) => {
                             details.push(format!("Will stop: {}", item.label(&workspace.root, cx)))
                         }
@@ -738,6 +795,9 @@ impl WorkspaceWindow {
             return;
         }
         if matches!(target, CloseTarget::Window) {
+            for workspace in &self.workspaces {
+                workspace.devshell.cancel();
+            }
             window.remove_window();
             return;
         }
@@ -747,6 +807,11 @@ impl WorkspaceWindow {
         }
         match target {
             CloseTarget::Workspace(id) => {
+                for workspace in &self.workspaces {
+                    if workspace.id == id {
+                        workspace.devshell.cancel();
+                    }
+                }
                 self.workspaces.retain(|workspace| workspace.id != id);
                 self.active = self.active.min(self.workspaces.len() - 1);
             }

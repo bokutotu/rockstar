@@ -4,7 +4,7 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -99,7 +99,11 @@ enum Incoming {
     ResultsClosed,
 }
 
-pub(crate) fn connect(cwd: &Path, start: ChatStart) -> Result<OpenedChat, AgentError> {
+pub(crate) fn connect(
+    cwd: &Path,
+    env: &crate::devshell::ResolutionOutcome,
+    start: ChatStart,
+) -> Result<OpenedChat, AgentError> {
     let canonical_cwd = cwd
         .canonicalize()
         .context("Cannot resolve the workspace directory")?;
@@ -109,7 +113,7 @@ pub(crate) fn connect(cwd: &Path, start: ChatStart) -> Result<OpenedChat, AgentE
         ChatStart::Resume(_) => bail!("Selected session does not belong to agy"),
     };
 
-    let mut agy = spawn_acp(&canonical_cwd, Stdio::inherit())?;
+    let mut agy = spawn_acp(&canonical_cwd, env, Stdio::inherit())?;
     let (agent, backend) = agent::channel();
     let (ready, initialized) = mpsc::channel();
     thread::Builder::new()
@@ -134,11 +138,14 @@ pub(crate) fn connect(cwd: &Path, start: ChatStart) -> Result<OpenedChat, AgentE
     Ok(OpenedChat { agent, messages })
 }
 
-pub(crate) fn list_sessions(root: &Path) -> Result<Vec<SavedSession>, AgentError> {
+pub(crate) fn list_sessions(
+    root: &Path,
+    env: &crate::devshell::ResolutionOutcome,
+) -> Result<Vec<SavedSession>, AgentError> {
     let root = root
         .canonicalize()
         .context("Cannot resolve the workspace directory")?;
-    let mut agy = spawn_acp(&root, Stdio::null())?;
+    let mut agy = spawn_acp(&root, env, Stdio::null())?;
     let (done_tx, done_rx) = mpsc::channel();
     let root_for_rpc = root.clone();
     thread::Builder::new()
@@ -162,8 +169,12 @@ pub(crate) fn list_sessions(root: &Path) -> Result<Vec<SavedSession>, AgentError
         .context("Timed out while listing agy sessions")?
 }
 
-fn spawn_acp(cwd: &Path, stderr: Stdio) -> Result<AgyAgent, AgentError> {
-    let mut command = Command::new("agy");
+fn spawn_acp(
+    cwd: &Path,
+    env: &crate::devshell::ResolutionOutcome,
+    stderr: Stdio,
+) -> Result<AgyAgent, AgentError> {
+    let mut command = env.command("agy");
     command
         .args(["acp", "--dangerously-skip-permissions"])
         .current_dir(cwd)

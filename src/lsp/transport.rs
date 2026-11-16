@@ -7,7 +7,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
@@ -84,6 +84,7 @@ impl ServerSession {
     pub(crate) fn start(
         kind: ServerKind,
         root: PathBuf,
+        devshell: Arc<crate::devshell::WorkspaceEnv>,
         command: CommandSpec,
         events: Sender<Event>,
     ) -> Arc<Self> {
@@ -97,7 +98,7 @@ impl ServerSession {
             finished,
         });
         thread::spawn(move || {
-            let result = run(kind, &root, &command, mail, rx, &state, &events);
+            let result = run(kind, &root, &devshell, &command, mail, rx, &state, &events);
             if let Err(error) = result {
                 *state.lock().unwrap() = ServerState::Failed(format!(
                     "{} ({}): {error:#}",
@@ -263,16 +264,19 @@ fn send_message(writer: &mpsc::SyncSender<Value>, value: &Value) -> Result<()> {
         .try_send(value.clone())
         .map_err(|error| anyhow!("Language server write queue: {error}"))
 }
+#[allow(clippy::too_many_arguments)]
 fn run(
     kind: ServerKind,
     root: &Path,
+    devshell: &crate::devshell::WorkspaceEnv,
     spec: &CommandSpec,
     mail: mpsc::Sender<Mail>,
     rx: mpsc::Receiver<Mail>,
     state: &Mutex<ServerState>,
     events: &Sender<Event>,
 ) -> Result<()> {
-    let mut command = Command::new(&spec.program);
+    let outcome = devshell.resolve();
+    let mut command = outcome.command(&spec.program);
     command
         .args(&spec.args)
         .current_dir(root)
@@ -284,11 +288,15 @@ fn run(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let child = command.spawn().with_context(|| {
-        format!(
+    let child = command.spawn().with_context(|| match outcome.failure() {
+        Some(nix_error) => format!(
+            "Cannot start {} (nix develop failed: {nix_error})",
+            spec.program
+        ),
+        None => format!(
             "Cannot start language server. Provide {} in the project's Nix devShell/PATH",
             spec.program
-        )
+        ),
     })?;
     let mut process = Process { child };
     let mut stdin = process.child.stdin.take().unwrap();

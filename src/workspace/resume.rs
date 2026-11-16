@@ -18,7 +18,9 @@ impl Tab {
         cx.set_global(Mode::Switcher);
         let owner = cx.entity().downgrade();
         let root = self.root.clone();
-        let picker = cx.new(|cx| ResumePicker::new(owner, target, request, root, window, cx));
+        let devshell = self.devshell.clone();
+        let picker =
+            cx.new(|cx| ResumePicker::new(owner, target, request, root, devshell, window, cx));
         let focus = picker.read(cx).input.focus_handle(cx);
         window.open_dialog(cx, move |dialog, _, cx| {
             dialog
@@ -86,11 +88,15 @@ fn filter_sessions(sessions: &[SavedSession], query: &str) -> Vec<usize> {
         .collect()
 }
 
-fn list_sessions_for_kind(kind: AgentKind, root: &Path) -> anyhow::Result<Vec<SavedSession>> {
+fn list_sessions_for_kind(
+    kind: AgentKind,
+    root: &Path,
+    devshell: &crate::devshell::WorkspaceEnv,
+) -> anyhow::Result<Vec<SavedSession>> {
     match kind {
         AgentKind::Pi => crate::pi::list_sessions(root),
-        AgentKind::Agy => crate::agy::list_sessions(root),
-        AgentKind::Codex => crate::codex::list_sessions(root),
+        AgentKind::Agy => crate::agy::list_sessions(root, &devshell.resolve()),
+        AgentKind::Codex => crate::codex::list_sessions(root, &devshell.resolve()),
     }
 }
 
@@ -121,6 +127,7 @@ impl ResumePicker {
         target: EntityId,
         request: u64,
         root: PathBuf,
+        devshell: Arc<crate::devshell::WorkspaceEnv>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -135,7 +142,11 @@ impl ResumePicker {
             .into_iter()
             .map(|kind| {
                 let root = root.clone();
-                let scan = cx.background_spawn(async move { list_sessions_for_kind(kind, &root) });
+                let devshell = devshell.clone();
+                let scan =
+                    cx.background_spawn(
+                        async move { list_sessions_for_kind(kind, &root, &devshell) },
+                    );
                 cx.spawn(async move |this, cx| {
                     let result = scan.await;
                     let _ = this.update(cx, |this, cx| {
