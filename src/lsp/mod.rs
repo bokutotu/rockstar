@@ -1,4 +1,6 @@
 //! Workspace-scoped language servers and versioned, shared document analysis.
+mod adapter;
+mod haskell;
 pub(crate) mod language;
 pub(crate) mod providers;
 mod transport;
@@ -9,11 +11,11 @@ use gpui_kit::{
     App, AppContext as _, Context, Entity, Task, WeakEntity, Window,
     component::{WindowExt as _, notification::Notification},
 };
-use language::ServerKind;
 use lsp_types::{CodeLens, Diagnostic, InlayHint, SemanticTokens, Uri};
 use serde_json::{Value, json};
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
-pub(crate) use transport::{CommandSpec, ServerSession, ServerState};
+use transport::SessionKey;
+pub(crate) use transport::{ServerSession, ServerState};
 
 #[derive(Clone)]
 pub(crate) struct DocumentSnapshot {
@@ -321,7 +323,8 @@ fn null_array(value: Value) -> Value {
 pub(crate) struct LspWorkspace {
     root: PathBuf,
     devshell: Arc<crate::devshell::WorkspaceEnv>,
-    sessions: HashMap<ServerKind, Arc<ServerSession>>,
+    sub_devshells: HashMap<PathBuf, Arc<crate::devshell::WorkspaceEnv>>,
+    sessions: HashMap<SessionKey, Arc<ServerSession>>,
     documents: HashMap<Uri, Entity<DocumentBinding>>,
     events: async_channel::Sender<transport::Event>,
 }
@@ -334,6 +337,9 @@ impl LspWorkspace {
     ) -> Self {
         let (events, rx) = async_channel::unbounded();
         cx.on_app_quit(|this, _| {
+            for devshell in this.sub_devshells.values() {
+                devshell.cancel();
+            }
             let stopped = this
                 .sessions
                 .values()
@@ -360,6 +366,7 @@ impl LspWorkspace {
         Self {
             root,
             devshell,
+            sub_devshells: HashMap::new(),
             sessions: HashMap::new(),
             documents: HashMap::new(),
             events,
@@ -378,25 +385,31 @@ impl LspWorkspace {
         if let Some(doc) = self.documents.get(&uri) {
             return Ok(Some(doc.clone()));
         }
-        if self.sessions.get(&kind).is_some_and(|session| {
-            matches!(session.state(), ServerState::Failed(_))
-                && self.devshell.should_retry_consumer()
+        let adapter = adapter::create(kind);
+        let session_root = adapter.resolve_root(&self.root, &file.path);
+        let key = SessionKey {
+            kind,
+            root: session_root,
+        };
+        if self.sessions.get(&key).is_some_and(|session| {
+            matches!(session.state(), ServerState::Failed(_)) && session.should_retry_devshell()
         }) {
-            self.sessions.remove(&kind);
+            self.sessions.remove(&key);
         }
+        let devshell = if key.root != self.root
+            && (key.root.join("flake.nix").is_file() || key.root.join("shell.nix").is_file())
+        {
+            self.sub_devshells
+                .entry(key.root.clone())
+                .or_insert_with(|| crate::devshell::WorkspaceEnv::new(key.root.clone()))
+                .clone()
+        } else {
+            self.devshell.clone()
+        };
         let session = self
             .sessions
-            .entry(kind)
-            .or_insert_with(|| {
-                let command = CommandSpec::from(kind);
-                ServerSession::start(
-                    kind,
-                    self.root.clone(),
-                    self.devshell.clone(),
-                    command,
-                    self.events.clone(),
-                )
-            })
+            .entry(key.clone())
+            .or_insert_with(|| ServerSession::start(key, devshell, adapter, self.events.clone()))
             .clone();
         let binding =
             cx.new(|cx| DocumentBinding::new(buffer, uri.clone(), language_id, session, cx));
@@ -409,6 +422,10 @@ impl LspWorkspace {
     }
     pub(crate) fn stop(&mut self, _: &mut Context<Self>) {
         self.documents.clear();
+        for devshell in self.sub_devshells.values() {
+            devshell.cancel();
+        }
+        self.sub_devshells.clear();
         for session in self.sessions.values() {
             session.stop();
         }
@@ -424,15 +441,15 @@ impl LspWorkspace {
     fn handle(&mut self, event: transport::Event, window: &mut Window, cx: &mut Context<Self>) {
         use transport::Event;
         match event {
-            Event::State(kind) => {
-                let Some(session) = self.sessions.get(&kind) else {
+            Event::State(key) => {
+                let Some(session) = self.sessions.get(&key).cloned() else {
                     return;
                 };
                 if let ServerState::Failed(error) = session.state() {
                     window.push_notification(Notification::error(error), cx);
                 }
                 for doc in self.documents.values() {
-                    if doc.read(cx).session.kind == kind {
+                    if Arc::ptr_eq(&doc.read(cx).session, &session) {
                         doc.update(cx, |doc, cx| {
                             let _ = doc.sync(cx);
                             doc.schedule_refresh(cx);
@@ -441,7 +458,10 @@ impl LspWorkspace {
                     }
                 }
             }
-            Event::Notification(kind, method, params) => {
+            Event::Notification(key, method, params) => {
+                let Some(session) = self.sessions.get(&key).cloned() else {
+                    return;
+                };
                 if method == "textDocument/publishDiagnostics" {
                     let Some(uri) = params
                         .get("uri")
@@ -453,7 +473,7 @@ impl LspWorkspace {
                     let Some(doc) = self.documents.get(&uri) else {
                         return;
                     };
-                    if doc.read(cx).session.kind != kind {
+                    if !Arc::ptr_eq(&doc.read(cx).session, &session) {
                         return;
                     }
                     doc.update(cx, |doc, cx| {
@@ -477,7 +497,7 @@ impl LspWorkspace {
                     });
                 } else if method.ends_with("/refresh") {
                     for doc in self.documents.values() {
-                        if doc.read(cx).session.kind == kind {
+                        if Arc::ptr_eq(&doc.read(cx).session, &session) {
                             doc.update(cx, |doc, cx| doc.schedule_refresh(cx));
                         }
                     }
@@ -486,14 +506,14 @@ impl LspWorkspace {
                     && let Some(message) = params["message"].as_str()
                 {
                     window.push_notification(
-                        Notification::error(format!("{}: {message}", kind.command().0)),
+                        Notification::error(format!("{}: {message}", key.kind.command().0)),
                         cx,
                     );
                 }
             }
-            Event::Request(kind, id, _method, _params) => {
+            Event::Request(key, id, _method, _params) => {
                 // A server cannot unexpectedly steal focus or launch an external application.
-                if let Some(session) = self.sessions.get(&kind) {
+                if let Some(session) = self.sessions.get(&key) {
                     session.respond(id, json!({"success":false}));
                 }
             }

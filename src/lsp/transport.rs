@@ -1,5 +1,8 @@
 //! A bounded, non-blocking-for-GPUI stdio JSON-RPC client. No shell is involved.
-use super::language::{self, Encoding, ServerKind};
+use super::{
+    adapter::ServerAdapter,
+    language::{self, Encoding, ServerKind},
+};
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_channel::{Receiver, Sender};
 use serde_json::{Value, json};
@@ -31,6 +34,12 @@ impl From<ServerKind> for CommandSpec {
         }
     }
 }
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct SessionKey {
+    pub kind: ServerKind,
+    pub root: PathBuf,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum ServerState {
     Starting,
@@ -43,9 +52,9 @@ pub(crate) enum ServerState {
 }
 #[derive(Debug)]
 pub(crate) enum Event {
-    State(ServerKind),
-    Notification(ServerKind, String, Value),
-    Request(ServerKind, Value, String, Value),
+    State(SessionKey),
+    Notification(SessionKey, String, Value),
+    Request(SessionKey, Value, String, Value),
 }
 struct Pending {
     reply: Reply,
@@ -61,6 +70,7 @@ enum Mail {
 
 pub(crate) struct ServerSession {
     pub kind: ServerKind,
+    devshell: Arc<crate::devshell::WorkspaceEnv>,
     state: Arc<Mutex<ServerState>>,
     mail: mpsc::Sender<Mail>,
     finished: Receiver<()>,
@@ -82,36 +92,40 @@ impl Response {
 }
 impl ServerSession {
     pub(crate) fn start(
-        kind: ServerKind,
-        root: PathBuf,
+        key: SessionKey,
         devshell: Arc<crate::devshell::WorkspaceEnv>,
-        command: CommandSpec,
+        adapter: Box<dyn ServerAdapter>,
         events: Sender<Event>,
     ) -> Arc<Self> {
         let (mail, rx) = mpsc::channel();
         let state = Arc::new(Mutex::new(ServerState::Starting));
         let (done, finished) = async_channel::bounded(1);
         let session = Arc::new(Self {
-            kind,
+            kind: key.kind,
+            devshell: devshell.clone(),
             state: state.clone(),
             mail: mail.clone(),
             finished,
         });
         thread::spawn(move || {
-            let result = run(kind, &root, &devshell, &command, mail, rx, &state, &events);
+            let spec = adapter.command(&key.root);
+            let result = run(&key, &devshell, &spec, adapter, mail, rx, &state, &events);
             if let Err(error) = result {
                 *state.lock().unwrap() = ServerState::Failed(format!(
                     "{} ({}): {error:#}",
-                    command.program,
-                    root.display()
+                    spec.program,
+                    key.root.display()
                 ));
             } else {
                 *state.lock().unwrap() = ServerState::Stopped;
             }
-            let _ = events.try_send(Event::State(kind));
+            let _ = events.try_send(Event::State(key));
             drop(done);
         });
         session
+    }
+    pub(crate) fn should_retry_devshell(&self) -> bool {
+        self.devshell.should_retry_consumer()
     }
     pub(crate) fn stop(&self) -> Receiver<()> {
         let _ = self.mail.send(Mail::Stop);
@@ -202,31 +216,18 @@ pub(crate) fn write_message(writer: &mut impl Write, value: &Value) -> Result<()
     writer.flush()?;
     Ok(())
 }
-fn configuration(kind: ServerKind) -> Value {
-    if kind == ServerKind::TypeScript {
-        json!({"typescript": {"referencesCodeLens": {"enabled": true, "showOnAllFunctions": true}, "implementationsCodeLens": {"enabled": true}}})
-    } else if kind == ServerKind::Rust {
-        json!({"rust-analyzer": {"lens": {"enable": true, "references": {"enable": true}}}})
-    } else {
-        json!({})
-    }
-}
-fn initialization(kind: ServerKind, root: &Path) -> Result<Value> {
+fn workspace_folders(root: &Path) -> Result<Value> {
     let uri = language::uri(root)?;
-    let options = if kind == ServerKind::TypeScript {
-        json!({"hostInfo": "rockstar", "disableAutomaticTypingAcquisition": true, "preferences": {
-            "includeInlayParameterNameHints": "all", "includeInlayParameterNameHintsWhenArgumentMatchesName": true,
-            "includeInlayFunctionParameterTypeHints": true, "includeInlayVariableTypeHints": true,
-            "includeInlayPropertyDeclarationTypeHints": true, "includeInlayFunctionLikeReturnTypeHints": true,
-            "includeInlayEnumMemberValueHints": true
-        }})
-    } else if kind == ServerKind::Rust {
-        configuration(kind)["rust-analyzer"].clone()
-    } else {
-        Value::Null
-    };
-    Ok(
-        json!({"processId":std::process::id(),"clientInfo":{"name":"rockstar","version":env!("CARGO_PKG_VERSION")},"rootUri":uri,"rootPath":root,"workspaceFolders":[{"uri":uri,"name":root.file_name().unwrap_or_default().to_string_lossy()}],
+    Ok(json!([{
+        "uri": uri,
+        "name": root.file_name().unwrap_or_default().to_string_lossy()
+    }]))
+}
+
+fn initialization(root: &Path, adapter: &mut dyn ServerAdapter) -> Result<Value> {
+    let uri = language::uri(root)?;
+    let folders = workspace_folders(root)?;
+    let mut params = json!({"processId":std::process::id(),"clientInfo":{"name":"rockstar","version":env!("CARGO_PKG_VERSION")},"rootUri":uri,"rootPath":root,"workspaceFolders":folders,
         "capabilities":{
             "general":{"positionEncodings":["utf-16","utf-8","utf-32"]},"offsetEncoding":["utf-16","utf-8","utf-32"],
             "workspace":{"configuration":true,"workspaceFolders":true,"applyEdit":false,"semanticTokens":{"refreshSupport":true},"inlayHint":{"refreshSupport":true},"codeLens":{"refreshSupport":true}},
@@ -239,8 +240,9 @@ fn initialization(kind: ServerKind, root: &Path) -> Result<Value> {
                 "publishDiagnostics":{"versionSupport":true,"relatedInformation":true,"tagSupport":{"valueSet":[1,2]}},"diagnostic":{},
                 "semanticTokens":{"requests":{"range":true,"full":true},"tokenTypes":["namespace","type","class","enum","interface","struct","typeParameter","parameter","variable","property","enumMember","event","function","method","macro","keyword","modifier","comment","string","number","regexp","operator","decorator"],"tokenModifiers":["declaration","definition","readonly","static","deprecated","abstract","async","modification","documentation","defaultLibrary"],"formats":["relative"],"overlappingTokenSupport":false,"multilineTokenSupport":false}
             }
-        },"initializationOptions":options}),
-    )
+        },"initializationOptions":Value::Null});
+    adapter.customize_initialize(root, &mut params);
+    Ok(params)
 }
 
 struct Process {
@@ -259,22 +261,23 @@ impl Drop for Process {
         let _ = self.child.wait();
     }
 }
-fn send_message(writer: &mpsc::SyncSender<Value>, value: &Value) -> Result<()> {
+pub(crate) fn queue_message(writer: &mpsc::SyncSender<Value>, value: &Value) -> Result<()> {
     writer
         .try_send(value.clone())
         .map_err(|error| anyhow!("Language server write queue: {error}"))
 }
 #[allow(clippy::too_many_arguments)]
 fn run(
-    kind: ServerKind,
-    root: &Path,
+    key: &SessionKey,
     devshell: &crate::devshell::WorkspaceEnv,
     spec: &CommandSpec,
+    mut adapter: Box<dyn ServerAdapter>,
     mail: mpsc::Sender<Mail>,
     rx: mpsc::Receiver<Mail>,
     state: &Mutex<ServerState>,
     events: &Sender<Event>,
 ) -> Result<()> {
+    let root = key.root.as_path();
     let outcome = devshell.resolve();
     let mut command = outcome.command(&spec.program);
     command
@@ -350,9 +353,9 @@ fn run(
             }
         }
     });
-    send_message(
+    queue_message(
         &writer,
-        &json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":initialization(kind, root)?}),
+        &json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":initialization(root, adapter.as_mut())?}),
     )?;
     let started = Instant::now();
     let mut ready = false;
@@ -373,7 +376,7 @@ fn run(
                 if let Some(p) = pending.remove(&id) {
                     let _ = p.reply.try_send(Err("LSP request timed out".into()));
                 }
-                send_message(
+                queue_message(
                     &writer,
                     &json!({"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":id}}),
                 )?;
@@ -409,10 +412,11 @@ fn run(
                             },
                         );
                     }
-                    send_message(&writer, &value)?;
+                    queue_message(&writer, &value)?;
+                    adapter.on_client_message(&method, &value["params"], &writer);
                 }
                 Mail::Respond(id, result) => {
-                    send_message(&writer, &json!({"jsonrpc":"2.0","id":id,"result":result}))?
+                    queue_message(&writer, &json!({"jsonrpc":"2.0","id":id,"result":result}))?
                 }
                 Mail::Incoming(value) => {
                     if let Some(method) = value.get("method").and_then(Value::as_str) {
@@ -426,28 +430,13 @@ fn run(
                                             items
                                                 .iter()
                                                 .map(|item| {
-                                                    let settings = configuration(kind);
-                                                    item["section"].as_str().map_or(
-                                                        settings.clone(),
-                                                        |section| {
-                                                            section
-                                                                .split('.')
-                                                                .try_fold(
-                                                                    &settings,
-                                                                    |value, key| value.get(key),
-                                                                )
-                                                                .cloned()
-                                                                .unwrap_or_else(|| json!({}))
-                                                        },
-                                                    )
+                                                    adapter.configuration(item["section"].as_str())
                                                 })
                                                 .collect()
                                         })
                                         .unwrap_or_default(),
                                 )),
-                                "workspace/workspaceFolders" => {
-                                    Some(initialization(kind, root)?["workspaceFolders"].clone())
-                                }
+                                "workspace/workspaceFolders" => Some(workspace_folders(root)?),
                                 "window/workDoneProgress/create" => Some(Value::Null),
                                 "workspace/applyEdit" => Some(
                                     json!({"applied":false,"failureReason":"Unsolicited workspace edits are not supported"}),
@@ -456,35 +445,35 @@ fn run(
                                 | "workspace/inlayHint/refresh"
                                 | "workspace/codeLens/refresh" => {
                                     let _ = events.try_send(Event::Notification(
-                                        kind,
+                                        key.clone(),
                                         method.into(),
                                         params.clone(),
                                     ));
                                     Some(Value::Null)
                                 }
-                                // We do not advertise dynamic registration. Acknowledge only static-equivalent features,
-                                // never pretend a file-system watcher has been installed.
-                                "client/registerCapability" | "client/unregisterCapability" => None,
                                 "window/showDocument" => {
                                     let _ = events.try_send(Event::Request(
-                                        kind,
+                                        key.clone(),
                                         id.clone(),
                                         method.into(),
                                         params,
                                     ));
                                     continue;
                                 }
-                                _ => None,
+                                _ => adapter.handle_client_request(method, &params),
                             };
                             let message = if let Some(result) = response {
                                 json!({"jsonrpc":"2.0","id":id,"result":result})
                             } else {
                                 json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":format!("Unsupported client method: {method}")}})
                             };
-                            send_message(&writer, &message)?;
+                            queue_message(&writer, &message)?;
                         } else {
-                            let _ =
-                                events.try_send(Event::Notification(kind, method.into(), params));
+                            let _ = events.try_send(Event::Notification(
+                                key.clone(),
+                                method.into(),
+                                params,
+                            ));
                         }
                     } else if value.get("id") == Some(&json!(0)) && !ready {
                         if let Some(error) = value.get("error") {
@@ -499,18 +488,13 @@ fn run(
                             capabilities: result["capabilities"].clone(),
                             encoding,
                         };
-                        send_message(
+                        queue_message(
                             &writer,
                             &json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
                         )?;
-                        if matches!(kind, ServerKind::TypeScript | ServerKind::Rust) {
-                            send_message(
-                                &writer,
-                                &json!({"jsonrpc":"2.0","method":"workspace/didChangeConfiguration","params":{"settings": configuration(kind)}}),
-                            )?;
-                        }
+                        adapter.on_initialized(root, result, &writer)?;
                         ready = true;
-                        let _ = events.try_send(Event::State(kind));
+                        let _ = events.try_send(Event::State(key.clone()));
                     } else if let Some(id) = value.get("id").and_then(Value::as_u64)
                         && let Some(p) = pending.remove(&id)
                     {
@@ -525,7 +509,7 @@ fn run(
                 Mail::End(error) => bail!("{error}\n{}", tail.lock().unwrap()),
                 Mail::Stop => {
                     if ready {
-                        let _ = send_message(
+                        let _ = queue_message(
                             &writer,
                             &json!({"jsonrpc":"2.0","id":-1,"method":"shutdown","params":null}),
                         );
@@ -538,7 +522,7 @@ fn run(
                                 break;
                             }
                         }
-                        let _ = send_message(
+                        let _ = queue_message(
                             &writer,
                             &json!({"jsonrpc":"2.0","method":"exit","params":null}),
                         );

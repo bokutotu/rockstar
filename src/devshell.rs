@@ -119,13 +119,18 @@ impl ResolutionOutcome {
     pub(crate) fn command(&self, program: impl AsRef<OsStr>) -> Command {
         match self {
             Self::Activated(env) => env.command(program),
-            Self::Inherited | Self::Failed(_) => Command::new(program),
+            Self::Inherited | Self::Failed(_) => {
+                let mut command = Command::new(program);
+                scrub_process_temp_env(&mut command);
+                command
+            }
         }
     }
 
     pub(crate) fn apply_pty(&self, command: &mut portable_pty::CommandBuilder) {
-        if let Self::Activated(env) = self {
-            env.apply_pty(command);
+        match self {
+            Self::Activated(env) => env.apply_pty(command),
+            Self::Inherited | Self::Failed(_) => scrub_pty_temp_env(command),
         }
     }
 
@@ -389,6 +394,7 @@ fn capture_nix_develop(
     let parent_pid = std::process::id() as libc::pid_t;
 
     let mut command = Command::new(&nix_program);
+    scrub_process_temp_env(&mut command);
     command.args([
         "--extra-experimental-features",
         "nix-command flakes",
@@ -521,37 +527,41 @@ fn sanitize_captured_env(raw_env: &[u8], ambient: &[(OsString, OsString)]) -> En
 
     // `nix develop` / `nix print-dev-env` creates an ephemeral `/tmp/nix-shell.*`
     // directory and assigns TMP/TMPDIR/TEMP/TEMPDIR to it. Remove it immediately
-    // and restore the caller's temporary-directory settings so long-lived LSPs,
-    // terminals, and agents never point at a directory tmpfiles may reap.
+    // and restore the caller's temporary-directory settings only when they point
+    // to a real, non-ephemeral directory (the GUI itself may have been launched
+    // from an outer `nix develop` whose `/tmp/nix-shell.*` was later deleted).
     let ephemeral_build_top = index_by_key
         .get(OsStr::new("NIX_BUILD_TOP"))
         .map(|&slot| parsed[slot].1.clone())
-        .filter(|value| {
-            ambient_map.get(OsStr::new("NIX_BUILD_TOP")).copied() != Some(value.as_os_str())
-                && is_ephemeral_nix_shell_dir(Path::new(value))
-        });
-    if let Some(dir) = &ephemeral_build_top {
+        .filter(|value| is_ephemeral_nix_shell_dir(Path::new(value)));
+    if let Some(dir) = &ephemeral_build_top
+        && ambient_map.get(OsStr::new("NIX_BUILD_TOP")).copied() != Some(dir.as_os_str())
+    {
         let _ = fs::remove_dir_all(Path::new(dir));
     }
 
+    remove_var(&mut parsed, &mut index_by_key, OsStr::new("NIX_BUILD_TOP"));
     // Preserve the user's login shell (e.g. fish/zsh) instead of Nix's stdenv bash.
-    restore_or_unset(
-        &mut parsed,
-        &mut index_by_key,
-        &ambient_map,
-        "NIX_BUILD_TOP",
-    );
     restore_or_unset(&mut parsed, &mut index_by_key, &ambient_map, "SHELL");
     restore_or_unset(&mut parsed, &mut index_by_key, &ambient_map, "terminfo");
 
-    for temp_var in ["TMP", "TMPDIR", "TEMP", "TEMPDIR"] {
-        let matches_ephemeral = ephemeral_build_top.as_ref().is_some_and(|ephemeral| {
-            index_by_key
-                .get(OsStr::new(temp_var))
-                .is_some_and(|&slot| &parsed[slot].1 == ephemeral)
+    for temp_var in TEMP_ENV_VARS {
+        let key = OsStr::new(temp_var);
+        let invalid = index_by_key.get(key).is_some_and(|&slot| {
+            ephemeral_build_top
+                .as_ref()
+                .is_some_and(|ephemeral| &parsed[slot].1 == ephemeral)
+                || !is_usable_temp_dir(&parsed[slot].1)
         });
-        if matches_ephemeral {
-            restore_or_unset(&mut parsed, &mut index_by_key, &ambient_map, temp_var);
+        if invalid {
+            match ambient_map
+                .get(key)
+                .copied()
+                .filter(|dir| is_usable_temp_dir(dir))
+            {
+                Some(original) => set_var(&mut parsed, &mut index_by_key, key, original),
+                None => remove_var(&mut parsed, &mut index_by_key, key),
+            }
         }
     }
 
@@ -569,12 +579,37 @@ fn sanitize_captured_env(raw_env: &[u8], ambient: &[(OsString, OsString)]) -> En
     EnvMap::from_pairs(parsed)
 }
 
+const TEMP_ENV_VARS: [&str; 4] = ["TMP", "TMPDIR", "TEMP", "TEMPDIR"];
+
 fn is_ephemeral_nix_shell_dir(path: &Path) -> bool {
     path.is_absolute()
         && path
             .file_name()
             .and_then(OsStr::to_str)
             .is_some_and(|name| name.starts_with("nix-shell."))
+}
+
+fn is_usable_temp_dir(value: &OsStr) -> bool {
+    let path = Path::new(value);
+    path.is_absolute() && !is_ephemeral_nix_shell_dir(path) && path.is_dir()
+}
+
+fn scrub_process_temp_env(command: &mut Command) {
+    command.env_remove("NIX_BUILD_TOP");
+    for var in TEMP_ENV_VARS {
+        if env::var_os(var).is_some_and(|value| !is_usable_temp_dir(&value)) {
+            command.env_remove(var);
+        }
+    }
+}
+
+fn scrub_pty_temp_env(command: &mut portable_pty::CommandBuilder) {
+    command.env_remove("NIX_BUILD_TOP");
+    for var in TEMP_ENV_VARS {
+        if env::var_os(var).is_some_and(|value| !is_usable_temp_dir(&value)) {
+            command.env_remove(var);
+        }
+    }
 }
 
 fn restore_or_unset(
@@ -816,7 +851,11 @@ mod tests {
     fn sanitize_env_cleans_ephemeral_tmpdir_and_preserves_login_shell() {
         let scratch = TempDir::new("sanitize");
         let fake_nix_tmp = scratch.path().join("nix-shell.abc123");
+        let preserved_temp = scratch.path().join("custom-preserved");
+        let ambient_runtime = scratch.path().join("user-runtime");
         fs::create_dir_all(&fake_nix_tmp).unwrap();
+        fs::create_dir_all(&preserved_temp).unwrap();
+        fs::create_dir_all(&ambient_runtime).unwrap();
 
         let mut raw = Vec::new();
         for (k, v) in [
@@ -828,7 +867,7 @@ mod tests {
             ("NIX_BUILD_TOP", fake_nix_tmp.to_str().unwrap()),
             ("TMPDIR", fake_nix_tmp.to_str().unwrap()),
             ("TMP", fake_nix_tmp.to_str().unwrap()),
-            ("TEMP", "/custom/preserved"),
+            ("TEMP", preserved_temp.to_str().unwrap()),
             ("NIX_GHC_LIBDIR", "/nix/store/ghc/lib"),
             ("PWD", "/some/dir"),
             ("SHLVL", "2"),
@@ -841,7 +880,10 @@ mod tests {
 
         let ambient = vec![
             (OsString::from("SHELL"), OsString::from("/run/sw/bin/fish")),
-            (OsString::from("TMPDIR"), OsString::from("/run/user/1000")),
+            (
+                OsString::from("TMPDIR"),
+                ambient_runtime.clone().into_os_string(),
+            ),
         ];
         let env = sanitize_captured_env(&raw, &ambient);
 
@@ -850,9 +892,9 @@ mod tests {
             "ephemeral nix-shell dir must be deleted"
         );
         assert_eq!(env.get("SHELL"), Some(OsStr::new("/run/sw/bin/fish")));
-        assert_eq!(env.get("TMPDIR"), Some(OsStr::new("/run/user/1000")));
+        assert_eq!(env.get("TMPDIR"), Some(ambient_runtime.as_os_str()));
         assert_eq!(env.get("TMP"), None);
-        assert_eq!(env.get("TEMP"), Some(OsStr::new("/custom/preserved")));
+        assert_eq!(env.get("TEMP"), Some(preserved_temp.as_os_str()));
         assert_eq!(env.get("NIX_BUILD_TOP"), None);
         assert_eq!(env.get("PWD"), None);
         assert_eq!(env.get("SHLVL"), None);
