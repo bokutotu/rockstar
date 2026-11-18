@@ -396,8 +396,7 @@ impl LspWorkspace {
         }) {
             self.sessions.remove(&key);
         }
-        let devshell = if key.root != self.root
-            && (key.root.join("flake.nix").is_file() || key.root.join("shell.nix").is_file())
+        let devshell = if key.root != self.root && self.devshell.has_separate_environment(&key.root)
         {
             self.sub_devshells
                 .entry(key.root.clone())

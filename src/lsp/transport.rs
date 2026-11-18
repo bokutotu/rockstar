@@ -279,7 +279,7 @@ fn run(
 ) -> Result<()> {
     let root = key.root.as_path();
     let outcome = devshell.resolve();
-    let mut command = outcome.command(&spec.program);
+    let mut command = outcome.command(&spec.program)?;
     command
         .args(&spec.args)
         .current_dir(root)
@@ -297,7 +297,7 @@ fn run(
             spec.program
         ),
         None => format!(
-            "Cannot start language server. Provide {} in the project's Nix devShell/PATH",
+            "Cannot start language server. Provide {} on the workspace PATH",
             spec.program
         ),
     })?;

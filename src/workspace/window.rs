@@ -84,7 +84,7 @@ impl WorkspaceWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let resolving = cx.background_spawn(async move { devshell.resolve() });
+        let resolving = cx.background_spawn(async move { devshell.warmup_nix() });
         cx.spawn_in(window, async move |this, cx| {
             let outcome = resolving.await;
             let Some(error) = outcome.failure() else {

@@ -305,7 +305,7 @@ pub(crate) fn connect(
     env: &crate::devshell::ResolutionOutcome,
     start: ChatStart,
 ) -> Result<OpenedChat, AgentError> {
-    let mut command = env.command("pi");
+    let mut command = env.command("pi")?;
     command
         .args(["--mode", "rpc"])
         .current_dir(cwd)

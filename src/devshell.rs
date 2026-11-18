@@ -1,9 +1,8 @@
-//! Per-workspace `nix develop` environment resolution and caching.
+//! Per-workspace direnv and Nix environment resolution.
 //!
 //! Rockstar runs as a single GUI process across workspaces (`:wsnew` and CLI
-//! forwarding), so ambient process environment does not match newly opened Nix
-//! projects. Each workspace resolves its devShell environment in the background
-//! without blocking the UI or polluting child stdio with `shellHook` output.
+//! forwarding). Resolve each workspace's environment in the background: load
+//! authorized .envrc files on demand, or prewarm and cache a Nix devShell.
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -37,8 +36,15 @@ const FALLBACK_NIX_PATHS: &[&str] = &[
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Manifest {
+    Direnv { file: PathBuf, program: PathBuf },
     Flake { dir: PathBuf },
     Shell { dir: PathBuf, file: PathBuf },
+}
+
+impl Manifest {
+    fn is_direnv(&self) -> bool {
+        matches!(self, Self::Direnv { .. })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,36 +113,46 @@ impl EnvMap {
 
 #[derive(Clone, Debug)]
 pub(crate) enum ResolutionOutcome {
-    /// No Nix manifest applies to this workspace, or `nix` is not installed.
+    /// No environment provider applies to this workspace.
     Inherited,
-    /// `nix develop` succeeded for this workspace.
+    /// The workspace environment was loaded.
     Activated(Arc<EnvMap>),
     /// A Nix manifest exists and `nix` ran, but `nix develop` failed.
-    Failed(String),
+    NixFailed(String),
+    /// Do not launch a consumer in the ambient environment.
+    Unavailable(String),
 }
 
 impl ResolutionOutcome {
-    pub(crate) fn command(&self, program: impl AsRef<OsStr>) -> Command {
+    fn for_launch(&self) -> Result<Option<&EnvMap>> {
         match self {
-            Self::Activated(env) => env.command(program),
-            Self::Inherited | Self::Failed(_) => {
-                let mut command = Command::new(program);
-                scrub_process_temp_env(&mut command);
-                command
-            }
+            Self::Activated(env) => Ok(Some(env)),
+            Self::Inherited | Self::NixFailed(_) => Ok(None),
+            Self::Unavailable(reason) => bail!("{reason}"),
         }
     }
 
-    pub(crate) fn apply_pty(&self, command: &mut portable_pty::CommandBuilder) {
-        match self {
-            Self::Activated(env) => env.apply_pty(command),
-            Self::Inherited | Self::Failed(_) => scrub_pty_temp_env(command),
+    pub(crate) fn command(&self, program: impl AsRef<OsStr>) -> Result<Command> {
+        if let Some(env) = self.for_launch()? {
+            return Ok(env.command(program));
         }
+        let mut command = Command::new(program);
+        scrub_process_temp_env(&mut command);
+        Ok(command)
+    }
+
+    pub(crate) fn apply_pty(&self, command: &mut portable_pty::CommandBuilder) -> Result<()> {
+        if let Some(env) = self.for_launch()? {
+            env.apply_pty(command);
+        } else {
+            scrub_pty_temp_env(command);
+        }
+        Ok(())
     }
 
     pub(crate) fn failure(&self) -> Option<&str> {
         match self {
-            Self::Failed(error) => Some(error.as_str()),
+            Self::NixFailed(error) | Self::Unavailable(error) => Some(error.as_str()),
             Self::Inherited | Self::Activated(_) => None,
         }
     }
@@ -177,16 +193,26 @@ impl WorkspaceEnv {
         })
     }
 
-    /// True if a previously failed consumer (such as a language server) has
-    /// reason to retry because the workspace's Nix manifest state changed.
+    /// Share the workspace resolver unless the language server has a different
+    /// project manifest (possibly in an ancestor of the server root).
+    pub(crate) fn has_separate_environment(&self, root: &Path) -> bool {
+        let home = env::var_os("HOME").map(PathBuf::from);
+        find_manifest(root, home.as_deref())
+            .is_some_and(|manifest| Some(manifest) != find_manifest(&self.root, home.as_deref()))
+    }
+
+    /// direnv owns its watch list and permissions; retry it on the next request
+    /// even if the manifest itself hasn't changed (e.g. after `direnv allow`).
     pub(crate) fn should_retry_consumer(&self) -> bool {
         let current = current_stamp(&self.root);
+        if current.as_ref().is_some_and(|s| s.manifest.is_direnv()) {
+            return true;
+        }
         let state = self.state.lock().unwrap();
         match &state.cached {
             None => current.is_some(),
             Some((cached_stamp, outcome)) => {
-                cached_stamp != &current
-                    && (current.is_some() || matches!(outcome, ResolutionOutcome::Failed(_)))
+                cached_stamp != &current && (current.is_some() || outcome.failure().is_some())
             }
         }
     }
@@ -201,26 +227,42 @@ impl WorkspaceEnv {
     }
 
     pub(crate) fn resolve(&self) -> ResolutionOutcome {
+        self.resolve_inner(false)
+    }
+
+    pub(crate) fn warmup_nix(&self) -> ResolutionOutcome {
+        self.resolve_inner(true)
+    }
+
+    fn resolve_inner(&self, warmup: bool) -> ResolutionOutcome {
         let current = current_stamp(&self.root);
-        let mut state = self.state.lock().unwrap();
-        if state.cancelled {
+        let direnv = current.as_ref().is_some_and(|s| s.manifest.is_direnv());
+        if warmup && direnv {
             return ResolutionOutcome::Inherited;
         }
-        if state.computing {
+        let mut state = self.state.lock().unwrap();
+        while state.computing && !state.cancelled {
             let start_gen = state.generation;
             while state.computing && state.generation == start_gen && !state.cancelled {
                 state = self.ready.wait(state).unwrap();
             }
-            if state.cancelled {
-                return ResolutionOutcome::Inherited;
-            }
-            if let Some((_, outcome)) = &state.cached {
+            if !state.cancelled
+                && let Some((stamp, outcome)) = &state.cached
+                && stamp.as_ref().map(|s| &s.manifest) == current.as_ref().map(|s| &s.manifest)
+                && (!direnv || stamp == &current)
+            {
                 return outcome.clone();
             }
         }
-        if let Some((cached_stamp, outcome)) = &state.cached
+        if state.cancelled {
+            return ResolutionOutcome::Unavailable("Workspace closed".into());
+        }
+        // Only concurrent consumers share a direnv result. Re-check approval
+        // and let direnv handle watch_file and its own cache on later launches.
+        if !direnv
+            && let Some((cached_stamp, outcome)) = &state.cached
             && cached_stamp == &current
-            && !matches!(outcome, ResolutionOutcome::Failed(_))
+            && outcome.failure().is_none()
         {
             return outcome.clone();
         }
@@ -232,7 +274,7 @@ impl WorkspaceEnv {
         state.computing = true;
         drop(state);
 
-        let outcome = match capture_nix_develop(
+        let outcome = match capture_environment(
             &self.root,
             &stamp.manifest,
             self.nix_override.as_deref(),
@@ -240,27 +282,32 @@ impl WorkspaceEnv {
         ) {
             Ok(Some(env)) => ResolutionOutcome::Activated(Arc::new(env)),
             Ok(None) => ResolutionOutcome::Inherited,
-            Err(error) => {
-                if self.state.lock().unwrap().cancelled {
-                    ResolutionOutcome::Inherited
-                } else {
-                    ResolutionOutcome::Failed(format!("{error:#}"))
-                }
-            }
+            Err(error) if direnv => ResolutionOutcome::Unavailable(format!("direnv: {error:#}")),
+            Err(error) => ResolutionOutcome::NixFailed(format!("{error:#}")),
         };
 
         // Re-read the manifest stamp on completion so any file changes made
         // while `nix develop` was running (or Nix updating flake.lock) match.
-        let finished_stamp = current_stamp(&self.root).or(Some(stamp));
+        let finished_stamp = if direnv {
+            stamp
+        } else {
+            current_stamp(&self.root)
+                .filter(|s| s.manifest == stamp.manifest)
+                .unwrap_or(stamp)
+        };
         let mut state = self.state.lock().unwrap();
         state.computing = false;
         state.active_pid = None;
         state.generation += 1;
         if !state.cancelled {
-            state.cached = Some((finished_stamp, outcome.clone()));
+            state.cached = Some((Some(finished_stamp), outcome.clone()));
         }
         self.ready.notify_all();
-        outcome
+        if state.cancelled {
+            ResolutionOutcome::Unavailable("Workspace closed".into())
+        } else {
+            outcome
+        }
     }
 }
 
@@ -268,6 +315,14 @@ fn current_stamp(root: &Path) -> Option<ManifestStamp> {
     let home = env::var_os("HOME").map(PathBuf::from);
     let manifest = find_manifest(root, home.as_deref())?;
     let (dir, primary, lockfile) = match &manifest {
+        Manifest::Direnv { file, .. } => {
+            return Some(ManifestStamp {
+                primary: file_stamp(file),
+                manifest,
+                lockfile: None,
+                git_index: None,
+            });
+        }
         Manifest::Flake { dir } => (
             dir.as_path(),
             file_stamp(&dir.join("flake.nix")),
@@ -288,6 +343,13 @@ fn find_manifest(root: &Path, home: Option<&Path>) -> Option<Manifest> {
     for dir in root.ancestors() {
         if dir != root && home == Some(dir) {
             break;
+        }
+        let file = dir.join(".envrc");
+        if file.is_file() {
+            let program = resolve_program(OsStr::new("direnv"), env::var_os("PATH").as_deref());
+            if program != Path::new("direnv") {
+                return Some(Manifest::Direnv { file, program });
+            }
         }
         if dir.join("flake.nix").is_file() {
             return Some(Manifest::Flake {
@@ -338,13 +400,13 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
     })
 }
 
-struct NixProcessGuard<'a> {
+struct LoaderProcess<'a> {
     child: Option<Child>,
     pid: u32,
     state: &'a Mutex<EnvState>,
 }
 
-impl Drop for NixProcessGuard<'_> {
+impl Drop for LoaderProcess<'_> {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             kill_process_group(self.pid);
@@ -379,38 +441,177 @@ fn locate_nix(nix_override: Option<&Path>) -> PathBuf {
     PathBuf::from("nix")
 }
 
-fn capture_nix_develop(
+fn capture_environment(
     root: &Path,
     manifest: &Manifest,
     nix_override: Option<&Path>,
     state: &Mutex<EnvState>,
 ) -> Result<Option<EnvMap>> {
-    let ambient: Vec<(OsString, OsString)> = env::vars_os().collect();
-    let nix_program = locate_nix(nix_override);
+    let direnv = manifest.is_direnv();
+    let mut command = match manifest {
+        Manifest::Direnv { file, program } => {
+            check_direnv_permission(root, file, program, state)?;
+            let mut command = Command::new(program);
+            command.arg("exec").arg(root);
+            command
+        }
+        Manifest::Flake { .. } | Manifest::Shell { .. } => {
+            let mut command = Command::new(locate_nix(nix_override));
+            command.args([
+                "--extra-experimental-features",
+                "nix-command flakes",
+                "develop",
+            ]);
+            if let Manifest::Shell { file, .. } = manifest {
+                command.args(["--impure", "--file"]).arg(file);
+            }
+            command.arg("--command");
+            command
+        }
+    };
 
     let (mut env_reader, env_writer) = UnixStream::pair()?;
     let inherited_writer = duplicate_above_stdio(env_writer.as_fd())?;
     let env_fd = inherited_writer.as_raw_fd();
-    let parent_pid = std::process::id() as libc::pid_t;
-
-    let mut command = Command::new(&nix_program);
     scrub_process_temp_env(&mut command);
-    command.args([
-        "--extra-experimental-features",
-        "nix-command flakes",
-        "develop",
-    ]);
-    if let Manifest::Shell { file, .. } = manifest {
-        command.args(["--impure", "--file"]).arg(file);
-    }
     command
-        .args(["--command", "sh", "-c", CAPTURE_SCRIPT, "rockstar-devshell"])
+        .args(["sh", "-c", CAPTURE_SCRIPT, "rockstar-devshell"])
         .arg(env_fd.to_string())
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        // An .envrc can print secrets. Only retain diagnostics for plain Nix.
+        .stderr(if direnv {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        });
 
+    let mut guard = match spawn_loader(command, Some(env_fd), state) {
+        Ok(child) => child,
+        Err(error) if !direnv && error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Cannot start workspace environment loader"),
+    };
+    // Close parent copies so the reader sees EOF when the writer exits.
+    drop((inherited_writer, env_writer));
+    let stderr_reader = guard
+        .child
+        .as_mut()
+        .unwrap()
+        .stderr
+        .take()
+        .map(|stderr| thread::spawn(move || read_stderr_tail(stderr)));
+    let mut raw_env = Vec::new();
+    (&mut env_reader)
+        .take((MAX_ENV_BYTES + 1) as u64)
+        .read_to_end(&mut raw_env)
+        .context("Cannot read workspace environment")?;
+    ensure!(
+        raw_env.len() <= MAX_ENV_BYTES,
+        "Workspace environment exceeds {} MiB",
+        MAX_ENV_BYTES / (1024 * 1024)
+    );
+    let status = guard.wait()?;
+    let stderr_tail = stderr_reader
+        .and_then(|task| task.join().ok())
+        .unwrap_or_default();
+    ensure!(!state.lock().unwrap().cancelled, "Workspace closed");
+    if !status.success() {
+        if direnv {
+            bail!(
+                "Environment load failed ({status}); run `direnv exec . true` in {} for details",
+                root.display()
+            );
+        }
+        let detail = summarize_nix_error(&stderr_tail);
+        if detail.is_empty() {
+            bail!("exited with {status}");
+        }
+        bail!("{detail}");
+    }
+    ensure!(
+        !raw_env.is_empty(),
+        "Environment loader produced no variables"
+    );
+    if let Manifest::Direnv { file, .. } = manifest {
+        let vars: Vec<_> = parse_env(&raw_env)
+            .filter(|(key, _)| !matches!(key.as_bytes(), b"PWD" | b"OLDPWD" | b"SHLVL" | b"_"))
+            .collect();
+        ensure!(
+            vars.iter()
+                .any(|(key, val)| key == "DIRENV_FILE" && val == file.as_os_str()),
+            "Did not load {}",
+            file.display()
+        );
+        Ok(Some(EnvMap::from_pairs(vars)))
+    } else {
+        let ambient = env::vars_os().collect::<Vec<_>>();
+        Ok(Some(sanitize_captured_env(&raw_env, &ambient)))
+    }
+}
+
+// `direnv exec` can succeed with an empty project environment for an explicitly
+// denied RC. Check direnv's own authorization, not just the exit code of exec.
+fn check_direnv_permission(
+    root: &Path,
+    file: &Path,
+    program: &Path,
+    state: &Mutex<EnvState>,
+) -> Result<()> {
+    let mut command = Command::new(program);
+    scrub_process_temp_env(&mut command);
+    command
+        .args(["status", "--json"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut guard = spawn_loader(command, None, state).context("Cannot start direnv status")?;
+    let mut data = Vec::new();
+    guard
+        .child
+        .as_mut()
+        .unwrap()
+        .stdout
+        .take()
+        .unwrap()
+        .take((MAX_ENV_BYTES + 1) as u64)
+        .read_to_end(&mut data)?;
+    ensure!(
+        data.len() <= MAX_ENV_BYTES && guard.wait()?.success(),
+        "Cannot determine permission for {}",
+        file.display()
+    );
+    let status: serde_json::Value =
+        serde_json::from_slice(&data).context("Invalid direnv status JSON")?;
+    let rc = &status["state"]["foundRC"];
+    ensure!(
+        rc["path"].as_str().map(Path::new) == Some(file),
+        "direnv did not select {}",
+        file.display()
+    );
+    ensure!(
+        rc["allowed"].as_u64() == Some(0), // direnv's RCAllowed status
+        "{} is not allowed. Review it before running `direnv allow`.",
+        file.display()
+    );
+    Ok(())
+}
+
+impl LoaderProcess<'_> {
+    fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        let status = self.child.as_mut().unwrap().wait()?;
+        self.child.take();
+        Ok(status)
+    }
+}
+
+fn spawn_loader(
+    mut command: Command,
+    env_fd: Option<RawFd>,
+    state: &Mutex<EnvState>,
+) -> io::Result<LoaderProcess<'_>> {
+    let parent_pid = std::process::id() as libc::pid_t;
     // SAFETY: Only async-signal-safe syscalls run in the child before exec.
     unsafe {
         command.pre_exec(move || {
@@ -430,74 +631,43 @@ fn capture_nix_develop(
             if libc::getppid() != parent_pid {
                 return Err(io::Error::from_raw_os_error(libc::ESRCH));
             }
-            set_close_on_exec(env_fd, false)
+            if let Some(fd) = env_fd {
+                set_close_on_exec(fd, false)?;
+            }
+            Ok(())
         });
     }
 
-    let child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("Cannot start nix develop"),
-    };
-    // Close parent copies of the write end so EOF is observed as soon as the child exits.
-    drop((command, inherited_writer, env_writer));
-
+    // Don't hold the workspace mutex across spawn: cancellation runs on the UI
+    // thread. If it raced with spawn, the guard kills and reaps the child.
+    let child = command.spawn()?;
     let pid = child.id();
-    let mut guard = NixProcessGuard {
+    let guard = LoaderProcess {
         child: Some(child),
         pid,
         state,
     };
-    {
-        let mut locked = state.lock().unwrap();
-        if locked.cancelled {
-            bail!("Workspace closed");
-        }
-        locked.active_pid = Some(pid);
+    let mut locked = state.lock().unwrap();
+    if locked.cancelled {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Workspace closed",
+        ));
     }
+    locked.active_pid = Some(pid);
+    Ok(guard)
+}
 
-    let stderr = guard
-        .child
-        .as_mut()
-        .and_then(|c| c.stderr.take())
-        .expect("piped nix stderr");
-    let stderr_reader = thread::spawn(move || read_stderr_tail(stderr));
-
-    let mut raw_env = Vec::new();
-    (&mut env_reader)
-        .take((MAX_ENV_BYTES + 1) as u64)
-        .read_to_end(&mut raw_env)
-        .context("Cannot read nix develop environment")?;
-    ensure!(
-        raw_env.len() <= MAX_ENV_BYTES,
-        "nix develop environment exceeds {} MiB",
-        MAX_ENV_BYTES / (1024 * 1024)
-    );
-
-    let status = guard
-        .child
-        .take()
-        .expect("live nix child")
-        .wait()
-        .context("Cannot wait for nix develop")?;
-    let stderr_tail = stderr_reader.join().unwrap_or_default();
-
-    if state.lock().unwrap().cancelled {
-        bail!("Workspace closed");
-    }
-    if !status.success() {
-        let detail = summarize_nix_error(&stderr_tail);
-        if detail.is_empty() {
-            bail!("exited with {status}");
-        }
-        bail!("{detail}");
-    }
-    ensure!(
-        !raw_env.is_empty(),
-        "nix develop exited without producing environment variables"
-    );
-
-    Ok(Some(sanitize_captured_env(&raw_env, &ambient)))
+fn parse_env(raw: &[u8]) -> impl Iterator<Item = (OsString, OsString)> + '_ {
+    raw.split(|&byte| byte == 0).filter_map(|entry| {
+        let eq = entry.iter().position(|&byte| byte == b'=')?;
+        (eq != 0).then(|| {
+            (
+                OsString::from_vec(entry[..eq].to_vec()),
+                OsString::from_vec(entry[eq + 1..].to_vec()),
+            )
+        })
+    })
 }
 
 fn sanitize_captured_env(raw_env: &[u8], ambient: &[(OsString, OsString)]) -> EnvMap {
@@ -508,15 +678,7 @@ fn sanitize_captured_env(raw_env: &[u8], ambient: &[(OsString, OsString)]) -> En
     let mut parsed: Vec<(OsString, OsString)> = Vec::new();
     let mut index_by_key: HashMap<OsString, usize> = HashMap::new();
 
-    for entry in raw_env.split(|&byte| byte == 0) {
-        if entry.is_empty() {
-            continue;
-        }
-        let Some(eq) = entry.iter().position(|&byte| byte == b'=') else {
-            continue;
-        };
-        let key = OsString::from_vec(entry[..eq].to_vec());
-        let value = OsString::from_vec(entry[eq + 1..].to_vec());
+    for (key, value) in parse_env(raw_env) {
         if let Some(&slot) = index_by_key.get(&key) {
             parsed[slot].1 = value;
         } else {
@@ -952,6 +1114,7 @@ mod tests {
 
         let output = first
             .command("haskell-language-server-wrapper")
+            .unwrap()
             .output()
             .unwrap();
         assert!(output.status.success());

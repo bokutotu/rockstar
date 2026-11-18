@@ -192,7 +192,7 @@ fn spawn_app_server(
     env: &crate::devshell::ResolutionOutcome,
     stderr: Stdio,
 ) -> Result<CodexAgent, AgentError> {
-    let mut command = env.command("codex");
+    let mut command = env.command("codex")?;
     command
         .args(["app-server", "--listen", "stdio://"])
         .current_dir(cwd)

@@ -174,7 +174,7 @@ fn spawn_acp(
     env: &crate::devshell::ResolutionOutcome,
     stderr: Stdio,
 ) -> Result<AgyAgent, AgentError> {
-    let mut command = env.command("agy");
+    let mut command = env.command("agy")?;
     command
         .args(["acp", "--dangerously-skip-permissions"])
         .current_dir(cwd)

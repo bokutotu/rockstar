@@ -25,7 +25,7 @@ impl Tab {
         let devshell = self.devshell.clone();
         let starting = cx.background_spawn(async move {
             let mut command = kind.command();
-            devshell.resolve().apply_pty(&mut command);
+            devshell.resolve().apply_pty(&mut command)?;
             TerminalSession::spawn(&root, command)
         });
         cx.spawn_in(window, async move |this, cx| {
