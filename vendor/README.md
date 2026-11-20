@@ -10,12 +10,18 @@ Rockstar now requests an IME coordinate update after the focused chat input is
 painted. Those updates must also reach XIM while composing, so that wrapping,
 scrolling, and resizing cannot leave the candidate window at an old position.
 
-Changes in `src/linux/x11/client.rs`:
+Changes in `src/linux/x11/` and `src/linux/wayland/window.rs`:
 
 - Allow position updates during composition.
 - Extract the logical-to-physical XIM spot conversion, preserving signed
   coordinates and saturating at the protocol's signed 16-bit limit.
 - Test cursor movement and display scaling in that conversion.
+- Bypass XIM key forwarding when the focused element does not accept text input
+  (e.g. Vim Normal/Visual mode), while keeping forwarded key press/release pairs
+  balanced and resetting lingering composition on `FocusLost`.
+- Check focused text input eligibility (`query_accepts_focused_text_input`) on
+  both X11 and Wayland so unfocused or read-only inputs never intercept keys or
+  receive stray IME commits.
 
 The application-side notification lives in `src/chat/ime.rs`.
 
@@ -51,6 +57,9 @@ syntax highlighting. These local extensions provide the missing display layer:
 - `is_composing` lets the host avoid displaying analysis for committed text over
   temporary IME preedit. Annotations invalidated by preedit are restored after
   cancellation or refreshed after commit.
+- `EntityInputHandler::accepts_text_input` returns `is_editable()`, so read-only
+  and disabled inputs (such as FileView in Normal/Visual mode) disable native
+  IME routing.
 - `set_selection_reversed` lets FileView place the caret at the active end of a
   Vim Visual selection, including a row in a block selection, without changing
   the selected text or removing additional selections.

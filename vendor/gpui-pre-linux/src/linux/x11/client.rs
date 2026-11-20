@@ -224,6 +224,7 @@ pub struct X11ClientState {
     pub(crate) compose_state: Option<xkbc::compose::State>,
     pub(crate) pre_edit_text: Option<String>,
     pub(crate) composing: bool,
+    pub(crate) xim_forwarded_keycodes: HashSet<xproto::Keycode>,
     pub(crate) pre_key_char_down: Option<Keystroke>,
     pub(crate) cursor_handle: cursor::Handle,
     pub(crate) cursor_styles: HashMap<xproto::Window, CursorStyle>,
@@ -326,6 +327,30 @@ fn ime_spot(bounds: Bounds<Pixels>, scale: f32) -> xim::Point {
     xim::Point {
         x: (f32::from(bounds.right()) * scale).round() as i16,
         y: (f32::from(bounds.bottom()) * scale).round() as i16,
+    }
+}
+
+/// Decides whether an X11 key event should be forwarded to XIM.
+///
+/// Key presses only go to XIM while the focused element accepts text input so
+/// modal command keys (e.g. Vim Normal mode) work regardless of IME state.
+/// Each forwarded key press is tracked so its matching key release is also
+/// forwarded to XIM (and bypassed presses never leak a stray release into XIM).
+fn should_forward_key_to_xim(
+    forwarded: &mut HashSet<xproto::Keycode>,
+    is_press: bool,
+    keycode: xproto::Keycode,
+    accepts_text_input: bool,
+) -> bool {
+    if is_press {
+        if accepts_text_input {
+            forwarded.insert(keycode);
+            true
+        } else {
+            false
+        }
+    } else {
+        forwarded.remove(&keycode)
     }
 }
 
@@ -550,6 +575,7 @@ impl X11Connection {
                 pre_edit_text: None,
                 pre_key_char_down: None,
                 composing: false,
+                xim_forwarded_keycodes: HashSet::default(),
 
                 cursor_handle,
                 cursor_styles: HashMap::default(),
@@ -1089,6 +1115,7 @@ impl X11Client {
                     compose_state.reset();
                 }
                 state.pre_edit_text.take();
+                state.xim_forwarded_keycodes.clear();
                 state.restore_cursor_after_hide();
                 drop(state);
                 self.reset_ime();
@@ -1535,21 +1562,45 @@ impl X11Client {
 
     fn xim_handle_event(&self, event: Event) -> Option<()> {
         match event {
-            Event::KeyPress(event) | Event::KeyRelease(event) => {
+            Event::KeyPress(key_event) | Event::KeyRelease(key_event) => {
+                let is_press = matches!(event, Event::KeyPress(_));
+                let window = self.get_window(key_event.event);
+                let accepts_text_input =
+                    is_press && window.as_ref().is_some_and(|w| w.accepts_text_input());
+                let (forward, stale_composing) = {
+                    let mut state = self.0.borrow_mut();
+                    let forward = should_forward_key_to_xim(
+                        &mut state.xim_forwarded_keycodes,
+                        is_press,
+                        key_event.detail,
+                        accepts_text_input,
+                    );
+                    (forward, !forward && is_press && state.composing)
+                };
+                if !forward {
+                    if stale_composing {
+                        self.reset_ime();
+                        if let Some(window) = window {
+                            window.handle_ime_unmark();
+                        }
+                    }
+                    self.handle_event(event);
+                    return Some(());
+                }
                 let mut state = self.0.borrow_mut();
                 state.pre_key_char_down = Some(keystroke_from_xkb(
                     &state.xkb,
                     state.modifiers,
-                    event.detail.into(),
+                    key_event.detail.into(),
                 ));
                 let (mut ximc, mut xim_handler) = state.take_xim()?;
                 drop(state);
-                xim_handler.window = event.event;
+                xim_handler.window = key_event.event;
                 ximc.forward_event(
                     xim_handler.im_id,
                     xim_handler.ic_id,
                     xim::ForwardEventFlag::empty(),
-                    &event,
+                    &key_event,
                 )
                 .context("X11: Failed to forward XIM event")
                 .log_err();

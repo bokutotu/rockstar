@@ -6,7 +6,8 @@ use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
     Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    TextInputStateChange, Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea,
     WindowDecorations, WindowKind, WindowParams, WindowVisibility, popup::PopupNotSupportedError,
     px,
 };
@@ -1212,13 +1213,26 @@ impl X11WindowStatePtr {
                 if let Some(mut input_handler) = state.input_handler.take() {
                     if let Some(key_char) = &event.keystroke.key_char {
                         drop(state);
-                        input_handler.replace_text_in_range(None, key_char);
+                        if input_handler.query_accepts_focused_text_input() {
+                            input_handler.replace_text_in_range(None, key_char);
+                        }
                         state = self.state.borrow_mut();
                     }
                     state.input_handler = Some(input_handler);
                 }
             }
         }
+    }
+
+    pub fn accepts_text_input(&self) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(mut input_handler) = state.input_handler.take() else {
+            return false;
+        };
+        drop(state);
+        let accepts = input_handler.query_accepts_focused_text_input();
+        self.state.borrow_mut().input_handler = Some(input_handler);
+        accepts
     }
 
     pub fn handle_ime_commit(&self, text: String) {
@@ -1228,7 +1242,9 @@ impl X11WindowStatePtr {
         let mut state = self.state.borrow_mut();
         if let Some(mut input_handler) = state.input_handler.take() {
             drop(state);
-            input_handler.replace_text_in_range(None, &text);
+            if input_handler.query_accepts_focused_text_input() {
+                input_handler.replace_text_in_range(None, &text);
+            }
             let mut state = self.state.borrow_mut();
             state.input_handler = Some(input_handler);
         }
@@ -1241,7 +1257,9 @@ impl X11WindowStatePtr {
         let mut state = self.state.borrow_mut();
         if let Some(mut input_handler) = state.input_handler.take() {
             drop(state);
-            input_handler.replace_and_mark_text_in_range(None, &text, None);
+            if text.is_empty() || input_handler.query_accepts_focused_text_input() {
+                input_handler.replace_and_mark_text_in_range(None, &text, None);
+            }
             let mut state = self.state.borrow_mut();
             state.input_handler = Some(input_handler);
         }
@@ -1515,6 +1533,17 @@ impl PlatformWindow for X11Window {
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         self.0.state.borrow_mut().input_handler.take()
+    }
+
+    fn text_input_state_changed(&self, change: TextInputStateChange) {
+        if change == TextInputStateChange::FocusLost {
+            let client = self.0.state.borrow().client.clone();
+            if let Some(client) = client.get_client()
+                && client.0.borrow().composing
+            {
+                client.reset_ime();
+            }
+        }
     }
 
     fn prompt(
