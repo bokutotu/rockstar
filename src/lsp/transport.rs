@@ -279,7 +279,12 @@ fn run(
 ) -> Result<()> {
     let root = key.root.as_path();
     let outcome = devshell.resolve();
-    let mut command = outcome.command(&spec.program)?;
+    let mut command = match (key.kind, option_env!("ROCKSTAR_BUNDLED_TERRAFORM_LS")) {
+        (ServerKind::Terraform, Some(bundled)) => {
+            outcome.command_with_fallback(&spec.program, root, Path::new(bundled))?
+        }
+        _ => outcome.command(&spec.program)?,
+    };
     command
         .args(&spec.args)
         .current_dir(root)

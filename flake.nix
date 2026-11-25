@@ -35,7 +35,9 @@
               noto-fonts-color-emoji
             ];
           };
-          renderEnvironment = {
+          buildEnvironment = {
+            # Embed the fallback path without putting the bundled server on the workspace PATH.
+            ROCKSTAR_BUNDLED_TERRAFORM_LS = "${pkgs.terraform-ls}/bin/terraform-ls";
             FONTCONFIG_FILE = fontconfigFile;
             # Use the host GPU driver for the application.
             LD_LIBRARY_PATH = "${pkgs.lib.makeLibraryPath libraries}:/run/opengl-driver/lib";
@@ -47,7 +49,7 @@
             libraries
             nativeBuildInputs
             fontconfigFile
-            renderEnvironment
+            buildEnvironment
             ;
         };
     in
@@ -60,12 +62,12 @@
             libraries
             nativeBuildInputs
             fontconfigFile
-            renderEnvironment
+            buildEnvironment
             ;
         in
         {
           default = pkgs.rustPlatform.buildRustPackage (
-            renderEnvironment
+            buildEnvironment
             // {
               pname = "rockstar";
               version = "0.1.0";
@@ -78,7 +80,7 @@
 
               postFixup = ''
                 wrapProgram "$out/bin/rockstar" \
-                  --prefix LD_LIBRARY_PATH : "${renderEnvironment.LD_LIBRARY_PATH}" \
+                  --prefix LD_LIBRARY_PATH : "${buildEnvironment.LD_LIBRARY_PATH}" \
                   --prefix PATH : "${
                     pkgs.lib.makeBinPath [
                       pkgs.xdg-utils
@@ -114,12 +116,12 @@
             pkgs
             libraries
             nativeBuildInputs
-            renderEnvironment
+            buildEnvironment
             ;
         in
         {
           default = pkgs.mkShell (
-            renderEnvironment
+            buildEnvironment
             // {
               packages = with pkgs; [
                 cargo

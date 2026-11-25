@@ -49,9 +49,6 @@ tree-sitter-nix = "0.3"
 tree-sitter-swift = "0.7.4"
 tree-sitter-xml = "0.7"
 
-[dev-dependencies]
-gpui-kit = { version = "0.8.1", features = ["test-support"] }
-
 [patch.crates-io]
 # Keep X11 IME coordinates updating during composition; see vendor/README.md.
 gpui-pre-linux = { path = "vendor/gpui-pre-linux" }

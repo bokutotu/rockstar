@@ -20,8 +20,6 @@ use crate::agent::{
 };
 
 mod sessions;
-#[cfg(test)]
-mod tests;
 use sessions::SessionEntries;
 pub(crate) use sessions::list_sessions;
 

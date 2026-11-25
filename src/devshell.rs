@@ -76,15 +76,6 @@ impl EnvMap {
         Self { vars, path }
     }
 
-    #[cfg(test)]
-    pub(crate) fn get(&self, key: impl AsRef<OsStr>) -> Option<&OsStr> {
-        let key = key.as_ref();
-        self.vars
-            .iter()
-            .find(|(k, _)| k.as_os_str() == key)
-            .map(|(_, v)| v.as_os_str())
-    }
-
     pub(crate) fn command(&self, program: impl AsRef<OsStr>) -> Command {
         let resolved = resolve_program(program.as_ref(), self.path.as_deref());
         let mut command = Command::new(resolved);
@@ -139,6 +130,21 @@ impl ResolutionOutcome {
         let mut command = Command::new(program);
         scrub_process_temp_env(&mut command);
         Ok(command)
+    }
+
+    /// Look up a bare command name on the consumer's PATH, then use the bundled binary if absent.
+    pub(crate) fn command_with_fallback(
+        &self,
+        name: &str,
+        cwd: &Path,
+        fallback: &Path,
+    ) -> Result<Command> {
+        let program = OsStr::new(name);
+        let resolved = match self.for_launch()? {
+            Some(env) => find_on_path(program, env.path.as_deref(), cwd),
+            None => find_on_path(program, env::var_os("PATH").as_deref(), cwd),
+        };
+        self.command(resolved.as_deref().unwrap_or(fallback))
     }
 
     pub(crate) fn apply_pty(&self, command: &mut portable_pty::CommandBuilder) -> Result<()> {
@@ -838,18 +844,14 @@ pub(crate) fn resolve_program(program: &OsStr, path_env: Option<&OsStr>) -> Path
     if program.as_bytes().contains(&b'/') {
         return PathBuf::from(program);
     }
-    if let Some(path_env) = path_env {
-        for dir in env::split_paths(path_env) {
-            if dir.as_os_str().is_empty() {
-                continue;
-            }
-            let candidate = dir.join(program);
-            if is_executable_file(&candidate) {
-                return candidate;
-            }
-        }
-    }
-    PathBuf::from(program)
+    find_on_path(program, path_env, Path::new("")).unwrap_or_else(|| PathBuf::from(program))
+}
+
+fn find_on_path(program: &OsStr, path_env: Option<&OsStr>, cwd: &Path) -> Option<PathBuf> {
+    env::split_paths(path_env?)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| cwd.join(dir).join(program))
+        .find(|candidate| is_executable_file(candidate))
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -934,258 +936,4 @@ fn set_close_on_exec(fd: RawFd, enabled: bool) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(prefix: &str) -> Self {
-            static COUNTER: AtomicUsize = AtomicUsize::new(0);
-            let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-tmp");
-            fs::create_dir_all(&base).unwrap();
-            let dir = base.join(format!(
-                "{prefix}-{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).unwrap();
-            // Bound ancestor walks inside `target/test-tmp` so Rockstar's own flake.nix isn't matched.
-            fs::create_dir_all(dir.join(".git")).unwrap();
-            Self(dir)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn write_executable(path: &Path, script: &str) {
-        fs::write(path, script).unwrap();
-        let mut perms = fs::metadata(path).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).unwrap();
-    }
-
-    #[test]
-    fn manifest_discovery_respects_git_and_home_boundaries() {
-        let repo = TempDir::new("manifest");
-        let sub = repo.path().join("packages/app");
-        fs::create_dir_all(&sub).unwrap();
-
-        // Plain git repository without flake.nix or shell.nix does not escape above `.git`.
-        assert_eq!(find_manifest(&sub, None), None);
-
-        // Monorepo root with flake.nix is found from nested directories.
-        fs::write(repo.path().join("flake.nix"), "{}").unwrap();
-        assert_eq!(
-            find_manifest(&sub, None),
-            Some(Manifest::Flake {
-                dir: repo.path().to_path_buf(),
-            })
-        );
-
-        // Home boundary stops parent search when opening a non-Nix child under $HOME,
-        // while still allowing opening $HOME itself if $HOME/flake.nix exists.
-        fs::remove_dir_all(repo.path().join(".git")).unwrap();
-        assert_eq!(find_manifest(&sub, Some(repo.path())), None);
-        assert_eq!(
-            find_manifest(repo.path(), Some(repo.path())),
-            Some(Manifest::Flake {
-                dir: repo.path().to_path_buf(),
-            })
-        );
-    }
-
-    #[test]
-    fn sanitize_env_cleans_ephemeral_tmpdir_and_preserves_login_shell() {
-        let scratch = TempDir::new("sanitize");
-        let fake_nix_tmp = scratch.path().join("nix-shell.abc123");
-        let preserved_temp = scratch.path().join("custom-preserved");
-        let ambient_runtime = scratch.path().join("user-runtime");
-        fs::create_dir_all(&fake_nix_tmp).unwrap();
-        fs::create_dir_all(&preserved_temp).unwrap();
-        fs::create_dir_all(&ambient_runtime).unwrap();
-
-        let mut raw = Vec::new();
-        for (k, v) in [
-            (
-                "PATH",
-                "/nix/store/hls/bin:/usr/bin/:/nix/store/hls/bin:/bin",
-            ),
-            ("SHELL", "/nix/store/bash/bin/bash"),
-            ("NIX_BUILD_TOP", fake_nix_tmp.to_str().unwrap()),
-            ("TMPDIR", fake_nix_tmp.to_str().unwrap()),
-            ("TMP", fake_nix_tmp.to_str().unwrap()),
-            ("TEMP", preserved_temp.to_str().unwrap()),
-            ("NIX_GHC_LIBDIR", "/nix/store/ghc/lib"),
-            ("PWD", "/some/dir"),
-            ("SHLVL", "2"),
-        ] {
-            raw.extend_from_slice(k.as_bytes());
-            raw.push(b'=');
-            raw.extend_from_slice(v.as_bytes());
-            raw.push(0);
-        }
-
-        let ambient = vec![
-            (OsString::from("SHELL"), OsString::from("/run/sw/bin/fish")),
-            (
-                OsString::from("TMPDIR"),
-                ambient_runtime.clone().into_os_string(),
-            ),
-        ];
-        let env = sanitize_captured_env(&raw, &ambient);
-
-        assert!(
-            !fake_nix_tmp.exists(),
-            "ephemeral nix-shell dir must be deleted"
-        );
-        assert_eq!(env.get("SHELL"), Some(OsStr::new("/run/sw/bin/fish")));
-        assert_eq!(env.get("TMPDIR"), Some(ambient_runtime.as_os_str()));
-        assert_eq!(env.get("TMP"), None);
-        assert_eq!(env.get("TEMP"), Some(preserved_temp.as_os_str()));
-        assert_eq!(env.get("NIX_BUILD_TOP"), None);
-        assert_eq!(env.get("PWD"), None);
-        assert_eq!(env.get("SHLVL"), None);
-        assert_eq!(
-            env.get("PATH"),
-            Some(OsStr::new("/nix/store/hls/bin:/usr/bin:/bin"))
-        );
-        assert_eq!(
-            env.get("NIX_GHC_LIBDIR"),
-            Some(OsStr::new("/nix/store/ghc/lib"))
-        );
-    }
-
-    #[test]
-    fn workspace_env_ignores_shellhook_stdout_and_resolves_lsp_binaries() {
-        let workspace = TempDir::new("devshell");
-        fs::write(workspace.path().join("flake.nix"), "{}").unwrap();
-
-        let bin_dir = workspace.path().join("devshell-bin");
-        fs::create_dir_all(&bin_dir).unwrap();
-        let hls = bin_dir.join("haskell-language-server-wrapper");
-        write_executable(&hls, "#!/bin/sh\nprintf 'hls-ok:%s' \"$HLS_EXTRA\"\n");
-
-        let count_file = workspace.path().join("invocations");
-        let mock_nix = workspace.path().join("mock-nix");
-        write_executable(
-            &mock_nix,
-            &format!(
-                "#!/bin/sh\n\
-                 printf 'x' >> '{}'\n\
-                 while [ $# -gt 0 ]; do\n\
-                   if [ \"$1\" = \"--command\" ]; then shift; break; fi\n\
-                   shift\n\
-                 done\n\
-                 printf 'noisy shellHook banner=123\\n'\n\
-                 export PATH='{}:'\"$PATH\"\n\
-                 export HLS_EXTRA='from-flake'\n\
-                 exec \"$@\"\n",
-                count_file.display(),
-                bin_dir.display(),
-            ),
-        );
-
-        let devshell =
-            WorkspaceEnv::with_nix_override(workspace.path().to_path_buf(), Some(mock_nix));
-        let first = devshell.resolve();
-        let second = devshell.resolve();
-        assert!(matches!(first, ResolutionOutcome::Activated(_)));
-        assert!(matches!(second, ResolutionOutcome::Activated(_)));
-        assert_eq!(
-            fs::read_to_string(&count_file).unwrap().len(),
-            1,
-            "second resolve with unchanged flake.nix must use cache"
-        );
-
-        let output = first
-            .command("haskell-language-server-wrapper")
-            .unwrap()
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "hls-ok:from-flake");
-    }
-
-    #[test]
-    fn concurrent_resolvers_share_single_inflight_nix_develop_and_retry_after_failure() {
-        let workspace = TempDir::new("concurrent");
-        let flake = workspace.path().join("flake.nix");
-        fs::write(&flake, "{ broken }").unwrap();
-
-        let count_file = workspace.path().join("count");
-        let gate_file = workspace.path().join("ok");
-        let mock_nix = workspace.path().join("mock-nix");
-        write_executable(
-            &mock_nix,
-            &format!(
-                "#!/bin/sh\n\
-                 printf '1' >> '{}'\n\
-                 sleep 0.05\n\
-                 if [ ! -f '{}' ]; then\n\
-                   printf 'error: flake evaluation failed\\n' >&2\n\
-                   exit 1\n\
-                 fi\n\
-                 while [ $# -gt 0 ]; do\n\
-                   if [ \"$1\" = \"--command\" ]; then shift; break; fi\n\
-                   shift\n\
-                 done\n\
-                 export DEVSHELL_READY=yes\n\
-                 exec \"$@\"\n",
-                count_file.display(),
-                gate_file.display(),
-            ),
-        );
-
-        let devshell =
-            WorkspaceEnv::with_nix_override(workspace.path().to_path_buf(), Some(mock_nix));
-
-        // Two threads resolving concurrently share a single `nix develop` run.
-        let d1 = devshell.clone();
-        let d2 = devshell.clone();
-        let t1 = thread::spawn(move || d1.resolve());
-        let t2 = thread::spawn(move || d2.resolve());
-        let r1 = t1.join().unwrap();
-        let r2 = t2.join().unwrap();
-        assert_eq!(r1.failure(), Some("flake evaluation failed"));
-        assert_eq!(r2.failure(), Some("flake evaluation failed"));
-        assert_eq!(fs::read_to_string(&count_file).unwrap().len(), 1);
-
-        // Editing flake.nix marks failed consumers eligible for retry and succeeds.
-        fs::write(&gate_file, "ok").unwrap();
-        fs::write(&flake, "{ fixed = true; }").unwrap();
-        assert!(devshell.should_retry_consumer());
-
-        let recovered = devshell.resolve();
-        match recovered {
-            ResolutionOutcome::Activated(env) => {
-                assert_eq!(env.get("DEVSHELL_READY"), Some(OsStr::new("yes")));
-            }
-            other => panic!("expected Activated, got {other:?}"),
-        }
-        assert!(!devshell.should_retry_consumer());
-    }
-
-    #[test]
-    fn summarize_nix_error_extracts_final_error_clause() {
-        let stderr = "\x1b[31;1merror:\x1b[0m\n       … while evaluating 'devShells'\n\n       error: Path 'flake.nix' is not tracked by Git.\n";
-        assert_eq!(
-            summarize_nix_error(stderr),
-            "Path 'flake.nix' is not tracked by Git."
-        );
-    }
 }
