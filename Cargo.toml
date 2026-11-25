@@ -50,6 +50,8 @@ tree-sitter-swift = "0.7.4"
 tree-sitter-xml = "0.7"
 
 [patch.crates-io]
+# Pandoc-style single-dollar math boundaries; see vendor/README.md.
+markdown = { path = "vendor/markdown" }
 # Keep X11 IME coordinates updating during composition; see vendor/README.md.
 gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
 # Native inlay / block annotations without modifying source text.

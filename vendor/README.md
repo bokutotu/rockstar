@@ -1,5 +1,14 @@
 # Local dependency patches
 
+## markdown 1.0.0 (markdown-rs)
+
+Source: the crates.io `markdown` 1.0.0 release (MIT). `src/construct/raw_text.rs`
+uses Pandoc-style boundaries for single-dollar inline math: no whitespace
+just inside either delimiter, and no ASCII digit immediately after the closer.
+An invalid closer rejects the pair so currency stays Markdown and a later
+formula can still open. Escaped dollars inside a formula are data. Code spans,
+multi-dollar spans and block math use their original rules.
+
 ## gpui-pre-linux 0.3.10
 
 Source: the crates.io `gpui-pre-linux` 0.3.10 release (Apache-2.0).

@@ -115,6 +115,8 @@ version = "0.97.0"
 features = ["proposed"]
 
 [dependencies.markdown]
+# Use the same parser when running this crate's tests outside the root build.
+path = "../markdown"
 version = "1.0.0"
 features = ["serde"]
 

@@ -28,9 +28,8 @@ pub(crate) fn parse(source: &str, cx: &mut NodeContext) -> Result<ParsedDocument
     Ok(ast_to_document(source, root, cx))
 }
 
-/// Math parsing is on by default, so prose that merely contains two dollar
-/// signs ("$5 and $10") parses as an inline math node. When no plugin claims
-/// such a node, the text between the dollars must stay ordinary Markdown:
+/// When no plugin claims an inline math node, the text between the dollars
+/// must stay ordinary Markdown:
 /// emphasis, inline HTML and links inside it render as they would anywhere
 /// else, and inline HTML tags may pair with tags outside the span. Re-parse
 /// the node's source without the math constructs and, when it holds any
@@ -898,11 +897,7 @@ fn parse_paragraph(
             paragraph.push(mapped_inline(source, "\n", node, cx));
         }
         Node::InlineMath(raw) => {
-            // Math parsing is on by default, so ordinary prose that merely
-            // contains dollar signs ("spent $5 and $10") arrives here as a
-            // math node whenever no inline plugin claimed it. Emitting
-            // `raw.value` would drop the delimiters and restyle the run as
-            // code, silently rewriting what the author typed. Fall back to the
+            // Emitting `raw.value` would drop the delimiters. Keep the
             // original source so unclaimed math stays literal.
             text = parse_cx
                 .node_source(node)
@@ -2348,21 +2343,19 @@ mod tests {
 
     #[test]
     fn unclaimed_inline_math_parses_its_span_as_prose() {
-        // Two dollar amounts pair up into an unclaimed math span. What lies
-        // between them is ordinary prose: inline HTML there must still pair
-        // with the tags outside the span, and emphasis inside it must render.
+        // Markup in an unclaimed math span must still pair with tags outside it.
         let source =
-            "EPS of <strong>$1.56</strong> beat the <strong>$1.50</strong> consensus, *up $2*";
+            "EPS of <strong>$1.56</strong> beat the <strong>1.50$</strong> consensus, *up $2*";
         let mut cx = NodeContext::default();
         let document = parse(source, &mut cx).unwrap();
         assert_eq!(
             document.text(),
-            "EPS of $1.56 beat the $1.50 consensus, up $2\n"
+            "EPS of $1.56 beat the 1.50$ consensus, up $2\n"
         );
         let BlockNode::Paragraph(paragraph) = &document.blocks[0] else {
             panic!()
         };
-        assert_eq!(bold_runs(paragraph), ["$1.56", "$1.50"]);
+        assert_eq!(bold_runs(paragraph), ["$1.56", "1.50$"]);
         assert!(paragraph.children.iter().any(|node| {
             node.marks
                 .iter()
@@ -2386,7 +2379,7 @@ mod tests {
             ..Default::default()
         };
         let document = parse("area $x^2$ costs $5 and $10", &mut cx).unwrap();
-        assert_eq!(document.text(), "area [x^2] costs [5 and ]10\n");
+        assert_eq!(document.text(), "area [x^2] costs $5 and $10\n");
     }
 
     #[test]
@@ -2498,14 +2491,13 @@ mod tests {
 
     #[test]
     fn unclaimed_inline_math_keeps_its_literal_source() {
-        // Math parsing is on by default, so prose that merely contains dollar
-        // signs parses as a math node. With no plugin to render it, the text
-        // must survive display and a Markdown round trip untouched.
-        let source = "spent $5 and $10 today";
+        // With no plugin to render it, math survives display and a Markdown
+        // round trip untouched.
+        let source = "area $x^2$ today";
         let mut cx = NodeContext::default();
         let document = parse(source, &mut cx).unwrap();
-        assert_eq!(document.text(), "spent $5 and $10 today\n");
-        assert!(document.to_markdown().contains("spent $5 and $10 today"));
+        assert_eq!(document.text(), "area $x^2$ today\n");
+        assert!(document.to_markdown().contains(source));
         let BlockNode::Paragraph(paragraph) = &document.blocks[0] else {
             panic!()
         };
